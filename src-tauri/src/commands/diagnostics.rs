@@ -98,7 +98,7 @@ fn get_diagnostics_inner(state: &AppState) -> Vec<DiagnosticsDto> {
             capabilities_detected: provider.capabilities.clone(),
             cooldown_until: runtime_state.cooldown_until.map(|d| d.to_rfc3339()),
             last_safe_error_code: runtime_state.error_code.clone(),
-            warnings: vec![],
+            warnings: runtime_state.identity_note.clone().into_iter().collect(),
             recent_attempts: attempts,
         });
     }

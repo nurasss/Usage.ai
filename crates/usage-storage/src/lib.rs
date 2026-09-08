@@ -783,6 +783,25 @@ impl Storage {
         Ok(())
     }
 
+    /// First-seen identity persistence and explicit re-bind only.
+    /// Nothing here merges histories: a mismatch is resolved by the
+    /// runtime router, never by rewriting another account's rows.
+    pub fn set_account_identity(
+        &mut self,
+        account_id: uuid::Uuid,
+        fingerprint: &str,
+        confidence: usage_core::IdentityConfidence,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE accounts SET external_identity_fingerprint=?,identity_confidence=? WHERE id=?",
+            params![
+                fingerprint,
+                format!("{confidence:?}"),
+                account_id.to_string()
+            ],
+        )? > 0)
+    }
+
     pub fn update_managed_account(
         &mut self,
         account_id: uuid::Uuid,

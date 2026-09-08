@@ -78,6 +78,7 @@ pub struct RefreshState {
     pub quota_windows: HashMap<String, (Option<String>, Option<f64>)>,
     pub quota_observations: HashMap<String, Vec<(DateTime<Utc>, f64)>>,
     pub attempt_count: u32,
+    pub identity_note: Option<String>,
 }
 
 pub struct RefreshRequest {
@@ -245,6 +246,25 @@ impl Coordinator {
                 ("product", &scope.product_id),
             ],
         );
+        // Identity routing before any fetch: a mismatched credential
+        // never attributes foreign data to this account (no auto-merge).
+        if let crate::account_router::Routing::Mismatch { observed, .. } =
+            self.check_identity(&request)
+        {
+            let attempt = self.record_attempt(
+                &scope,
+                "identity-router",
+                AttemptStatus::Error,
+                Some("identity_mismatch"),
+            );
+            if let Ok(mut states) = self.states.lock() {
+                let state = states.entry(scope.clone()).or_default();
+                state.last_attempt = Some(self.hosts.clock.now());
+                state.error_code = Some("identity_mismatch".into());
+                state.identity_note = Some(format!("identity_mismatch:observed={observed}"));
+            }
+            return self.stale_outcome(&scope, Some(SourceError::IdentityMismatch), vec![attempt]);
+        }
         if let Some(until) = self.cooldown_remaining(&scope) {
             let _ = until;
             // Server cooldowns are never bypassed, including by manual triggers.
@@ -467,6 +487,55 @@ impl Coordinator {
             selected_source: None,
             schema_fingerprint: None,
         }
+    }
+
+    /// Identity routing for one scope. API credentials yield an
+    /// observed fingerprint; local file sources yield none. First-seen
+    /// fingerprints persist as `Weak` — never `Verified`, never merged.
+    fn check_identity(&self, request: &RefreshRequest) -> crate::account_router::Routing {
+        use crate::account_router::{route, Routing};
+        use usage_core::IdentityConfidence;
+
+        let scope = &request.scope;
+        let observed: Option<String> = if scope.product_id == "openai-api" {
+            request
+                .secret
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|s| usage_host::fingerprint("openai-api", s))
+        } else {
+            None
+        };
+        let (stored, confidence) = self
+            .storage
+            .lock()
+            .ok()
+            .and_then(|s| s.get_account(scope.account_id).ok())
+            .flatten()
+            .map(|m| (m.external_identity, m.identity_confidence))
+            .unwrap_or((
+                request.account.external_identity.clone(),
+                IdentityConfidence::Unknown,
+            ));
+        let routing = route(stored.as_deref(), confidence, observed.as_deref());
+        if matches!(
+            routing,
+            Routing::Attributed {
+                confidence: IdentityConfidence::Weak
+            }
+        ) && stored.is_none()
+        {
+            if let Some(fp) = observed {
+                if let Ok(mut storage) = self.storage.lock() {
+                    let _ = storage.set_account_identity(
+                        scope.account_id,
+                        &fp,
+                        IdentityConfidence::Weak,
+                    );
+                }
+            }
+        }
+        routing
     }
 
     fn cooldown_remaining(&self, scope: &ScopeKey) -> Option<Duration> {
@@ -868,5 +937,132 @@ mod tests {
         assert_eq!(trigger_label(Trigger::Scheduled), "scheduled");
         assert_eq!(trigger_label(Trigger::Wake), "wake");
         assert_eq!(trigger_label(Trigger::Tray), "tray");
+    }
+
+    fn managed_api_account(
+        id: uuid::Uuid,
+        identity: Option<String>,
+        confidence: usage_core::IdentityConfidence,
+    ) -> usage_storage::ManagedAccount {
+        usage_storage::ManagedAccount {
+            id,
+            provider_id: "openai".into(),
+            product_id: Some("openai-api".into()),
+            external_identity: identity,
+            label: "API".into(),
+            connection_ref: None,
+            lifecycle: AccountLifecycle::Active,
+            enabled: true,
+            custom_path: None,
+            identity_confidence: confidence,
+        }
+    }
+
+    fn api_request(
+        scope: &ScopeKey,
+        account: &Account,
+        secret: &[u8],
+        trigger: Trigger,
+    ) -> RefreshRequest {
+        RefreshRequest {
+            scope: scope.clone(),
+            account: account.clone(),
+            custom_root: None,
+            secret: Some(secret.to_vec()),
+            trigger,
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_blocks_attribution_before_any_fetch() {
+        use usage_core::IdentityConfidence;
+
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = script_http(ScriptBehavior::CostPage(cost_page()));
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let id = Uuid::new_v4();
+        let original_fp = usage_host::fingerprint("openai-api", b"sk-original");
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed_api_account(
+                id,
+                Some(original_fp),
+                IdentityConfidence::Weak,
+            ))
+            .unwrap();
+        let acc = Account {
+            id,
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "API".into(),
+            connection_ref: None,
+            lifecycle: AccountLifecycle::Active,
+        };
+        let scope = ScopeKey {
+            account_id: id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        // A rotated/replaced key must not attribute foreign billing
+        // rows to this account: no fetch, no commit, explicit error.
+        let outcomes = coordinator
+            .refresh_many(vec![api_request(
+                &scope,
+                &acc,
+                b"sk-rotated",
+                Trigger::Scheduled,
+            )])
+            .await;
+        assert!(matches!(
+            outcomes[0].error,
+            Some(SourceError::IdentityMismatch)
+        ));
+        assert!(outcomes[0].snapshot.is_none());
+        assert_eq!(outcomes[0].costs_imported, 0);
+        assert_eq!(*http.calls.lock().unwrap(), 0);
+        let states = coordinator.states_snapshot();
+        assert!(states[&scope]
+            .identity_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("identity_mismatch:observed=")));
+    }
+
+    #[tokio::test]
+    async fn first_seen_identity_persists_as_weak() {
+        use usage_core::IdentityConfidence;
+
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = script_http(ScriptBehavior::CostPage(cost_page()));
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let id = Uuid::new_v4();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed_api_account(id, None, IdentityConfidence::Unknown))
+            .unwrap();
+        let acc = Account {
+            id,
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "API".into(),
+            connection_ref: None,
+            lifecycle: AccountLifecycle::Active,
+        };
+        let scope = ScopeKey {
+            account_id: id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        let outcomes = coordinator
+            .refresh_many(vec![api_request(&scope, &acc, b"sk-new", Trigger::Manual)])
+            .await;
+        assert!(outcomes[0].snapshot.is_some());
+        let stored = storage.lock().unwrap().get_account(id).unwrap().unwrap();
+        assert_eq!(
+            stored.external_identity.as_deref(),
+            Some(usage_host::fingerprint("openai-api", b"sk-new").as_str())
+        );
+        assert_eq!(stored.identity_confidence, IdentityConfidence::Weak);
     }
 }
