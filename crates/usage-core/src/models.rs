@@ -186,6 +186,14 @@ pub struct UsageRecord {
     pub requests: Option<u64>,
     pub source: String,
     pub coverage: Coverage,
+    /// Source-file provenance (§P0-01). Legacy rows carry `None` and are
+    /// treated as generation 1 of an unattributed import.
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_generation: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

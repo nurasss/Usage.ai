@@ -7,7 +7,7 @@ use std::{
 };
 use usage_core::{Account, CostRecord, UsageRecord};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 pub struct Storage {
     conn: Connection,
@@ -24,6 +24,53 @@ pub struct ImportCheckpoint {
     pub last_source_record_id: Option<String>,
     pub device: i64,
     pub inode: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceConnection {
+    pub id: String,
+    pub account_id: String,
+    pub provider_id: String,
+    pub product_id: String,
+    pub root_hash: String,
+    pub root_hint: String,
+    pub kind: String,
+    pub identity_fingerprint: Option<String>,
+    pub identity_confidence: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFile {
+    pub id: String,
+    pub connection_id: String,
+    pub path_hash: String,
+    pub device: i64,
+    pub inode: i64,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileImportState {
+    pub file_id: String,
+    pub byte_offset: u64,
+    pub schema_version: u32,
+    pub last_source_record_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportBatchCommit<'a> {
+    pub file_id: &'a str,
+    pub file_generation: i64,
+    pub is_replacement: bool,
+    pub device: i64,
+    pub inode: i64,
+    pub records: &'a [UsageRecord],
+    pub byte_offset: u64,
+    pub schema_version: u32,
+    pub last_source_record_id: Option<&'a str>,
 }
 
 impl Storage {
@@ -46,6 +93,7 @@ impl Storage {
             path: Some(path.to_path_buf()),
         };
         storage.migrate()?;
+        Self::harden_db_permissions(path);
         Ok(storage)
     }
 
@@ -54,6 +102,27 @@ impl Storage {
         let mut s = Self { conn, path: None };
         s.migrate()?;
         Ok(s)
+    }
+
+    /// User-only permissions for the database and its WAL/SHM sidecars.
+    /// SQLite recreates sidecars across its lifecycle, so this runs at
+    /// open time; the app-data directory itself is user-owned.
+    fn harden_db_permissions(db_path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(db_path, mode.clone());
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = db_path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                let _ = std::fs::set_permissions(Path::new(&sidecar), mode.clone());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = db_path;
+        }
     }
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
@@ -81,6 +150,9 @@ impl Storage {
         if current < 4 {
             tx.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))?;
         }
+        if current < 5 {
+            tx.execute_batch(include_str!("../migrations/005_provenance.sql"))?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -88,8 +160,8 @@ impl Storage {
 
     pub fn upsert_usage(&mut self, record: &UsageRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage",
-            params![record.account_id.to_string(),record.product_id,record.billing_scope_id,record.source_record_id,record.period_start.to_rfc3339(),record.period_end.to_rfc3339(),record.model,record.input_tokens,record.output_tokens,record.cached_tokens,record.reasoning_tokens,record.total_tokens,record.requests,record.source,format!("{:?}",record.coverage)])?;
+            "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage,connection_id=excluded.connection_id,file_id=excluded.file_id,file_generation=excluded.file_generation",
+            params![record.account_id.to_string(),record.product_id,record.billing_scope_id,record.source_record_id,record.period_start.to_rfc3339(),record.period_end.to_rfc3339(),record.model,record.input_tokens,record.output_tokens,record.cached_tokens,record.reasoning_tokens,record.total_tokens,record.requests,record.source,format!("{:?}",record.coverage),record.connection_id,record.file_id,record.file_generation.unwrap_or(1)])?;
         Ok(())
     }
 
@@ -179,6 +251,200 @@ impl Storage {
         Ok(old.byte_offset.min(new_size))
     }
 
+    /// Explicit source connection: one stable identity per
+    /// (provider, product, root). Default and custom roots never share
+    /// a connection, so their histories can never merge implicitly.
+    /// The connection id is a deterministic UUID over the same triple.
+    pub fn ensure_connection(
+        &mut self,
+        account_id: uuid::Uuid,
+        provider_id: &str,
+        product_id: &str,
+        root_hash: &str,
+        root_hint: &str,
+        kind: &str,
+    ) -> Result<SourceConnection> {
+        let id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("usage.ai/connection/{provider_id}/{product_id}/{root_hash}").as_bytes(),
+        );
+        self.conn.execute(
+            "INSERT INTO source_connections(id,account_id,provider_id,product_id,root_hash,root_hint,kind,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,root_hint=excluded.root_hint,kind=excluded.kind",
+            params![
+                id.to_string(),
+                account_id.to_string(),
+                provider_id,
+                product_id,
+                root_hash,
+                root_hint,
+                kind,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        self.get_connection(&id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("connection missing after upsert"))
+    }
+
+    pub fn get_connection(&self, id: &str) -> Result<Option<SourceConnection>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id,account_id,provider_id,product_id,root_hash,root_hint,kind,identity_fingerprint,identity_confidence FROM source_connections WHERE id=?",
+                [id],
+                |r| {
+                    Ok(SourceConnection {
+                        id: r.get(0)?,
+                        account_id: r.get(1)?,
+                        provider_id: r.get(2)?,
+                        product_id: r.get(3)?,
+                        root_hash: r.get(4)?,
+                        root_hint: r.get(5)?,
+                        kind: r.get(6)?,
+                        identity_fingerprint: r.get(7)?,
+                        identity_confidence: r.get(8)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn set_connection_identity(
+        &mut self,
+        connection_id: &str,
+        fingerprint: Option<&str>,
+        confidence: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE source_connections SET identity_fingerprint=?,identity_confidence=? WHERE id=?",
+            params![fingerprint, confidence, connection_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stable internal file identity per connection. The file UUID is
+    /// deterministic over (connection, path_hash): the same logical
+    /// file always maps to the same row, across restarts.
+    pub fn ensure_source_file(
+        &mut self,
+        connection_id: &str,
+        path_hash: &str,
+        device: i64,
+        inode: i64,
+    ) -> Result<SourceFile> {
+        let id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("usage.ai/file/{connection_id}/{path_hash}").as_bytes(),
+        );
+        self.conn.execute(
+            "INSERT INTO source_files(id,connection_id,path_hash,device,inode) VALUES(?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+            params![id.to_string(), connection_id, path_hash, device, inode],
+        )?;
+        self.get_source_file(&id.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("source file missing after upsert"))
+    }
+
+    pub fn get_source_file(&self, id: &str) -> Result<Option<SourceFile>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id,connection_id,path_hash,device,inode,generation FROM source_files WHERE id=?",
+                [id],
+                |r| {
+                    Ok(SourceFile {
+                        id: r.get(0)?,
+                        connection_id: r.get(1)?,
+                        path_hash: r.get(2)?,
+                        device: r.get(3)?,
+                        inode: r.get(4)?,
+                        generation: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn file_import_state(&self, file_id: &str) -> Result<Option<FileImportState>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT file_id,byte_offset,schema_version,last_source_record_id FROM file_imports WHERE file_id=?",
+                [file_id],
+                |r| {
+                    Ok(FileImportState {
+                        file_id: r.get(0)?,
+                        byte_offset: r.get(1)?,
+                        schema_version: r.get(2)?,
+                        last_source_record_id: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Atomic file import commit (P0-04): in ONE transaction —
+    /// generation bump + old-generation row rebuild + record upserts +
+    /// offset/checkpoint update. A failure before commit leaves neither
+    /// records nor checkpoint partially stored.
+    pub fn commit_import_batch(&mut self, commit: &ImportBatchCommit<'_>) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if commit.is_replacement {
+            tx.execute(
+                "DELETE FROM usage_records WHERE file_id=? AND file_generation < ?",
+                params![commit.file_id, commit.file_generation],
+            )?;
+            tx.execute(
+                "UPDATE source_files SET device=?,inode=?,generation=? WHERE id=?",
+                params![
+                    commit.device,
+                    commit.inode,
+                    commit.file_generation,
+                    commit.file_id
+                ],
+            )?;
+        }
+        let mut accepted = 0usize;
+        {
+            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage,connection_id=excluded.connection_id,file_id=excluded.file_id,file_generation=excluded.file_generation")?;
+            for record in commit.records {
+                statement.execute(params![
+                    record.account_id.to_string(),
+                    record.product_id,
+                    record.billing_scope_id,
+                    record.source_record_id,
+                    record.period_start.to_rfc3339(),
+                    record.period_end.to_rfc3339(),
+                    record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cached_tokens,
+                    record.reasoning_tokens,
+                    record.total_tokens,
+                    record.requests,
+                    record.source,
+                    format!("{:?}", record.coverage),
+                    record.connection_id,
+                    record.file_id,
+                    record.file_generation.unwrap_or(1)
+                ])?;
+                accepted += 1;
+            }
+        }
+        tx.execute(
+            "INSERT INTO file_imports(file_id,byte_offset,schema_version,last_source_record_id,touched_at) VALUES(?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET byte_offset=excluded.byte_offset,schema_version=excluded.schema_version,last_source_record_id=excluded.last_source_record_id,touched_at=excluded.touched_at",
+            params![
+                commit.file_id,
+                commit.byte_offset,
+                commit.schema_version,
+                commit.last_source_record_id,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(accepted)
+    }
+
     /// Last-known-good snapshot store. A new provider result replaces the
     /// stored payload only after successful fetch/parse/validate/map and a
     /// transactional commit performed by the caller beforehand — a failed
@@ -235,7 +501,7 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut accepted = 0usize;
         {
-            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
+            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
             for record in records {
                 statement.execute(params![
                     record.account_id.to_string(),
@@ -252,7 +518,10 @@ impl Storage {
                     record.total_tokens,
                     record.requests,
                     record.source,
-                    format!("{:?}", record.coverage)
+                    format!("{:?}", record.coverage),
+                    record.connection_id,
+                    record.file_id,
+                    record.file_generation.unwrap_or(1)
                 ])?;
                 accepted += 1;
             }
@@ -308,7 +577,7 @@ impl Storage {
         )?;
         let mut usage_accepted = 0usize;
         {
-            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
+            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
             for record in bundle.usage {
                 statement.execute(params![
                     record.account_id.to_string(),
@@ -325,7 +594,10 @@ impl Storage {
                     record.total_tokens,
                     record.requests,
                     record.source,
-                    format!("{:?}", record.coverage)
+                    format!("{:?}", record.coverage),
+                    record.connection_id,
+                    record.file_id,
+                    record.file_generation.unwrap_or(1)
                 ])?;
                 usage_accepted += 1;
             }
@@ -444,8 +716,11 @@ impl Storage {
             "DELETE FROM cost_records WHERE period_end < ?",
             [history_before.to_rfc3339()],
         )?;
+        // Retention must never break SWR: the newest successful
+        // snapshot of every active account/product survives regardless
+        // of the age cutoff.
         let snapshots = self.conn.execute(
-            "DELETE FROM snapshots WHERE fetched_at < ?",
+            "DELETE FROM snapshots WHERE fetched_at < ? AND id NOT IN (SELECT MAX(id) FROM snapshots GROUP BY account_id, product_id)",
             [history_before.to_rfc3339()],
         )?;
         let attempts_cutoff = Utc::now() - chrono::Duration::days(30);
@@ -1149,6 +1424,9 @@ mod tests {
             requests: Some(1),
             source: "local".into(),
             coverage: Coverage::LocalClientOnly,
+            connection_id: None,
+            file_id: None,
+            file_generation: None,
         }
     }
     #[test]
@@ -1283,6 +1561,16 @@ mod tests {
         .unwrap();
         s.save_snapshot(Uuid::nil(), "codex", "{}", None, old)
             .unwrap();
+        // A superseded-but-newer snapshot is the newest LKG and must
+        // survive retention so SWR keeps its fallback.
+        s.save_snapshot(
+            Uuid::nil(),
+            "codex",
+            "{}",
+            None,
+            old - chrono::Duration::days(10),
+        )
+        .unwrap();
         s.record_attempt(&AttemptLog {
             account_id: Uuid::nil(),
             product_id: "codex",
@@ -1443,5 +1731,183 @@ mod tests {
         assert!(models.iter().any(|(m, v)| m.is_none() && *v == 10));
         assert!(s.cost_records_between(start, end).unwrap().is_empty());
         assert_eq!(s.list_accounts().unwrap().len(), 0);
+    }
+    fn provenanced(
+        id: &str,
+        total: u64,
+        connection: &str,
+        file: &str,
+        generation: i64,
+    ) -> UsageRecord {
+        let mut record = usage(id, total);
+        record.connection_id = Some(connection.into());
+        record.file_id = Some(file.into());
+        record.file_generation = Some(generation);
+        record
+    }
+    #[test]
+    fn connections_isolate_default_and_custom_roots() {
+        let mut s = Storage::in_memory().unwrap();
+        s.upsert_account(&Account {
+            id: Uuid::nil(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "T".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        })
+        .unwrap();
+        let default = s
+            .ensure_connection(
+                Uuid::nil(),
+                "openai",
+                "codex",
+                "roothash-default",
+                "default",
+                "default-local",
+            )
+            .unwrap();
+        let custom = s
+            .ensure_connection(
+                Uuid::nil(),
+                "openai",
+                "codex",
+                "roothash-custom",
+                "work",
+                "custom-local",
+            )
+            .unwrap();
+        assert_ne!(default.id, custom.id);
+        // Same triple re-ensured maps to the same stable connection.
+        let again = s
+            .ensure_connection(
+                Uuid::nil(),
+                "openai",
+                "codex",
+                "roothash-default",
+                "default",
+                "default-local",
+            )
+            .unwrap();
+        assert_eq!(again.id, default.id);
+        let file_a = s
+            .ensure_source_file(&default.id, "pathhash-a", 7, 9)
+            .unwrap();
+        let file_b = s
+            .ensure_source_file(&custom.id, "pathhash-a", 7, 9)
+            .unwrap();
+        // Same path hash under different connections: distinct file rows.
+        assert_ne!(file_a.id, file_b.id);
+    }
+    #[test]
+    fn replacement_rebuilds_old_generation_rows_atomically() {
+        let mut s = Storage::in_memory().unwrap();
+        s.upsert_account(&Account {
+            id: Uuid::nil(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "T".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        })
+        .unwrap();
+        let connection = s
+            .ensure_connection(
+                Uuid::nil(),
+                "openai",
+                "codex",
+                "rh",
+                "default",
+                "default-local",
+            )
+            .unwrap();
+        let file = s.ensure_source_file(&connection.id, "ph", 7, 9).unwrap();
+        let v1 = vec![
+            provenanced("r1", 10, &connection.id, &file.id, 1),
+            provenanced("r2", 20, &connection.id, &file.id, 1),
+        ];
+        assert_eq!(
+            s.commit_import_batch(&ImportBatchCommit {
+                file_id: &file.id,
+                file_generation: 1,
+                is_replacement: false,
+                device: 7,
+                inode: 9,
+                records: &v1,
+                byte_offset: 100,
+                schema_version: 1,
+                last_source_record_id: Some("r2"),
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(s.usage_count().unwrap(), 2);
+        // Replacement with a new device/inode generation: old rows for
+        // this file vanish in the same transaction as the new import.
+        let v2 = vec![provenanced("r3", 5, &connection.id, &file.id, 2)];
+        assert_eq!(
+            s.commit_import_batch(&ImportBatchCommit {
+                file_id: &file.id,
+                file_generation: 2,
+                is_replacement: true,
+                device: 7,
+                inode: 10,
+                records: &v2,
+                byte_offset: 50,
+                schema_version: 1,
+                last_source_record_id: Some("r3"),
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(s.usage_count().unwrap(), 1);
+        let state = s.file_import_state(&file.id).unwrap().unwrap();
+        assert_eq!(state.byte_offset, 50);
+        assert_eq!(s.get_source_file(&file.id).unwrap().unwrap().generation, 2);
+        assert_eq!(s.get_source_file(&file.id).unwrap().unwrap().inode, 10);
+    }
+    #[test]
+    fn failed_import_batch_leaves_db_unchanged() {
+        // Fault injection at the SQL boundary: a transaction that writes
+        // rows and checkpoints, then fails, must roll everything back.
+        let mut s = Storage::in_memory().unwrap();
+        let before = s.usage_count().unwrap();
+        let failed: anyhow::Result<()> = (|| {
+            let tx = s
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,source,coverage) VALUES(?,?,?,?,?,?,?)",
+                rusqlite::params![
+                    Uuid::nil().to_string(),
+                    "codex",
+                    "fault-1",
+                    "2026-09-08T00:00:00Z",
+                    "2026-09-08T00:00:00Z",
+                    "local",
+                    "LocalClientOnly"
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO file_imports(file_id,byte_offset) VALUES(?,?)",
+                rusqlite::params!["file-1", 64],
+            )?;
+            tx.execute("THIS IS NOT SQL", [])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        assert!(failed.is_err());
+        assert_eq!(s.usage_count().unwrap(), before);
+        assert!(s.file_import_state("file-1").unwrap().is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn database_file_is_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let _storage = Storage::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
