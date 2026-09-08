@@ -1,0 +1,344 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { addAccount, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, loadAccounts, loadAppInfo, loadBudgets, loadDiagnostics, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, saveBudget, saveSettings, testConnection, updateAccount } from './lib/api';
+  import { formatAge, formatCompact, formatCountdown, stateLabel } from './lib/format';
+  import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ProviderSnapshot, Quota, StorageStatus } from './lib/types';
+
+  let snapshot: AppSnapshot | null = null;
+  let period: 'today' | 'yesterday' | '7days' | '30days' = 'today';
+  let metric: 'tokens' | 'cost' = 'tokens';
+  let breakdown: 'product' | 'model' | 'account' | 'project' = 'product';
+  let refreshing = false;
+  let notice = '';
+  let now = Date.now();
+  let selected = 'overview';
+  let settings: AppSettings = { ...defaultSettings };
+  let diagnostics: Diagnostics[] = [];
+  let accounts: AccountInfo[] = [];
+  let budgets: Budget[] = [];
+  let storageStatus: StorageStatus | null = null;
+  let appInfo: AppInfo = { version: '0.1.0', updatesEnabled: false };
+  let online = typeof navigator === 'undefined' ? true : navigator.onLine;
+  let providerFilter = '';
+  let newAlias = '';
+  let newProduct = 'openai-api';
+  let newSecret = '';
+  let testResult = '';
+  let budgetAmount = '';
+  let budgetCurrency = 'USD';
+  let budgetAccount = '';
+
+  const productOptions = [
+    { id: 'openai-api', label: 'OpenAI API (ключ)' },
+    { id: 'codex', label: 'Codex (локально)' },
+    { id: 'claude-code', label: 'Claude Code (локально)' },
+    { id: 'antigravity', label: 'Antigravity (discovery)' },
+    { id: 'glm-coding', label: 'Z.ai GLM (discovery)' },
+    { id: 'zen', label: 'OpenCode Zen (discovery)' }
+  ];
+
+  onMount(() => {
+    loadSnapshot().then((value) => snapshot = value);
+    loadSettings().then((value) => settings = value);
+    loadDiagnostics().then((value) => diagnostics = value);
+    loadAccounts().then((value) => accounts = value);
+    loadBudgets().then((value) => budgets = value);
+    loadStorageStatus().then((value) => storageStatus = value);
+    loadAppInfo().then((value) => appInfo = value);
+    let unlisten: (() => void) | undefined;
+    if ('__TAURI_INTERNALS__' in window) import('@tauri-apps/api/event').then(({ listen }) => listen('open-settings', () => selected = 'settings')).then((stop) => unlisten = stop);
+    const timer = window.setInterval(() => now = Date.now(), 1_000);
+    const onOnline = () => online = true;
+    const onOffline = () => online = false;
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    // After sleep/wake the page becomes visible again: run a single current
+    // refresh instead of replaying a missed queue.
+    const onVisible = () => { if (document.visibilityState === 'visible' && selected !== 'settings') void refresh(); };
+    document.addEventListener('visibilitychange', onVisible);
+    const key = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') window.close();
+      if (event.metaKey && event.key.toLowerCase() === 'r') { event.preventDefault(); void refresh(); }
+      if (event.metaKey && event.key === ',') { event.preventDefault(); selected = 'settings'; }
+    };
+    window.addEventListener('keydown', key);
+    return () => { window.clearInterval(timer); window.removeEventListener('keydown', key); window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); document.removeEventListener('visibilitychange', onVisible); unlisten?.(); };
+  });
+
+  async function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      snapshot = await refreshAll();
+      diagnostics = await loadDiagnostics();
+      accounts = await loadAccounts();
+      budgets = await loadBudgets();
+      storageStatus = await loadStorageStatus();
+      notice = 'Данные обновлены';
+    }
+    catch { notice = 'Не удалось обновить данные'; }
+    finally { refreshing = false; window.setTimeout(() => notice = '', 2400); }
+  }
+
+  async function exportData(format: 'csv' | 'json') {
+    notice = await exportHistory(format);
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function exportDiag() {
+    notice = await exportDiagnostics();
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function dropAccount(id: string, history: boolean) {
+    notice = await removeAccount(id, history);
+    accounts = await loadAccounts();
+    budgets = await loadBudgets();
+    snapshot = await loadSnapshot();
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function createAccount() {
+    try {
+      const [providerId, productId] = newProduct === 'openai-api' ? ['openai', 'openai-api'] : newProduct === 'codex' ? ['openai', 'codex'] : newProduct === 'claude-code' ? ['anthropic', 'claude-code'] : newProduct === 'antigravity' ? ['google', 'antigravity'] : newProduct === 'glm-coding' ? ['zai', 'glm-coding'] : ['opencode', 'zen'];
+      await addAccount(providerId, productId, newAlias || 'Аккаунт', newSecret || undefined);
+      newAlias = ''; newSecret = '';
+      accounts = await loadAccounts();
+      notice = 'Аккаунт добавлен';
+    } catch { notice = 'Не удалось добавить: проверьте название и ключ'; }
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function toggleAccount(account: AccountInfo) {
+    try { await updateAccount(account.id, { enabled: !account.enabled }); accounts = await loadAccounts(); }
+    catch { notice = 'Не удалось обновить аккаунт'; window.setTimeout(() => notice = '', 2500); }
+  }
+
+  async function probeAccount(id: string) {
+    try {
+      const result = await testConnection(id);
+      testResult = `${result.product}: ${stateLabel(result.connectionState)}`;
+    } catch { testResult = 'Проверка не удалась'; }
+    window.setTimeout(() => testResult = '', 4000);
+  }
+
+  async function createBudget() {
+    try {
+      const account = accounts.find((a) => a.id === budgetAccount) ?? accounts[0];
+      if (!account) { notice = 'Сначала добавьте аккаунт'; window.setTimeout(() => notice = '', 2500); return; }
+      await saveBudget(account.id, account.productId ?? 'openai-api', budgetCurrency, budgetAmount);
+      budgets = await loadBudgets();
+      budgetAmount = '';
+      notice = 'Бюджет сохранён';
+    } catch { notice = 'Некорректная сумма или валюта'; }
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function removeBudget(budget: Budget) {
+    await deleteBudget(budget.accountId, budget.productId, budget.currency);
+    budgets = await loadBudgets();
+  }
+
+  async function persistSettings() {
+    try { await saveSettings(settings); notice = 'Настройки сохранены'; }
+    catch { notice = 'Не удалось сохранить: shortcut занят или настройка недоступна'; }
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  function scrollToProvider(providerId: string) {
+    selected = providerId;
+    document.getElementById(providerId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function severity(quota: Quota): string {
+    if (quota.remainingPercent === undefined) return 'neutral';
+    if (quota.remainingPercent <= 0) return 'exhausted';
+    if (quota.remainingPercent <= 10) return 'critical';
+    if (quota.remainingPercent <= 25) return 'warning';
+    return 'normal';
+  }
+
+  function providerIcon(provider: ProviderSnapshot): string {
+    return ({ openai: '✣', anthropic: 'A', google: 'G', zai: 'Z', opencode: '◈' } as Record<string, string>)[provider.providerId] ?? '•';
+  }
+
+  function modelLabel(value: string | undefined): string {
+    return value && value.trim() ? value : 'Модель не определена';
+  }
+
+  $: offline = snapshot ? (snapshot.offline || !online) : !online;
+  $: costRows = snapshot ? snapshot.providers.filter((p) => p.reportedCostToday || p.estimatedCostToday) : [];
+  $: breakdownSegments = snapshot ? (breakdown === 'product' ? (snapshot.overview[period] ?? []) : breakdown === 'model' ? (snapshot.modelBreakdown?.[period] ?? []) : breakdown === 'account' ? (snapshot.accountBreakdown?.[period] ?? []) : (snapshot.projectBreakdown?.[period] ?? [])) : [];
+  $: breakdownTotal = breakdownSegments.reduce((sum, item) => sum + item.value, 0);
+  $: visibleProviders = snapshot ? snapshot.providers.filter((p) => !providerFilter.trim() || `${p.providerName} ${p.productName} ${p.alias}`.toLowerCase().includes(providerFilter.trim().toLowerCase())) : [];
+</script>
+
+<svelte:head><title>Usage.ai</title></svelte:head>
+
+<div class="app-shell" class:loading={!snapshot}>
+  <aside aria-label="Навигация">
+    <button class:active={selected === 'overview'} on:click={() => { selected = 'overview'; document.getElementById('overview')?.scrollIntoView({ behavior: 'smooth' }); }} aria-label="Обзор" title="Обзор">⌁</button>
+    <div class="nav-rule"></div>
+    {#if snapshot}
+      {#each snapshot.providers as provider}
+        <button class:active={selected === provider.productId} on:click={() => scrollToProvider(provider.productId)} aria-label={`${provider.providerName} ${provider.productName}`} title={`${provider.providerName} · ${provider.productName}`}>{providerIcon(provider)}</button>
+      {/each}
+    {/if}
+    <div class="nav-spacer"></div>
+    <button on:click={() => exportData('csv')} aria-label="Экспорт CSV" title="Экспорт CSV">⇩</button>
+    <button class:active={selected === 'settings'} on:click={() => selected = selected === 'settings' ? 'overview' : 'settings'} aria-label="Настройки" title="Настройки">⚙</button>
+  </aside>
+
+  <main>
+    {#if !snapshot}
+      <div class="skeleton-wrap" aria-label="Загрузка"><div></div><div></div><div></div></div>
+    {:else if selected === 'settings'}
+      <section class="settings-page">
+        <div class="eyebrow">USAGE.AI</div>
+        <h1>Настройки</h1>
+        <div class="setting-group">
+          <h2>Основные</h2>
+          <label><span>Запускать при входе</span><input type="checkbox" bind:checked={settings.launchAtLogin} /></label>
+          <label><span>Интервал обновления</span><select aria-label="Интервал обновления" bind:value={settings.refreshIntervalMinutes}><option value={1}>1 минута</option><option value={5}>5 минут</option><option value={10}>10 минут</option><option value={15}>15 минут</option><option value={30}>30 минут</option><option value={60}>60 минут</option><option value={null}>Вручную</option></select></label>
+          <label><span>Строка меню</span><select aria-label="Режим строки меню" bind:value={settings.menuBarMode}><option value="icon">Только значок</option><option value="iconMetric">Значок + метрика</option></select></label>
+          <label><span>Оформление</span><select aria-label="Оформление" bind:value={settings.theme}><option value="system">Системное</option><option value="light">Светлое</option><option value="dark">Тёмное</option></select></label>
+          <label><span>Глобальная клавиша</span><input class="shortcut-input" aria-label="Глобальная клавиша" bind:value={settings.globalShortcut} /></label>
+        </div>
+        <div class="setting-group">
+          <h2>Данные</h2>
+          <label><span>Хранить историю</span><select aria-label="Срок хранения" bind:value={settings.retentionDays}><option value={90}>90 дней</option><option value={30}>30 дней</option><option value={365}>1 год</option></select></label>
+          {#if storageStatus}
+            <dl><div><dt>Записей usage</dt><dd>{storageStatus.usageRecords}</dd></div><div><dt>Записей cost</dt><dd>{storageStatus.costRecords}</dd></div><div><dt>Аккаунтов</dt><dd>{storageStatus.accounts}</dd></div><div><dt>Импорт</dt><dd>{storageStatus.checkpoints} файлов · {storageStatus.lastImport ?? '—'}</dd></div><div><dt>База</dt><dd>{storageStatus.dbBytes ? `${(storageStatus.dbBytes / 1024).toFixed(0)} КБ` : '—'}</dd></div></dl>
+          {/if}
+          <div class="button-row"><button class="secondary" on:click={() => exportData('csv')}>Экспорт CSV</button><button class="secondary" on:click={() => exportData('json')}>Экспорт JSON</button><button class="secondary" on:click={exportDiag}>Диагностика</button></div>
+        </div>
+        <div class="setting-group">
+          <h2>Уведомления</h2>
+          <label><span>Уведомления включены</span><input type="checkbox" bind:checked={settings.notificationsEnabled} /></label>
+          <label><span>Порог остатка</span><input class="number-input" type="number" min="0" max="100" bind:value={settings.quotaWarningPercent} aria-label="Порог остатка" /></label>
+          <label><span>Тихие часы с</span><input class="shortcut-input" type="time" aria-label="Тихие часы с" bind:value={settings.quietHoursStart} /></label>
+          <label><span>Тихие часы до</span><input class="shortcut-input" type="time" aria-label="Тихие часы до" bind:value={settings.quietHoursEnd} /></label>
+        </div>
+        <div class="setting-group">
+          <h2>Бюджеты</h2>
+          {#if !budgets.length}<p class="muted">Бюджетов нет. Фактические расходы сравниваются помесячно, валюты не конвертируются.</p>
+          {:else}
+            {#each budgets as budget}
+              <label><span>{budget.productId} · {budget.amount} {budget.currency}</span><button class="secondary" on:click={() => removeBudget(budget)}>Удалить</button></label>
+            {/each}
+          {/if}
+          <label><span>Аккаунт</span><select aria-label="Аккаунт бюджета" bind:value={budgetAccount}>{#each accounts as account}<option value={account.id}>{account.label} · {account.productId ?? account.providerId}</option>{/each}</select></label>
+          <label><span>Сумма</span><input class="number-input" type="number" min="1" step="1" aria-label="Сумма бюджета" bind:value={budgetAmount} /></label>
+          <label><span>Валюта</span><input class="shortcut-input" aria-label="Валюта бюджета" bind:value={budgetCurrency} /></label>
+          <div class="button-row"><button class="secondary" on:click={createBudget}>Сохранить бюджет</button></div>
+        </div>
+        <div class="setting-group">
+          <h2>Аккаунты ({accounts.length})</h2>
+          <label><span>Название</span><input class="shortcut-input" aria-label="Название аккаунта" bind:value={newAlias} placeholder="Личный" /></label>
+          <label><span>Продукт</span><select aria-label="Продукт аккаунта" bind:value={newProduct}>{#each productOptions as option}<option value={option.id}>{option.label}</option>{/each}</select></label>
+          {#if newProduct === 'openai-api'}<label><span>API-ключ</span><input class="shortcut-input" type="password" aria-label="API-ключ" bind:value={newSecret} placeholder="sk-…" /></label>{/if}
+          <div class="button-row"><button class="secondary" on:click={createAccount}>Добавить</button></div>
+          {#if testResult}<p class="muted">{testResult}</p>{/if}
+          {#if !accounts.length}
+            <p class="muted">Подключённые аккаунты появятся здесь после первого обновления.</p>
+          {:else}
+            {#each accounts as account}
+              <div class="account-line"><span>{account.label} · {account.productId ?? account.providerId} · {account.enabled ? account.lifecycle : 'выключен'}</span></div>
+              <div class="button-row"><button class="secondary" on:click={() => toggleAccount(account)}>{account.enabled ? 'Выключить' : 'Включить'}</button><button class="secondary" on:click={() => probeAccount(account.id)}>Проверить</button><button class="secondary" on:click={() => dropAccount(account.id, false)}>Архив</button><button class="secondary" on:click={() => dropAccount(account.id, true)}>Удалить</button></div>
+            {/each}
+          {/if}
+        </div>
+        <div class="setting-group">
+          <h2>Диагностика ({diagnostics.length})</h2>
+          {#if !diagnostics.length}
+            <p class="muted">Нет данных. Обновите панель, затем вернитесь сюда.</p>
+          {:else}
+            {#each diagnostics as item}
+              <details><summary>{item.provider} / {item.product} · {stateLabel(item.connectionState)}</summary><dl><div><dt>Аккаунт</dt><dd>{item.accountAlias}</dd></div><div><dt>Покрытие</dt><dd>{item.coverage}</dd></div><div><dt>Коннектор</dt><dd>{item.connectorVersion} · {item.parserVersion}</dd></div><div><dt>Ошибка</dt><dd>{item.lastSafeErrorCode ?? '—'}</dd></div><div><dt>Кулдаун</dt><dd>{item.cooldownUntil ?? '—'}</dd></div></dl></details>
+            {/each}
+          {/if}
+        </div>
+        <div class="setting-group">
+          <h2>Обновления</h2>
+          <p class="muted">Версия {appInfo.version} · канал не настроен, автоматические обновления отключены до настройки подписанного релизного канала.</p>
+        </div>
+        <div class="button-row"><button class="back" on:click={() => selected = 'overview'}>← Вернуться к обзору</button><button class="save" on:click={persistSettings}>Сохранить</button></div>
+      </section>
+    {:else}
+      <div class="scroll-content">
+        <header id="overview">
+          <div><div class="eyebrow">USAGE.AI</div><h1>Добрый вечер</h1></div>
+          <button class="refresh" class:spinning={refreshing} on:click={refresh} aria-label="Обновить данные" title="Обновить (⌘R)">↻</button>
+        </header>
+
+        {#if snapshot.mode === 'demo'}<div class="demo-banner"><span>ДЕМО</span> Показаны синтетические данные — не реальные лимиты</div>{/if}
+        {#if offline}<div class="offline-banner">Офлайн · показан последний сохранённый снимок</div>{/if}
+
+        <section class="overview-card" aria-labelledby="overview-title">
+          <div class="card-title-row"><h2 id="overview-title">Быстрый обзор</h2><div class="metric-switch"><button class:chosen={metric === 'tokens'} on:click={() => metric = 'tokens'}>Токены</button><button class:chosen={metric === 'cost'} on:click={() => metric = 'cost'}>Расходы</button></div></div>
+          <div class="period-tabs" role="tablist"><button class:chosen={period === 'today'} on:click={() => period = 'today'}>Сегодня</button><button class:chosen={period === 'yesterday'} on:click={() => period = 'yesterday'}>Вчера</button><button class:chosen={period === '7days'} on:click={() => period = '7days'}>7 дней</button><button class:chosen={period === '30days'} on:click={() => period = '30days'}>30 дней</button></div>
+          {#if metric === 'tokens'}
+            <div class="period-tabs" role="tablist"><button class:chosen={breakdown === 'product'} on:click={() => breakdown = 'product'}>Продукты</button><button class:chosen={breakdown === 'model'} on:click={() => breakdown = 'model'}>Модели</button><button class:chosen={breakdown === 'account'} on:click={() => breakdown = 'account'}>Аккаунты</button><button class:chosen={breakdown === 'project'} on:click={() => breakdown = 'project'}>Проекты</button></div>
+            {#if !breakdownSegments.length || breakdownTotal <= 0}
+              <div class="empty-metric"><strong>Нет данных</strong><span>Источник пока не предоставил подтверждённые токены за период</span></div>
+            {:else}
+              <div class="total"><strong>{formatCompact(breakdownTotal)}</strong><span>токенов</span></div>
+              <div class="stacked" aria-label={`Всего ${breakdownTotal} токенов`}>{#each breakdownSegments as segment}<div style={`width:${breakdownTotal > 0 ? segment.value / breakdownTotal * 100 : 0}%;background:${segment.color}`} title={`${segment.label}: ${segment.value.toLocaleString('ru-RU')}`}></div>{/each}</div>
+              <div class="legend">{#each breakdownSegments as segment}<span><i style={`background:${segment.color}`}></i>{modelLabel(segment.label)} <b>{formatCompact(segment.value)}</b></span>{/each}</div>
+            {/if}
+          {:else if !costRows.length}
+            <div class="empty-metric"><strong>Нет данных</strong><span>Ни один источник не предоставил подтверждённые расходы. Оценка показывается только с меткой «Оценка».</span></div>
+          {:else}
+            {#each costRows as provider}
+              {#if provider.reportedCostToday}<div class="cost-row"><span>Фактические · {provider.providerName} {provider.productName}</span><strong>{provider.reportedCostToday.currency} {provider.reportedCostToday.amount}</strong></div>{/if}
+              {#if provider.estimatedCostToday}<div class="cost-row"><span>Оценка · {provider.providerName} {provider.productName}</span><strong>{provider.estimatedCostToday.currency} {provider.estimatedCostToday.amount}</strong></div>{/if}
+            {/each}
+          {/if}
+        </section>
+
+        <div class="section-label">ПРОДУКТЫ</div>
+        <input class="filter-input" aria-label="Фильтр продуктов" placeholder="Фильтр: название или аккаунт…" bind:value={providerFilter} />
+        {#each visibleProviders as provider}
+          <section class="provider-card" id={provider.productId}>
+            <div class="provider-head">
+              <div class={`brand ${provider.providerId}`}>{providerIcon(provider)}</div>
+              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{provider.alias} · <i class={`dot ${provider.connectionState}`}></i>{stateLabel(provider.connectionState)}</p></div>
+              {#if provider.planLabel}<span class="plan">{provider.planLabel}</span>{/if}
+            </div>
+            {#if provider.quotas.length}
+              {#each provider.quotas as quota}
+                <div class="quota">
+                  <div class="quota-top"><span>{quota.name}</span><strong>{quota.remainingPercent === undefined ? 'Нет данных' : `Осталось ${quota.remainingPercent}%`}</strong></div>
+                  <div class={`progress ${severity(quota)}`} title={`Источник: ${quota.source} · Покрытие: ${provider.coverage}`}><div style={`width:${quota.remainingPercent ?? 0}%`}></div>{#if quota.windowStart && quota.resetsAt && quota.windowKind === 'fixed' && provider.freshness.kind === 'Fresh'}<i class="pace" style={`left:${Math.min(100, Math.max(0, (new Date(quota.resetsAt).getTime() - now) / (new Date(quota.resetsAt).getTime() - new Date(quota.windowStart).getTime()) * 100))}%`}></i>{/if}</div>
+                  <div class="quota-meta"><span>{quota.resetsAt ? formatCountdown(quota.resetsAt, now) : 'Время сброса неизвестно'}</span><span>{formatAge(provider.fetchedAt, now)}{provider.freshness.kind === 'Stale' ? ' · устарело' : ''}</span></div>
+                </div>
+              {/each}
+            {:else}
+              <div class="unavailable"><strong>{stateLabel(provider.connectionState)}</strong><span>Источник не предоставляет подтверждённые quota‑метрики. Нулевое значение не подставлено.</span></div>
+            {/if}
+            {#if provider.tokensToday}<div class="cost-row"><span>Токены сегодня</span><strong>{provider.tokensToday.toLocaleString('ru-RU')}</strong></div>{/if}
+            {#if provider.reportedCostToday}<div class="cost-row"><span>Фактические расходы сегодня</span><strong>{provider.reportedCostToday.currency} {provider.reportedCostToday.amount}</strong></div>{/if}
+            {#if provider.estimatedCostToday}<div class="cost-row"><span>Оценка расходов сегодня</span><strong>{provider.estimatedCostToday.currency} {provider.estimatedCostToday.amount}</strong></div>{/if}
+            {#if provider.balances && provider.balances.length}
+              {#each provider.balances as balance}
+                <div class="cost-row"><span>Баланс</span><strong>{balance.currency} {balance.amount}</strong></div>
+              {/each}
+            {/if}
+            <details><summary>Источник и диагностика</summary><dl><div><dt>Покрытие</dt><dd>{provider.coverage}</dd></div><div><dt>Состояние</dt><dd>{provider.connectionState}</dd></div><div><dt>Возможности</dt><dd>{provider.capabilities.join(', ') || 'не определены'}</dd></div><div><dt>Наблюдение</dt><dd>{provider.observedAt ?? 'неизвестно'}</dd></div></dl></details>
+          </section>
+        {/each}
+      </div>
+    {/if}
+
+    {#if snapshot && selected !== 'settings'}
+      <footer><span class="update-state">●</span><span>Версия 0.1.0</span><button on:click={refresh} disabled={refreshing}>{refreshing ? 'Обновление…' : `Следующее обновление ${formatCountdown(snapshot.nextRefreshAt, now).replace('Сброс ', '').toLowerCase()}`}</button></footer>
+    {/if}
+  </main>
+  {#if notice}<div class="toast" role="status">{notice}</div>{/if}
+</div>
+
+<style>
+  .muted { font-size: 10px; color: var(--muted); }
+  .account-line { min-height: 30px; display: flex; align-items: center; font-size: 10px; border-top: 1px solid #f0eee9; }
+  .filter-input { width: 100%; border: 1px solid var(--line); background: var(--card); color: inherit; border-radius: 10px; padding: 7px 10px; font-size: 10px; margin-bottom: 10px; }
+</style>

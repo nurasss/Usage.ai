@@ -1,0 +1,20 @@
+[package]
+name = "usage-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+csv = "1"
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+usage-core = { path = "../usage-core" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+

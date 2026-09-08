@@ -1,0 +1,2 @@
+{"timestamp":"2026-09-08T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":120,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":150}},"rate_limits":{"limit_id":"codex-fixture","limit_name":"5-часовой лимит","primary":{"used_percent":32.5,"window_minutes":300,"resets_at":1788872400},"secondary":null,"plan_type":"fixture-plan"}}}
+

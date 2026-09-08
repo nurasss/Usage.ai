@@ -1,0 +1,22 @@
+[package]
+name = "usage-providers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+glob = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+rust_decimal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+usage-core = { path = "../usage-core" }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true
+
