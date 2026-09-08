@@ -3,6 +3,6 @@
   "identifier": "default",
   "description": "Minimal permissions for the Usage.ai panel",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-close"]
+  "permissions": ["core:default", "core:window:allow-hide", "core:window:allow-close", "dialog:allow-save"]
 }
 

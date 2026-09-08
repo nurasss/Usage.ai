@@ -1,19 +1,21 @@
-# Final integration matrix (working)
+# Final integration matrix (v1.1)
 
-`Verified` means the observed source schema is supported in code. It does not imply every capability exists. `Blocked` deliberately renders no fabricated value. `Configured` means the connector is implemented and activates only with user-supplied credentials/paths.
+One status per product (§39): `Implemented` / `Partial` / `DiscoveryReady` / `DiscoveryOnly` / `Blocked` / `Disabled`.
+A `DiscoveryOnly` card never passes the provider DoD. No metric is fabricated while source/auth verification remains incomplete.
 
-| Product | Quota | Local history | API usage/cost | Balance | Status |
-|---|---|---|---|---|---|
-| ChatGPT consumer | no verified source | n/a | n/a | no verified source | Blocked by source |
-| Codex | verified local snapshot | verified | n/a | observed but not persisted until semantics verified | Partial/verified |
-| OpenAI API | n/a | optional | implemented (`openai-api-connector-v1`, Admin key required) | no verified endpoint — stays unknown | Configured |
-| claude.ai | no verified source | partial through Claude Code only | n/a | no verified source | Blocked by source |
-| Claude Code | no verified quota source | verified | n/a | no verified source | Partial/verified |
-| Claude API | n/a | optional | account/scopes not configured | account/scopes not configured | Blocked by credentials/scopes |
-| Gemini consumer | no verified source | no verified source | n/a | no verified source | Blocked by source |
-| Antigravity | no stable RPC/source verified | no verified source | n/a | no verified source | Blocked by source |
-| Gemini API | n/a | optional | Cloud project/scopes not configured | no verified source | Blocked by credentials/scopes |
-| Z.ai GLM Coding Plan | no installed source verified | no installed source verified | n/a | no verified source | Blocked by source |
-| Z.ai API | n/a | optional | account not configured | account not configured | Blocked by credentials |
-| OpenCode Zen | no verified source | client config exists; history location unverified | no verified source | no verified source | Blocked by source |
-
+| Product | Baseline v1.0 | v1.1 |
+|---|---|---|
+| Codex local quota | Partial | Implemented (strategy `codex-local-jsonl`, all-files tail scan, `Unknown` window semantics) |
+| Codex history | Partial | Implemented (delta-event semantics, stable `path:offset` ids, rotation-aware import) |
+| Codex App Server | Missing | Research only — frozen by Gate A, no production code |
+| ChatGPT consumer | DiscoveryOnly | DiscoveryOnly — no promise without a permitted source |
+| OpenAI API Costs | Partial | Implemented (single logical fetch, bounded pagination, one-transaction commit) |
+| OpenAI API Usage | Missing | Missing — no verified tokens endpoint for the available scopes |
+| Claude Code history | Partial | Implemented (strategy `claude-local-jsonl`, `message.id + requestId` dedup, cache read+creation) |
+| Claude subscription quota | Missing | Missing — implemented only after a verified source |
+| Claude API | Missing | Missing — implemented only with Admin usage scope |
+| claude.ai | DiscoveryOnly | DiscoveryOnly — no promise without a permitted source |
+| Antigravity | DiscoveryOnly | DiscoveryOnly — frozen by Gate A, candidates only |
+| Gemini API | DiscoveryOnly | DiscoveryOnly — separate integration after auth/billing validation |
+| Z.ai Coding / API | DiscoveryOnly / Missing | DiscoveryOnly / Missing — contract validation first |
+| OpenCode local / Go / Zen | Missing / Missing / DiscoveryOnly | Unchanged — product separation required before any billing work |

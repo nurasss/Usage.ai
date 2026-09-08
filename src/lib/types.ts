@@ -47,6 +47,10 @@ export interface OverviewSegment { label: string; value: number; color: string; 
 export type OverviewRange = 'today' | 'yesterday' | '7days' | '30days';
 export type OverviewMap = Record<OverviewRange, OverviewSegment[]>;
 export interface Money { amount: string; currency: string; }
+export interface ProviderCost {
+  accountId: string; productId: string; label: string;
+  reported: Money[]; estimated: Money[];
+}
 export interface AppSnapshot {
   mode: 'demo' | 'live';
   offline: boolean;
@@ -55,6 +59,7 @@ export interface AppSnapshot {
   modelBreakdown?: OverviewMap;
   accountBreakdown?: OverviewMap;
   projectBreakdown?: OverviewMap;
+  costsByPeriod?: Record<string, ProviderCost[]>;
   nextRefreshAt: string;
 }
 
@@ -65,18 +70,37 @@ export interface AppSettings {
   quietHoursStart?: string; quietHoursEnd?: string;
 }
 
+export interface AttemptInfo {
+  source: string; status: string; safeCode?: string; finishedAt: string;
+}
+
 export interface Diagnostics {
   provider: string; product: string; accountAlias: string;
+  selectedSource?: string;
   connectionState: ConnectionState; lastRefreshAttempt?: string;
   lastSuccessfulRefresh?: string; lastDataObservedAt?: string;
   freshness: Freshness; coverage: Coverage; statusClass?: string;
   connectorVersion: string; parserVersion: string; schemaFingerprint?: string;
   capabilitiesDetected: string[]; cooldownUntil?: string; lastSafeErrorCode?: string;
+  warnings?: string[]; recentAttempts?: AttemptInfo[];
 }
 
 export interface AccountInfo {
   id: string; providerId: string; productId?: string; label: string; lifecycle: string;
-  connectionRef?: string; enabled: boolean; customPath?: string;
+  connectionRef?: string; enabled: boolean; customPath?: string; identityConfidence?: string;
+}
+
+export type AccountModel = 'localClient' | 'apiKey' | 'discoveryOnly';
+
+export interface ProductDescriptor {
+  providerId: string; productId: string; providerName: string; productName: string;
+  glyph: string; capabilities: Capability[]; accountModel: AccountModel;
+  allowedHosts: string[]; allowCustomPath: boolean; needsSecret: boolean;
+}
+
+export interface ImportStats {
+  productId: string; filesDiscovered: number; filesImported: number;
+  recordsAccepted: number; malformed: number; checkpointResets: number; warnings: string[];
 }
 
 export interface Budget {

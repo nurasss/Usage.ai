@@ -1,6 +1,8 @@
 # OpenAI API Integration Spec
 
-Status: **implemented behind user configuration** — connector `openai-api-connector-v1`, parser `openai-costs-parser-v1`. Live data appears only after the user adds an account with an Admin API key; otherwise the product stays `NotConfigured`/`AuthenticationRequired` with no fabricated values.
+Status: **Implemented (v1.1)** — strategy `openai-api-costs` (`OfficialApi`), connector `openai-api-connector-v1`, parser `openai-costs-page-v1`. Live data appears only after the user configures an Admin connection; otherwise the product stays `NotConfigured`/`AuthenticationRequired` with no fabricated values.
+
+0. v1.1 pipeline: one logical refresh performs one bounded paginated fetch set whose single parsed payload feeds both the snapshot and the cost import in one storage transaction; an unfinished tail degrades coverage to `Partial` (`pagination_bounded_partial`) instead of truncating silently; typed `configure_openai_admin_connection` is the only secret-writing IPC.
 
 1. Data: reported organization cost buckets by day, split by project (`billing_scope_id`) and line item; no quota pools from this source.
 2. Source: documented `GET https://api.openai.com/v1/organization/costs` (allow-listed host only, HTTPS, no redirects with secret, rustls WebPKI roots).

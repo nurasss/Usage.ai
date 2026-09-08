@@ -7,7 +7,7 @@ use std::{
 };
 use usage_core::{Account, CostRecord, UsageRecord};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 4;
 
 pub struct Storage {
     conn: Connection,
@@ -22,6 +22,8 @@ pub struct ImportCheckpoint {
     pub byte_offset: u64,
     pub schema_version: u32,
     pub last_source_record_id: Option<String>,
+    pub device: i64,
+    pub inode: i64,
 }
 
 impl Storage {
@@ -72,6 +74,12 @@ impl Storage {
         }
         if current < 2 {
             tx.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))?;
+        }
+        if current < 3 {
+            tx.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql"))?;
+        }
+        if current < 4 {
+            tx.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -127,12 +135,12 @@ impl Storage {
     }
 
     pub fn set_checkpoint(&mut self, checkpoint: &ImportCheckpoint) -> Result<()> {
-        self.conn.execute("INSERT INTO import_checkpoints(path_hash,mtime_ms,size,byte_offset,schema_version,last_source_record_id) VALUES(?,?,?,?,?,?) ON CONFLICT(path_hash) DO UPDATE SET mtime_ms=excluded.mtime_ms,size=excluded.size,byte_offset=excluded.byte_offset,schema_version=excluded.schema_version,last_source_record_id=excluded.last_source_record_id", params![checkpoint.path_hash,checkpoint.mtime_ms,checkpoint.size,checkpoint.byte_offset,checkpoint.schema_version,checkpoint.last_source_record_id])?;
+        self.conn.execute("INSERT INTO import_checkpoints(path_hash,mtime_ms,size,byte_offset,schema_version,last_source_record_id,device,inode,touched_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(path_hash) DO UPDATE SET mtime_ms=excluded.mtime_ms,size=excluded.size,byte_offset=excluded.byte_offset,schema_version=excluded.schema_version,last_source_record_id=excluded.last_source_record_id,device=excluded.device,inode=excluded.inode,touched_at=excluded.touched_at", params![checkpoint.path_hash,checkpoint.mtime_ms,checkpoint.size,checkpoint.byte_offset,checkpoint.schema_version,checkpoint.last_source_record_id,checkpoint.device,checkpoint.inode,Utc::now().to_rfc3339()])?;
         Ok(())
     }
 
     pub fn checkpoint(&self, path_hash: &str) -> Result<Option<ImportCheckpoint>> {
-        Ok(self.conn.query_row("SELECT path_hash,mtime_ms,size,byte_offset,schema_version,last_source_record_id FROM import_checkpoints WHERE path_hash=?", [path_hash], |r| Ok(ImportCheckpoint { path_hash:r.get(0)?,mtime_ms:r.get(1)?,size:r.get(2)?,byte_offset:r.get(3)?,schema_version:r.get(4)?,last_source_record_id:r.get(5)? })).optional()?)
+        Ok(self.conn.query_row("SELECT path_hash,mtime_ms,size,byte_offset,schema_version,last_source_record_id,device,inode FROM import_checkpoints WHERE path_hash=?", [path_hash], |r| Ok(ImportCheckpoint { path_hash:r.get(0)?,mtime_ms:r.get(1)?,size:r.get(2)?,byte_offset:r.get(3)?,schema_version:r.get(4)?,last_source_record_id:r.get(5)?,device:r.get(6)?,inode:r.get(7)? })).optional()?)
     }
 
     pub fn reset_checkpoint_on_rotation(
@@ -141,12 +149,336 @@ impl Storage {
         new_size: u64,
         new_mtime_ms: i64,
     ) -> Result<u64> {
-        let offset = self
-            .checkpoint(path_hash)?
-            .filter(|old| new_size >= old.size && new_mtime_ms >= old.mtime_ms)
-            .map(|old| old.byte_offset)
-            .unwrap_or(0);
-        Ok(offset.min(new_size))
+        self.offset_for_observation(path_hash, new_size, new_mtime_ms, 0, 0)
+    }
+
+    /// Rotation/replacement-aware resume offset. Replacement is proven by
+    /// device/inode change when the platform exposes them; otherwise by
+    /// size shrink. A grown file with stable identity resumes at the
+    /// stored offset.
+    pub fn offset_for_observation(
+        &mut self,
+        path_hash: &str,
+        new_size: u64,
+        new_mtime_ms: i64,
+        new_device: i64,
+        new_inode: i64,
+    ) -> Result<u64> {
+        let Some(old) = self.checkpoint(path_hash)? else {
+            return Ok(0);
+        };
+        let identity_changed =
+            (old.device != 0 || old.inode != 0 || new_device != 0 || new_inode != 0)
+                && (old.device, old.inode) != (new_device, new_inode);
+        if identity_changed || new_size < old.size {
+            return Ok(0);
+        }
+        if new_mtime_ms < old.mtime_ms && new_size == old.size {
+            return Ok(0);
+        }
+        Ok(old.byte_offset.min(new_size))
+    }
+
+    /// Last-known-good snapshot store. A new provider result replaces the
+    /// stored payload only after successful fetch/parse/validate/map and a
+    /// transactional commit performed by the caller beforehand — a failed
+    /// refresh therefore never destroys good data.
+    pub fn save_snapshot(
+        &mut self,
+        account_id: uuid::Uuid,
+        product_id: &str,
+        payload_json: &str,
+        observed_at: Option<DateTime<Utc>>,
+        fetched_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO snapshots(account_id,product_id,payload_json,observed_at,fetched_at) VALUES(?,?,?,?,?)",
+            params![
+                account_id.to_string(),
+                product_id,
+                payload_json,
+                observed_at.map(|d| d.to_rfc3339()),
+                fetched_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn last_known_good(
+        &self,
+        account_id: uuid::Uuid,
+        product_id: &str,
+    ) -> Result<Option<StoredSnapshot>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account_id,product_id,payload_json,observed_at,fetched_at FROM snapshots WHERE account_id=? AND product_id=? ORDER BY id DESC LIMIT 1",
+                params![account_id.to_string(), product_id],
+                |r| {
+                    Ok(StoredSnapshot {
+                        account_id: r.get(0)?,
+                        product_id: r.get(1)?,
+                        payload_json: r.get(2)?,
+                        observed_at: r.get(3)?,
+                        fetched_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// One batch = one transaction. Either the whole file batch lands or
+    /// the previous state stays intact.
+    pub fn import_usage_batch(&mut self, records: &[UsageRecord]) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut accepted = 0usize;
+        {
+            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
+            for record in records {
+                statement.execute(params![
+                    record.account_id.to_string(),
+                    record.product_id,
+                    record.billing_scope_id,
+                    record.source_record_id,
+                    record.period_start.to_rfc3339(),
+                    record.period_end.to_rfc3339(),
+                    record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cached_tokens,
+                    record.reasoning_tokens,
+                    record.total_tokens,
+                    record.requests,
+                    record.source,
+                    format!("{:?}", record.coverage)
+                ])?;
+                accepted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(accepted)
+    }
+
+    pub fn import_cost_batch(&mut self, records: &[CostRecord]) -> Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut accepted = 0usize;
+        {
+            let mut statement = tx.prepare("INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET amount_decimal=excluded.amount_decimal,currency=excluded.currency,kind=excluded.kind,coverage=excluded.coverage,period_start=excluded.period_start,period_end=excluded.period_end")?;
+            for record in records {
+                statement.execute(params![
+                    record.account_id.to_string(),
+                    record.product_id,
+                    record.billing_scope_id,
+                    record.source_record_id,
+                    record.period_start.to_rfc3339(),
+                    record.period_end.to_rfc3339(),
+                    record.amount_decimal.to_string(),
+                    record.currency,
+                    format!("{:?}", record.kind),
+                    record.source,
+                    format!("{:?}", record.coverage)
+                ])?;
+                accepted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(accepted)
+    }
+
+    /// Single-transaction refresh commit: snapshot payload, usage batch
+    /// and cost batch land atomically. A failure anywhere leaves the
+    /// previous last-known-good state intact.
+    pub fn commit_refresh_bundle(&mut self, bundle: &RefreshBundle<'_>) -> Result<BundleReport> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO snapshots(account_id,product_id,payload_json,observed_at,fetched_at) VALUES(?,?,?,?,?)",
+            params![
+                bundle.account_id.to_string(),
+                bundle.product_id,
+                bundle.snapshot_payload_json,
+                bundle.observed_at.map(|d| d.to_rfc3339()),
+                bundle.fetched_at.to_rfc3339()
+            ],
+        )?;
+        let mut usage_accepted = 0usize;
+        {
+            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
+            for record in bundle.usage {
+                statement.execute(params![
+                    record.account_id.to_string(),
+                    record.product_id,
+                    record.billing_scope_id,
+                    record.source_record_id,
+                    record.period_start.to_rfc3339(),
+                    record.period_end.to_rfc3339(),
+                    record.model,
+                    record.input_tokens,
+                    record.output_tokens,
+                    record.cached_tokens,
+                    record.reasoning_tokens,
+                    record.total_tokens,
+                    record.requests,
+                    record.source,
+                    format!("{:?}", record.coverage)
+                ])?;
+                usage_accepted += 1;
+            }
+        }
+        let mut costs_accepted = 0usize;
+        {
+            let mut statement = tx.prepare("INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET amount_decimal=excluded.amount_decimal,currency=excluded.currency,kind=excluded.kind,coverage=excluded.coverage,period_start=excluded.period_start,period_end=excluded.period_end")?;
+            for record in bundle.costs {
+                statement.execute(params![
+                    record.account_id.to_string(),
+                    record.product_id,
+                    record.billing_scope_id,
+                    record.source_record_id,
+                    record.period_start.to_rfc3339(),
+                    record.period_end.to_rfc3339(),
+                    record.amount_decimal.to_string(),
+                    record.currency,
+                    format!("{:?}", record.kind),
+                    record.source,
+                    format!("{:?}", record.coverage)
+                ])?;
+                costs_accepted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(BundleReport {
+            usage_accepted,
+            costs_accepted,
+        })
+    }
+
+    pub fn record_attempt(&mut self, attempt: &AttemptLog<'_>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO source_attempts(account_id,product_id,source,status,safe_code,started_at,finished_at) VALUES(?,?,?,?,?,?,?)",
+            params![
+                attempt.account_id.to_string(),
+                attempt.product_id,
+                attempt.source,
+                attempt.status,
+                attempt.safe_code,
+                attempt.started_at.to_rfc3339(),
+                attempt.finished_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_attempts(
+        &self,
+        account_id: uuid::Uuid,
+        product_id: &str,
+        limit: u64,
+    ) -> Result<Vec<SourceAttempt>> {
+        let mut statement = self.conn.prepare("SELECT account_id,product_id,source,status,safe_code,started_at,finished_at FROM source_attempts WHERE account_id=? AND product_id=? ORDER BY id DESC LIMIT ?")?;
+        let rows = statement
+            .query_map(
+                params![account_id.to_string(), product_id, limit as i64],
+                |r| {
+                    Ok(SourceAttempt {
+                        account_id: r.get(0)?,
+                        product_id: r.get(1)?,
+                        source: r.get(2)?,
+                        status: r.get(3)?,
+                        safe_code: r.get(4)?,
+                        started_at: r.get(5)?,
+                        finished_at: r.get(6)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_cooldown(
+        &mut self,
+        account_id: uuid::Uuid,
+        source: &str,
+        until_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cooldowns(account_id,source,until_at) VALUES(?,?,?) ON CONFLICT(account_id,source) DO UPDATE SET until_at=excluded.until_at",
+            params![account_id.to_string(), source, until_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_cooldowns(&self) -> Result<Vec<(String, String, String)>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT account_id,source,until_at FROM cooldowns WHERE until_at > ?")?;
+        let rows = statement
+            .query_map([Utc::now().to_rfc3339()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn clear_cooldown(&mut self, account_id: uuid::Uuid, source: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM cooldowns WHERE account_id=? AND source=?",
+            params![account_id.to_string(), source],
+        )?;
+        Ok(())
+    }
+
+    /// Retention covers every category explicitly. Active import
+    /// checkpoints are never deleted by age — only ones untouched for
+    /// longer than twice the history retention.
+    pub fn prune_retention(&mut self, history_before: DateTime<Utc>) -> Result<RetentionReport> {
+        let usage = self.conn.execute(
+            "DELETE FROM usage_records WHERE period_end < ?",
+            [history_before.to_rfc3339()],
+        )?;
+        let costs = self.conn.execute(
+            "DELETE FROM cost_records WHERE period_end < ?",
+            [history_before.to_rfc3339()],
+        )?;
+        let snapshots = self.conn.execute(
+            "DELETE FROM snapshots WHERE fetched_at < ?",
+            [history_before.to_rfc3339()],
+        )?;
+        let attempts_cutoff = Utc::now() - chrono::Duration::days(30);
+        let attempts = self.conn.execute(
+            "DELETE FROM source_attempts WHERE finished_at < ?",
+            [attempts_cutoff.to_rfc3339()],
+        )?;
+        let notifications_cutoff = Utc::now() - chrono::Duration::days(90);
+        let notifications = self.conn.execute(
+            "DELETE FROM notification_deliveries WHERE delivered_at < ?",
+            [notifications_cutoff.to_rfc3339()],
+        )?;
+        let retention_days = Utc::now()
+            .signed_duration_since(history_before)
+            .num_days()
+            .max(30);
+        let stale_checkpoints_cutoff = Utc::now() - chrono::Duration::days(2 * retention_days);
+        let checkpoints = self.conn.execute(
+            "DELETE FROM import_checkpoints WHERE touched_at IS NOT NULL AND touched_at < ?",
+            [stale_checkpoints_cutoff.to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM cooldowns WHERE until_at <= ?",
+            [Utc::now().to_rfc3339()],
+        )?;
+        Ok(RetentionReport {
+            usage,
+            costs,
+            snapshots,
+            attempts,
+            notifications,
+            checkpoints,
+        })
     }
 
     pub fn export_json(&self) -> Result<String> {
@@ -374,7 +706,7 @@ impl Storage {
         Ok(self
             .conn
             .query_row(
-                "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path FROM accounts WHERE id=?",
+                "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence FROM accounts WHERE id=?",
                 [account_id.to_string()],
                 |r| {
                     let id_raw: String = r.get(0)?;
@@ -394,6 +726,7 @@ impl Storage {
                         },
                         enabled: enabled_int != 0,
                         custom_path: r.get(8)?,
+                        identity_confidence: parse_confidence(r.get(9)?),
                     })
                 },
             )
@@ -402,7 +735,7 @@ impl Storage {
 
     pub fn list_managed_accounts(&self) -> Result<Vec<ManagedAccount>> {
         let mut statement = self.conn.prepare(
-            "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path FROM accounts ORDER BY alias",
+            "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence FROM accounts ORDER BY alias",
         )?;
         let rows = statement
             .query_map([], |r| {
@@ -423,6 +756,7 @@ impl Storage {
                     },
                     enabled: enabled_int != 0,
                     custom_path: r.get(8)?,
+                    identity_confidence: parse_confidence(r.get(9)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -431,7 +765,7 @@ impl Storage {
 
     pub fn create_managed_account(&mut self, account: &ManagedAccount) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,created_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,product_id=excluded.product_id,external_identity_fingerprint=excluded.external_identity_fingerprint,alias=excluded.alias,connection_ref=excluded.connection_ref,lifecycle=excluded.lifecycle,enabled=excluded.enabled,custom_path=excluded.custom_path",
+            "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,product_id=excluded.product_id,external_identity_fingerprint=excluded.external_identity_fingerprint,alias=excluded.alias,connection_ref=excluded.connection_ref,lifecycle=excluded.lifecycle,enabled=excluded.enabled,custom_path=excluded.custom_path,identity_confidence=excluded.identity_confidence",
             params![
                 account.id.to_string(),
                 account.provider_id,
@@ -442,6 +776,7 @@ impl Storage {
                 format!("{:?}", account.lifecycle),
                 i64::from(account.enabled),
                 account.custom_path,
+                format!("{:?}", account.identity_confidence),
                 Utc::now().to_rfc3339()
             ],
         )?;
@@ -647,6 +982,7 @@ pub struct ManagedAccount {
     pub lifecycle: usage_core::AccountLifecycle,
     pub enabled: bool,
     pub custom_path: Option<String>,
+    pub identity_confidence: usage_core::IdentityConfidence,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -671,6 +1007,14 @@ impl Budget {
     }
 }
 
+fn parse_confidence(raw: String) -> usage_core::IdentityConfidence {
+    match raw.as_str() {
+        "Verified" => usage_core::IdentityConfidence::Verified,
+        "Weak" => usage_core::IdentityConfidence::Weak,
+        _ => usage_core::IdentityConfidence::Unknown,
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageStatus {
@@ -680,6 +1024,68 @@ pub struct StorageStatus {
     pub checkpoints: u64,
     pub last_import: Option<String>,
     pub db_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredSnapshot {
+    pub account_id: String,
+    pub product_id: String,
+    pub payload_json: String,
+    pub observed_at: Option<String>,
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceAttempt {
+    pub account_id: String,
+    pub product_id: String,
+    pub source: String,
+    pub status: String,
+    pub safe_code: Option<String>,
+    pub started_at: String,
+    pub finished_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RefreshBundle<'a> {
+    pub account_id: uuid::Uuid,
+    pub product_id: &'a str,
+    pub snapshot_payload_json: &'a str,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub fetched_at: DateTime<Utc>,
+    pub usage: &'a [UsageRecord],
+    pub costs: &'a [CostRecord],
+}
+
+#[derive(Debug, Clone)]
+pub struct AttemptLog<'a> {
+    pub account_id: uuid::Uuid,
+    pub product_id: &'a str,
+    pub source: &'a str,
+    pub status: &'a str,
+    pub safe_code: Option<&'a str>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleReport {
+    pub usage_accepted: usize,
+    pub costs_accepted: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionReport {
+    pub usage: usize,
+    pub costs: usize,
+    pub snapshots: usize,
+    pub attempts: usize,
+    pub notifications: usize,
+    pub checkpoints: usize,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -744,9 +1150,176 @@ mod tests {
             byte_offset: 90,
             schema_version: 1,
             last_source_record_id: None,
+            device: 7,
+            inode: 9,
         })
         .unwrap();
         assert_eq!(s.reset_checkpoint_on_rotation("x", 10, 3).unwrap(), 0);
+    }
+    #[test]
+    fn replacement_by_inode_resets_even_when_size_grows() {
+        let mut s = Storage::in_memory().unwrap();
+        s.set_checkpoint(&ImportCheckpoint {
+            path_hash: "y".into(),
+            mtime_ms: 2,
+            size: 100,
+            byte_offset: 100,
+            schema_version: 1,
+            last_source_record_id: None,
+            device: 7,
+            inode: 9,
+        })
+        .unwrap();
+        // Same path, bigger size, but different file identity: replacement.
+        assert_eq!(s.offset_for_observation("y", 200, 3, 7, 10).unwrap(), 0);
+        // Same identity, appended: resume.
+        assert_eq!(s.offset_for_observation("y", 200, 3, 7, 9).unwrap(), 100);
+    }
+    #[test]
+    fn snapshot_last_known_good_survives_failed_update() {
+        let mut s = Storage::in_memory().unwrap();
+        s.upsert_account(&Account {
+            id: Uuid::nil(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "T".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        })
+        .unwrap();
+        s.save_snapshot(Uuid::nil(), "codex", r#"{"v":1}"#, None, Utc::now())
+            .unwrap();
+        // A failed transactional update must leave the good snapshot intact.
+        let failed: anyhow::Result<()> = (|| {
+            let tx = s
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO snapshots(account_id,product_id,payload_json,observed_at,fetched_at) VALUES(?,?,?,?,?)",
+                rusqlite::params!["bad", "codex", "oops", Option::<String>::None, "not-a-time"],
+            )?;
+            tx.execute("THIS IS NOT SQL", [])?;
+            tx.commit()?;
+            Ok(())
+        })();
+        assert!(failed.is_err());
+        let lkg = s.last_known_good(Uuid::nil(), "codex").unwrap().unwrap();
+        assert_eq!(lkg.payload_json, r#"{"v":1}"#);
+    }
+    #[test]
+    fn batch_import_is_atomic_and_attempts_persist() {
+        let mut s = Storage::in_memory().unwrap();
+        assert_eq!(
+            s.import_usage_batch(&[usage("a", 1), usage("b", 2)])
+                .unwrap(),
+            2
+        );
+        assert_eq!(s.usage_count().unwrap(), 2);
+        let now = Utc::now();
+        s.record_attempt(&AttemptLog {
+            account_id: Uuid::nil(),
+            product_id: "codex",
+            source: "codex-local-jsonl",
+            status: "ok",
+            safe_code: None,
+            started_at: now,
+            finished_at: now,
+        })
+        .unwrap();
+        s.record_attempt(&AttemptLog {
+            account_id: Uuid::nil(),
+            product_id: "codex",
+            source: "codex-local-jsonl",
+            status: "error",
+            safe_code: Some("parse_error"),
+            started_at: now,
+            finished_at: now,
+        })
+        .unwrap();
+        let attempts = s.recent_attempts(Uuid::nil(), "codex", 5).unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].status, "error");
+        s.set_cooldown(Uuid::nil(), "openai-api", now + chrono::Duration::hours(1))
+            .unwrap();
+        assert_eq!(s.load_cooldowns().unwrap().len(), 1);
+        s.clear_cooldown(Uuid::nil(), "openai-api").unwrap();
+        assert!(s.load_cooldowns().unwrap().is_empty());
+    }
+    #[test]
+    fn retention_covers_all_categories_but_keeps_active_checkpoints() {
+        let mut s = Storage::in_memory().unwrap();
+        let old = Utc::now() - chrono::Duration::days(120);
+        let mut ancient = usage("old", 5);
+        ancient.period_start = old;
+        ancient.period_end = old;
+        s.upsert_usage(&ancient).unwrap();
+        s.upsert_account(&Account {
+            id: Uuid::nil(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "T".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        })
+        .unwrap();
+        s.save_snapshot(Uuid::nil(), "codex", "{}", None, old)
+            .unwrap();
+        s.record_attempt(&AttemptLog {
+            account_id: Uuid::nil(),
+            product_id: "codex",
+            source: "x",
+            status: "ok",
+            safe_code: None,
+            started_at: old,
+            finished_at: old,
+        })
+        .unwrap();
+        // Untouched checkpoint (touched_at NULL) is active: never pruned.
+        s.conn
+            .execute(
+                "INSERT INTO import_checkpoints(path_hash,mtime_ms,size,byte_offset,schema_version) VALUES('active',1,1,1,1)",
+                [],
+            )
+            .unwrap();
+        let report = s
+            .prune_retention(Utc::now() - chrono::Duration::days(90))
+            .unwrap();
+        assert_eq!(report.usage, 1);
+        assert_eq!(report.snapshots, 1);
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.checkpoints, 0);
+    }
+    #[test]
+    fn migrates_real_v1_database_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+                .unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES('00000000-0000-0000-0000-000000000000','openai','Личный','Active','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES('00000000-0000-0000-0000-000000000000','codex','r1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',10,1,'local','LocalClientOnly')",
+                [],
+            )
+            .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.usage_count().unwrap(), 1);
+        assert_eq!(storage.list_managed_accounts().unwrap().len(), 1);
+        assert!(storage
+            .last_known_good(Uuid::nil(), "codex")
+            .unwrap()
+            .is_none());
+        // Backup of the pre-migration database must exist next to it.
+        assert!(path.with_extension("db.pre-migration.bak").exists());
     }
     #[test]
     fn export_uses_safe_alias_and_no_identity() {
@@ -811,6 +1384,7 @@ mod tests {
             lifecycle: usage_core::AccountLifecycle::Active,
             enabled: true,
             custom_path: None,
+            identity_confidence: usage_core::IdentityConfidence::Weak,
         };
         s.create_managed_account(&account).unwrap();
         assert!(s.get_account(account.id).unwrap().unwrap().enabled);

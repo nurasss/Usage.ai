@@ -22,6 +22,16 @@ pub enum AccountLifecycle {
     Archived,
 }
 
+/// How strongly the stored account identity is proven.
+/// `Unknown` local data is never auto-merged with another account.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum IdentityConfidence {
+    Verified,
+    Weak,
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Product {

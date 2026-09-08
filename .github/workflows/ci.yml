@@ -17,8 +17,8 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p usage-core -p usage-providers -p usage-storage --all-targets -- -D warnings
-      - run: cargo test -p usage-core -p usage-providers -p usage-storage
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
   intel-macos:
     runs-on: macos-13

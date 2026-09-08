@@ -52,3 +52,28 @@ footer { position: absolute; bottom: 0; left: 0; right: 0; height: 49px; display
   :root { color: #f1efeb; --surface: rgba(28,28,28,.97); --card: #242424; --muted: #99958f; --line: #3a3937; } aside { background: #202020; } aside button:hover, aside button.active, .metric-switch button.chosen, .period-tabs button.chosen { background: #373635; color: #ff866b; }.metric-switch,.period-tabs,.plan { background: #333230; }.provider-name h2 span { color: #aaa59e; }.unavailable, dl { background: #30302e; }.unavailable strong,.cost-row,.quota-top,dd { color: #ece9e4; }.demo-banner { background: #493e1f; border-color: #66572a; color: #eed88c; }.secondary,.back,.refresh,.shortcut-input,.number-input { background: #2d2d2c; }.save { background: var(--accent); }.setting-group select { color: #eee; background: #31302f; }.stacked,.progress { background: #464441; } footer { background: rgba(28,28,28,.94); }.toast { background: #eeeae4; color: #222; } }
 @media (max-height: 620px) { .scroll-content,.settings-page { padding-top: 15px; }.overview-card { padding: 12px; }.section-label { margin-top: 13px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; } }
+/* Explicit theme override wins over the OS media query. Placed last
+   so equal-specificity rules take precedence in both directions. */
+:root[data-theme="dark"] { color-scheme: dark; color: #f1efeb; --surface: rgba(28,28,28,.97); --card: #242424; --muted: #99958f; --line: #3a3937; }
+:root[data-theme="dark"] aside { background: #202020; }
+:root[data-theme="dark"] aside button:hover, :root[data-theme="dark"] aside button.active, :root[data-theme="dark"] .metric-switch button.chosen, :root[data-theme="dark"] .period-tabs button.chosen { background: #373635; color: #ff866b; }
+:root[data-theme="dark"] .metric-switch, :root[data-theme="dark"] .period-tabs, :root[data-theme="dark"] .plan { background: #333230; }
+:root[data-theme="dark"] .provider-name h2 span { color: #aaa59e; }
+:root[data-theme="dark"] .unavailable, :root[data-theme="dark"] dl { background: #30302e; }
+:root[data-theme="dark"] .unavailable strong, :root[data-theme="dark"] .cost-row, :root[data-theme="dark"] .quota-top, :root[data-theme="dark"] dd { color: #ece9e4; }
+:root[data-theme="dark"] .demo-banner { background: #493e1f; border-color: #66572a; color: #eed88c; }
+:root[data-theme="dark"] .secondary, :root[data-theme="dark"] .back, :root[data-theme="dark"] .refresh, :root[data-theme="dark"] .shortcut-input, :root[data-theme="dark"] .number-input, :root[data-theme="dark"] .filter-input { background: #2d2d2c; }
+:root[data-theme="dark"] .save { background: var(--accent); }
+:root[data-theme="dark"] .setting-group select { color: #eee; background: #31302f; }
+:root[data-theme="dark"] .stacked, :root[data-theme="dark"] .progress { background: #464441; }
+:root[data-theme="dark"] footer { background: rgba(28,28,28,.94); }
+:root[data-theme="dark"] .toast { background: #eeeae4; color: #222; }
+:root[data-theme="light"] { color-scheme: light; color: #292829; --surface: rgba(248,247,244,.97); --card: #fff; --muted: #8b8781; --line: #e9e6df; }
+:root[data-theme="light"] aside { background: #f0eee9; }
+:root[data-theme="light"] aside button:hover, :root[data-theme="light"] aside button.active, :root[data-theme="light"] .metric-switch button.chosen, :root[data-theme="light"] .period-tabs button.chosen { background: white; color: var(--accent); }
+:root[data-theme="light"] .metric-switch, :root[data-theme="light"] .period-tabs, :root[data-theme="light"] .plan { background: #f2f0eb; }
+:root[data-theme="light"] .unavailable, :root[data-theme="light"] dl { background: #f7f5f1; }
+:root[data-theme="light"] .demo-banner { background: #fff6d9; border-color: #efdda4; color: #725c2c; }
+:root[data-theme="light"] .stacked, :root[data-theme="light"] .progress { background: #eceae6; }
+:root[data-theme="light"] footer { background: rgba(248,247,244,.94); }
+:root[data-theme="light"] .toast { background: #292827; color: white; }

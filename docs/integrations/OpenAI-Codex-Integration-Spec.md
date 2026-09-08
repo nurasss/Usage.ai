@@ -1,6 +1,8 @@
 # OpenAI Codex Integration Spec
 
-Status: **partially verified on target Mac**. Connector/parser version `codex-local-session-v1`.
+Status: **Implemented (v1.1)** — strategy `codex-local-jsonl` (`LocalStructuredData`), schema `codex-jsonl-token_count-v1`.
+
+0. v1.1 semantics: every `token_count` event is one request delta keyed by stable `path:offset` identity; quota is scanned across all session tails (never newest-file-only); `window_kind` stays `Unknown` until window semantics are proven; `CODEX_HOME` is shared by refresh and import; custom roots are product-scoped.
 
 1. Data: last request tokens, dynamic quota windows, reset timestamp, plan label; credits remain unexposed pending semantics.
 2. Source: read-only local Codex JSONL session events.

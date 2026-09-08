@@ -15,19 +15,20 @@ tauri-build = { version = "2", features = [] }
 anyhow.workspace = true
 chrono.workspace = true
 glob = "0.3"
-keyring = { version = "3", features = ["apple-native"] }
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3"
-sha2.workspace = true
 usage-core = { path = "../crates/usage-core" }
+usage-host = { path = "../crates/usage-host" }
 usage-providers = { path = "../crates/usage-providers" }
+usage-runtime = { path = "../crates/usage-runtime" }
 usage-storage = { path = "../crates/usage-storage" }
 uuid.workspace = true

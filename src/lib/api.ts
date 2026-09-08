@@ -1,8 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { demoSnapshot } from './demo';
-import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, OverviewMap, StorageStatus } from './types';
+import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, OverviewMap, ProductDescriptor, StorageStatus } from './types';
 
-const inTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export const inTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 const emptyMap = (): OverviewMap => ({ today: [], yesterday: [], '7days': [], '30days': [] });
 
@@ -18,14 +18,17 @@ function withDefaults(snapshot: AppSnapshot): AppSnapshot {
     overview: pick(snapshot.overview),
     modelBreakdown: snapshot.modelBreakdown ? pick(snapshot.modelBreakdown) : emptyMap(),
     accountBreakdown: snapshot.accountBreakdown ? pick(snapshot.accountBreakdown) : emptyMap(),
-    projectBreakdown: snapshot.projectBreakdown ? pick(snapshot.projectBreakdown) : emptyMap()
+    projectBreakdown: snapshot.projectBreakdown ? pick(snapshot.projectBreakdown) : emptyMap(),
+    costsByPeriod: snapshot.costsByPeriod ?? {}
   };
 }
 
+// P0-3: inside the packaged app a backend/IPC failure is an explicit
+// error, never a silent fallback to synthetic demo numbers. Demo data
+// exists only for browser development (no Tauri runtime).
 export async function loadSnapshot(): Promise<AppSnapshot> {
   if (!inTauri()) return demoSnapshot;
-  try { return withDefaults(await invoke<AppSnapshot>('get_snapshot')); }
-  catch { return demoSnapshot; }
+  return withDefaults(await invoke<AppSnapshot>('get_snapshot'));
 }
 
 export async function refreshAll(): Promise<AppSnapshot> {
@@ -62,6 +65,9 @@ export async function removeAccount(accountId: string, deleteHistory: boolean): 
 
 export async function addAccount(providerId: string, productId: string, alias: string, secret?: string): Promise<AccountInfo> {
   if (!inTauri()) throw new Error('demo');
+  if (productId === 'openai-api' && secret) {
+    return invoke<AccountInfo>('configure_openai_admin_connection', { label: alias, secret });
+  }
   return invoke<AccountInfo>('add_account', { providerId, productId, alias, secret: secret || null });
 }
 
@@ -106,6 +112,22 @@ export async function loadAppInfo(): Promise<AppInfo> {
   if (!inTauri()) return { version: '0.1.0', updatesEnabled: false };
   try { return await invoke<AppInfo>('get_app_info'); }
   catch { return { version: '0.1.0', updatesEnabled: false }; }
+}
+
+export async function loadDescriptors(): Promise<ProductDescriptor[]> {
+  if (!inTauri()) return [];
+  return invoke<ProductDescriptor[]>('get_descriptors');
+}
+
+export async function loadImportStats(): Promise<ImportStats[]> {
+  if (!inTauri()) return [];
+  try { return await invoke<ImportStats[]>('get_import_stats'); }
+  catch { return []; }
+}
+
+export async function reportOnlineState(online: boolean): Promise<void> {
+  if (!inTauri()) return;
+  try { await invoke('report_online_state', { online }); } catch { /* observed state only */ }
 }
 
 export const defaultSettings: AppSettings = { launchAtLogin: false, refreshIntervalMinutes: 5, menuBarMode: 'icon', globalShortcut: 'Ctrl+Alt+U', theme: 'system', retentionDays: 90, quotaWarningPercent: 20, notificationsEnabled: false };

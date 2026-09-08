@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use std::{collections::BTreeSet, str::FromStr, time::Duration};
 use usage_core::{
     Account, Capability, ConnectionState, Coverage, Freshness, MoneyBalance, ProviderAdapter,
-    ProviderError, Snapshot, UsageRecord,
+    ProviderError, Snapshot,
 };
 use uuid::Uuid;
 
@@ -24,6 +24,9 @@ pub struct OpenAiApiAdapter {
 pub struct ParsedCosts {
     pub records: Vec<CostDraft>,
     pub truncated: bool,
+    /// Opaque pagination cursor when the API offers one and more
+    /// pages remain; `None` means the result is complete.
+    pub next_cursor: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -47,12 +50,20 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
         .get("data")
         .and_then(|v| v.as_array())
         .ok_or_else(|| ProviderError::Parse("openai_costs_schema_changed".into()))?;
+    // Only an explicit cursor field is followed. Bucket/item ids are
+    // never guessed as pagination cursors: a wrong `starting_after`
+    // would silently skip or duplicate billing rows.
     let mut out = ParsedCosts {
         records: vec![],
         truncated: value
             .get("has_more")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
+        next_cursor: ["next_cursor", "starting_after"]
+            .iter()
+            .filter_map(|key| value.get(*key)?.as_str())
+            .map(|s| s.to_string())
+            .next(),
         warnings: vec![],
     };
     for (bucket_idx, bucket) in data.iter().enumerate() {
@@ -103,8 +114,12 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             out.records.push(CostDraft {
+                // Identity includes currency: two rows for the same
+                // bucket/scope in different currencies must not
+                // overwrite each other. Amount is excluded on purpose:
+                // a corrected re-report must update, not duplicate.
                 source_record_id: format!(
-                    "openai-costs:{start}:{end}:{}:{}",
+                    "openai-costs:{start}:{end}:{currency}:{}:{}",
                     project_id.as_deref().unwrap_or("org"),
                     line_item.as_deref().unwrap_or("all")
                 ),
@@ -132,41 +147,140 @@ impl OpenAiApiAdapter {
         key_fingerprint("openai-api", api_key)
     }
 
+    fn page_url(&self, start: DateTime<Utc>, end: DateTime<Utc>, cursor: Option<&str>) -> String {
+        let mut url = format!(
+            "{}{COSTS_PATH}?start_time={}&end_time={}&bucket_width=1d&limit=180",
+            self.base(),
+            start.timestamp(),
+            end.timestamp()
+        );
+        if let Some(cursor) = cursor {
+            use std::fmt::Write;
+            let _ = write!(url, "&starting_after={cursor}");
+        }
+        url
+    }
+
+    /// One logical fetch set: all pages share a single parsed payload
+    /// that produces the snapshot and the cost records together (P0-1).
+    /// Pagination is bounded; an unfinished tail degrades coverage to
+    /// `Partial` instead of silently truncating the bill.
+    pub async fn fetch_report(
+        &self,
+        account: &Account,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<CostsReport, ProviderError> {
+        if api_key.trim().is_empty() {
+            return Err(ProviderError::AuthenticationRequired);
+        }
+        let end = Utc::now();
+        let start = end - chrono::Duration::days(30);
+        let mut drafts = vec![];
+        let mut warnings = vec![];
+        let mut cursor: Option<String> = None;
+        let mut truncated = false;
+        let mut pages = 0usize;
+        loop {
+            let url = self.page_url(start, end, cursor.as_deref());
+            let (_status, value) = fetch_json(&url, api_key, OPENAI_API_HOSTS, timeout).await?;
+            let parsed = parse_costs(&value, "openai-api-costs-v1")?;
+            warnings.extend(parsed.warnings);
+            drafts.extend(parsed.records);
+            pages += 1;
+            if !parsed.truncated {
+                break;
+            }
+            match parsed.next_cursor {
+                Some(next) if pages < usage_host::policy::MAX_API_PAGES => cursor = Some(next),
+                _ => {
+                    truncated = true;
+                    warnings.push("pagination_bounded_partial".into());
+                    break;
+                }
+            }
+        }
+        Ok(build_report(
+            account,
+            &self.capabilities(),
+            drafts,
+            warnings,
+            truncated,
+            start,
+        ))
+    }
+
     pub async fn refresh_with_key(
         &self,
         account: &Account,
         api_key: &str,
         timeout: Duration,
     ) -> Result<Snapshot, ProviderError> {
-        if api_key.trim().is_empty() {
-            return Err(ProviderError::AuthenticationRequired);
-        }
-        let end = Utc::now();
-        let start = end - chrono::Duration::days(30);
-        let url = format!(
-            "{}{COSTS_PATH}?start_time={}&end_time={}&bucket_width=1d&limit=180",
-            self.base(),
-            start.timestamp(),
-            end.timestamp()
-        );
-        let (_status, value) = fetch_json(&url, api_key, OPENAI_API_HOSTS, timeout).await?;
-        let parsed = parse_costs(&value, "openai-api-costs-v1")?;
-        let fetched_at = Utc::now();
-        let observed_at = parsed
-            .records
-            .iter()
-            .map(|r| r.period_end)
-            .max()
-            .unwrap_or(start);
-        let age = (fetched_at - observed_at).num_seconds().max(0) as u64;
-        let usage_records: Vec<UsageRecord> = vec![];
-        let _ = usage_records;
-        Ok(Snapshot {
+        Ok(self.fetch_report(account, api_key, timeout).await?.snapshot)
+    }
+
+    pub async fn import_costs_with_key(
+        &self,
+        account: &Account,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<(Vec<usage_core::CostRecord>, Vec<String>), ProviderError> {
+        let report = self.fetch_report(account, api_key, timeout).await?;
+        Ok((report.costs, report.warnings))
+    }
+
+    pub fn balances_from(&self, _account_id: Uuid) -> Vec<MoneyBalance> {
+        // No documented stable balance endpoint is verified for this adapter;
+        // absence is reported as unknown, never as zero.
+        vec![]
+    }
+}
+
+pub struct CostsReport {
+    pub snapshot: Snapshot,
+    pub costs: Vec<usage_core::CostRecord>,
+    pub warnings: Vec<String>,
+    pub truncated: bool,
+}
+
+fn build_report(
+    account: &Account,
+    capabilities: &BTreeSet<Capability>,
+    drafts: Vec<CostDraft>,
+    warnings: Vec<String>,
+    truncated: bool,
+    start: DateTime<Utc>,
+) -> CostsReport {
+    let observed_at = drafts.iter().map(|r| r.period_end).max().unwrap_or(start);
+    let fetched_at = Utc::now();
+    let age = (fetched_at - observed_at).num_seconds().max(0) as u64;
+    let costs = drafts
+        .into_iter()
+        .map(|draft| usage_core::CostRecord {
+            account_id: account.id,
+            product_id: "openai-api".into(),
+            billing_scope_id: draft.project_id,
+            source_record_id: draft.source_record_id,
+            period_start: draft.period_start,
+            period_end: draft.period_end,
+            amount_decimal: draft.amount,
+            currency: draft.currency,
+            kind: usage_core::CostKind::Reported,
+            source: "openai-api-costs-v1".into(),
+            coverage: if truncated {
+                Coverage::Partial
+            } else {
+                Coverage::ProviderDelayed
+            },
+        })
+        .collect();
+    CostsReport {
+        snapshot: Snapshot {
             account_id: account.id,
             provider_id: "openai".into(),
             product_id: "openai-api".into(),
             plan_label: None,
-            capabilities: self.capabilities(),
+            capabilities: capabilities.clone(),
             quotas: vec![],
             balances: vec![],
             observed_at: Some(observed_at),
@@ -177,54 +291,15 @@ impl OpenAiApiAdapter {
             } else {
                 Freshness::Stale(age)
             },
-            coverage: if parsed.truncated {
+            coverage: if truncated {
                 Coverage::Partial
             } else {
                 Coverage::ProviderDelayed
             },
-        })
-    }
-
-    pub async fn import_costs_with_key(
-        &self,
-        account: &Account,
-        api_key: &str,
-        timeout: Duration,
-    ) -> Result<(Vec<usage_core::CostRecord>, Vec<String>), ProviderError> {
-        let end = Utc::now();
-        let start = end - chrono::Duration::days(30);
-        let url = format!(
-            "{}{COSTS_PATH}?start_time={}&end_time={}&bucket_width=1d&limit=180",
-            self.base(),
-            start.timestamp(),
-            end.timestamp()
-        );
-        let (_status, value) = fetch_json(&url, api_key, OPENAI_API_HOSTS, timeout).await?;
-        let parsed = parse_costs(&value, "openai-api-costs-v1")?;
-        let records = parsed
-            .records
-            .into_iter()
-            .map(|draft| usage_core::CostRecord {
-                account_id: account.id,
-                product_id: "openai-api".into(),
-                billing_scope_id: draft.project_id,
-                source_record_id: draft.source_record_id,
-                period_start: draft.period_start,
-                period_end: draft.period_end,
-                amount_decimal: draft.amount,
-                currency: draft.currency,
-                kind: usage_core::CostKind::Reported,
-                source: "openai-api-costs-v1".into(),
-                coverage: Coverage::ProviderDelayed,
-            })
-            .collect();
-        Ok((records, parsed.warnings))
-    }
-
-    pub fn balances_from(&self, _account_id: Uuid) -> Vec<MoneyBalance> {
-        // No documented stable balance endpoint is verified for this adapter;
-        // absence is reported as unknown, never as zero.
-        vec![]
+        },
+        costs,
+        warnings,
+        truncated,
     }
 }
 
@@ -237,14 +312,7 @@ impl ProviderAdapter for OpenAiApiAdapter {
         "openai-api"
     }
     fn capabilities(&self) -> BTreeSet<Capability> {
-        [
-            Capability::ApiCostReported,
-            Capability::ProjectBreakdown,
-            Capability::HistoryRemote,
-            Capability::MultiAccount,
-        ]
-        .into_iter()
-        .collect()
+        crate::descriptor::OPENAI_API_CAPS.iter().copied().collect()
     }
     fn allowed_hosts(&self) -> &'static [&'static str] {
         OPENAI_API_HOSTS
@@ -252,6 +320,137 @@ impl ProviderAdapter for OpenAiApiAdapter {
     async fn refresh(&self, _account: &Account) -> Result<Snapshot, ProviderError> {
         Err(ProviderError::AuthenticationRequired)
     }
+}
+
+/// Strategy wrapper: OpenAI organization costs over scoped HostServices.
+/// The secret arrives from the runtime (Keychain) per call and is never
+/// stored, logged or forwarded outside the allow-listed host.
+pub struct OpenAiCostsStrategy {
+    pub base_url: Option<String>,
+}
+
+impl OpenAiCostsStrategy {
+    fn page_url(&self, start: DateTime<Utc>, end: DateTime<Utc>, cursor: Option<&str>) -> String {
+        let base = self
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "https://api.openai.com".into());
+        let mut url = format!(
+            "{base}{COSTS_PATH}?start_time={}&end_time={}&bucket_width=1d&limit=180",
+            start.timestamp(),
+            end.timestamp()
+        );
+        if let Some(cursor) = cursor {
+            use std::fmt::Write;
+            let _ = write!(url, "&starting_after={cursor}");
+        }
+        url
+    }
+}
+
+#[async_trait]
+impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
+    fn source_id(&self) -> crate::strategy::SourceId {
+        crate::strategy::SourceId("openai-api-costs")
+    }
+    fn classification(&self) -> crate::strategy::SourceClassification {
+        crate::strategy::SourceClassification::OfficialApi
+    }
+    async fn availability(
+        &self,
+        ctx: &crate::strategy::FetchContext<'_>,
+    ) -> crate::strategy::Availability {
+        if ctx.secret.as_deref().is_some_and(|s| !s.is_empty()) {
+            crate::strategy::Availability::Ready
+        } else {
+            crate::strategy::Availability::NotConfigured
+        }
+    }
+    async fn fetch(
+        &self,
+        ctx: &crate::strategy::FetchContext<'_>,
+    ) -> Result<crate::strategy::FetchPayload, crate::strategy::SourceError> {
+        use crate::strategy::SourceError;
+        let Some(secret) = ctx.secret.as_deref() else {
+            return Err(SourceError::AuthenticationRequired);
+        };
+        if secret.is_empty() {
+            return Err(SourceError::AuthenticationRequired);
+        }
+        let end = ctx.hosts.clock.now();
+        let start = end - chrono::Duration::days(30);
+        let mut drafts = vec![];
+        let mut warnings = vec![];
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let url = self.page_url(start, end, cursor.as_deref());
+            let response = ctx
+                .hosts
+                .http
+                .get_json(usage_host::HttpJsonRequest {
+                    url: &url,
+                    bearer: Some(secret),
+                    allowed_hosts: OPENAI_API_HOSTS,
+                    timeout: ctx.timeout,
+                    max_bytes: usage_host::policy::MAX_HTTP_BYTES,
+                    user_agent: usage_host::policy::USER_AGENT,
+                })
+                .await
+                .map_err(|e| match &e {
+                    usage_host::HostError::RateLimited(retry_after_secs) => {
+                        SourceError::RateLimited {
+                            retry_after_secs: *retry_after_secs,
+                        }
+                    }
+                    other => crate::strategy::map_host_error(other),
+                })?;
+            let body = response.body.ok_or(SourceError::Parse {
+                schema: openai_api_schema(),
+            })?;
+            let parsed =
+                parse_costs(&body, "openai-api-costs-v1").map_err(|_| SourceError::Parse {
+                    schema: openai_api_schema(),
+                })?;
+            warnings.extend(parsed.warnings);
+            drafts.extend(parsed.records);
+            pages += 1;
+            if !parsed.truncated {
+                break;
+            }
+            match parsed.next_cursor {
+                Some(next) if pages < usage_host::policy::MAX_API_PAGES => cursor = Some(next),
+                _ => {
+                    warnings.push("pagination_bounded_partial".into());
+                    break;
+                }
+            }
+        }
+        let truncated = warnings.iter().any(|w| w == "pagination_bounded_partial");
+        let account = ctx.account;
+        let caps: BTreeSet<Capability> =
+            crate::descriptor::OPENAI_API_CAPS.iter().copied().collect();
+        let report = build_report(account, &caps, drafts, warnings, truncated, start);
+        let observed_at = report.snapshot.observed_at;
+        Ok(crate::strategy::FetchPayload {
+            snapshot: Some(report.snapshot),
+            usage: vec![],
+            costs: report.costs,
+            balances: vec![],
+            warnings: report.warnings,
+            schema_fingerprint: openai_api_schema(),
+            coverage: if truncated {
+                Coverage::Partial
+            } else {
+                Coverage::ProviderDelayed
+            },
+            observed_at,
+        })
+    }
+}
+
+pub fn openai_api_schema() -> &'static str {
+    "openai-costs-page-v1"
 }
 
 #[cfg(test)]
@@ -302,5 +501,130 @@ mod tests {
         assert!(caps.contains(&Capability::ApiCostReported));
         assert!(!caps.contains(&Capability::ApiCostEstimated));
         assert!(!caps.contains(&Capability::Balance));
+    }
+
+    struct ScriptHttp {
+        pages: std::sync::Mutex<Vec<serde_json::Value>>,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl usage_host::HttpHost for ScriptHttp {
+        async fn get_json(
+            &self,
+            _req: usage_host::HttpJsonRequest<'_>,
+        ) -> Result<usage_host::HttpJsonResponse, usage_host::HostError> {
+            *self.calls.lock().unwrap() += 1;
+            let body = self.pages.lock().unwrap().remove(0);
+            Ok(usage_host::HttpJsonResponse {
+                status: 200,
+                retry_after_secs: None,
+                body: Some(body),
+            })
+        }
+    }
+
+    fn test_hosts(
+        pages: Vec<serde_json::Value>,
+    ) -> (usage_host::Hosts, std::sync::Arc<ScriptHttp>) {
+        use std::sync::Arc;
+        let http = Arc::new(ScriptHttp {
+            pages: std::sync::Mutex::new(pages),
+            calls: std::sync::Mutex::new(0),
+        });
+        let hosts = usage_host::Hosts {
+            clock: Arc::new(usage_host::SystemClock),
+            logger: Arc::new(usage_host::NullLogger),
+            keychain: Arc::new(usage_host::MemoryKeychain::default()),
+            http: http.clone(),
+            files: Arc::new(usage_host::ScopedFiles),
+            network: Arc::new(usage_host::ObservedNetwork::default()),
+        };
+        (hosts, http)
+    }
+
+    fn cost_page(rows: &[(&str, f64)], has_more: bool, cursor: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "object": "page",
+            "has_more": has_more,
+            "next_cursor": cursor,
+            "data": [{
+                "start_time": 1_725_000_000,
+                "end_time": 1_725_086_400,
+                "results": rows.iter().map(|(item, amount)| {
+                    serde_json::json!({"amount": {"value": amount, "currency": "usd"}, "line_item": item})
+                }).collect::<Vec<_>>()
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn strategy_fetches_all_pages_once_per_refresh() {
+        use crate::strategy::{FetchContext, FetchStrategy};
+        let (hosts, http) = test_hosts(vec![
+            cost_page(&[("a", 1.0)], true, Some("c1")),
+            cost_page(&[("b", 2.0)], false, None),
+        ]);
+        let account = Account {
+            id: Uuid::nil(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "API".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        };
+        let ctx = FetchContext {
+            account: &account,
+            hosts: &hosts,
+            timeout: Duration::from_secs(5),
+            custom_root: None,
+            secret: Some(b"sk-test".to_vec()),
+        };
+        let payload = OpenAiCostsStrategy { base_url: None }
+            .fetch(&ctx)
+            .await
+            .unwrap();
+        // One logical refresh produced both snapshot and cost rows
+        // from a single shared parsed payload (P0-1).
+        assert!(payload.snapshot.is_some());
+        assert_eq!(payload.costs.len(), 2);
+        assert_eq!(*http.calls.lock().unwrap(), 2);
+        assert_eq!(payload.coverage, Coverage::ProviderDelayed);
+    }
+
+    #[tokio::test]
+    async fn endless_pagination_is_bounded_and_partial() {
+        use crate::strategy::{FetchContext, FetchStrategy};
+        let endless: Vec<serde_json::Value> = (0..20)
+            .map(|_| cost_page(&[("a", 1.0)], true, Some("again")))
+            .collect();
+        let (hosts, http) = test_hosts(endless);
+        let account = Account {
+            id: Uuid::nil(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "API".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        };
+        let ctx = FetchContext {
+            account: &account,
+            hosts: &hosts,
+            timeout: Duration::from_secs(5),
+            custom_root: None,
+            secret: Some(b"sk-test".to_vec()),
+        };
+        let payload = OpenAiCostsStrategy { base_url: None }
+            .fetch(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            *http.calls.lock().unwrap(),
+            usage_host::policy::MAX_API_PAGES
+        );
+        assert_eq!(payload.coverage, Coverage::Partial);
+        assert!(payload
+            .warnings
+            .contains(&"pagination_bounded_partial".to_string()));
     }
 }

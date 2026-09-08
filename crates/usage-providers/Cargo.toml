@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 usage-core = { path = "../usage-core" }
+usage-host = { path = "../usage-host" }
 uuid.workspace = true
 
 [dev-dependencies]

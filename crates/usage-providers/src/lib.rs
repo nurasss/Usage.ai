@@ -1,8 +1,10 @@
 pub mod claude;
 pub mod codex;
+pub mod descriptor;
 pub mod discovery;
 pub mod http;
 pub mod openai_api;
+pub mod strategy;
 
 use sha2::{Digest, Sha256};
 use std::path::Path;

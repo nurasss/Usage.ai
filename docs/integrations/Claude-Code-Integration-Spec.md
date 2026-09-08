@@ -1,6 +1,8 @@
 # Claude Code Integration Spec
 
-Status: **local history verified; subscription quota blocked**. Parser version `claude-code-local-session-v1`.
+Status: **history Implemented (v1.1)** — strategy `claude-local-jsonl`, schema `claude-jsonl-assistant-v1`; **subscription quota still blocked** (no verified source).
+
+0. v1.1 semantics: identity priority `message.id + requestId` → `uuid` → `path:offset`, so repeated streaming chunks share one record and never inflate totals; cache = read + creation; a reachable history source reports `Connected` with history capabilities only (no `subscriptionQuota`), an absent one reports `Unavailable`.
 
 1. Data: model, input/output/cache token categories and request time.
 2. Source: read-only Claude Code project JSONL.
