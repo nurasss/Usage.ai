@@ -92,3 +92,66 @@ impl KeychainHost for MemoryKeychain {
         Ok(())
     }
 }
+
+/// Namespace-scoped Keychain facade. The service is fixed at
+/// construction by the runtime from the product descriptor, so a
+/// provider can only address accounts inside its own namespace —
+/// never an arbitrary (service, account) pair.
+#[derive(Debug, Clone, Copy)]
+pub struct ScopedKeychain<'a, H: KeychainHost + ?Sized> {
+    inner: &'a H,
+    service: &'a str,
+}
+
+impl<'a, H: KeychainHost + ?Sized> ScopedKeychain<'a, H> {
+    pub fn new(inner: &'a H, service: &'a str) -> Self {
+        Self { inner, service }
+    }
+
+    pub fn service(&self) -> &str {
+        self.service
+    }
+
+    fn check_account(account: &str) -> Result<(), HostError> {
+        if account.is_empty() || account.len() > 128 {
+            return Err(HostError::Policy);
+        }
+        Ok(())
+    }
+
+    pub async fn read(&self, account: &str) -> Result<SecretString, HostError> {
+        Self::check_account(account)?;
+        self.inner.read(self.service, account).await
+    }
+
+    pub async fn write(&self, account: &str, secret: &[u8]) -> Result<(), HostError> {
+        Self::check_account(account)?;
+        self.inner.write(self.service, account, secret).await
+    }
+
+    pub async fn delete(&self, account: &str) -> Result<(), HostError> {
+        Self::check_account(account)?;
+        self.inner.delete(self.service, account).await
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    #[tokio::test]
+    async fn scopes_are_isolated_by_service() {
+        let inner = MemoryKeychain::default();
+        let a = ScopedKeychain::new(&inner, "service-a");
+        let b = ScopedKeychain::new(&inner, "service-b");
+        a.write("item", b"secret-a").await.unwrap();
+        assert!(b.read("item").await.is_err());
+        assert_eq!(a.read("item").await.unwrap().expose(), b"secret-a");
+    }
+    #[tokio::test]
+    async fn empty_or_oversized_accounts_rejected() {
+        let inner = MemoryKeychain::default();
+        let scope = ScopedKeychain::new(&inner, "service-a");
+        assert!(scope.read("").await.is_err());
+        assert!(scope.read(&"x".repeat(129)).await.is_err());
+    }
+}

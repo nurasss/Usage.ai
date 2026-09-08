@@ -268,6 +268,7 @@ pub async fn test_connection(
             timeout: usage_host::policy::SOURCE_TIMEOUT,
             custom_root: None,
             secret: Some(secret.expose().to_vec()),
+            cancel: usage_host::CancellationToken::new(),
         };
         use usage_providers::strategy::FetchStrategy;
         let now = chrono::Utc::now();

@@ -10,6 +10,17 @@ pub enum AccountModel {
     DiscoveryOnly,
 }
 
+/// One fetch source declared by a product descriptor. The runtime
+/// builds its strategy order from exactly this list — there is no
+/// second hard-coded registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceDescriptor {
+    pub id: &'static str,
+    pub classification: crate::strategy::SourceClassification,
+    pub kill_switch: &'static str,
+    pub version: &'static str,
+}
+
 /// Single source of truth for every product surface:
 /// runtime registry, UI product list, icons, capability-driven
 /// settings, allowed hosts, diagnostics and account policy.
@@ -21,9 +32,12 @@ pub struct ProductDescriptor {
     pub provider_name: &'static str,
     pub product_name: &'static str,
     pub glyph: &'static str,
+    pub color: &'static str,
     pub capabilities: &'static [Capability],
     pub account_model: AccountModel,
     pub allowed_hosts: &'static [&'static str],
+    /// Ordered fetch sources; the runtime strategy order follows this list.
+    pub sources: &'static [SourceDescriptor],
     /// Glob relative to the product root, e.g. `sessions/**/rollout-*.jsonl`.
     pub local_glob: Option<&'static str>,
     /// Env override for the product home, e.g. `CODEX_HOME`.
@@ -58,6 +72,29 @@ pub const OPENAI_API_CAPS: &[Capability] = &[
 
 pub const NO_CAPS: &[Capability] = &[];
 
+pub const CODEX_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: "codex-local-jsonl",
+    classification: crate::strategy::SourceClassification::LocalStructuredData,
+    kill_switch: "",
+    version: "v1",
+}];
+
+pub const CLAUDE_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: "claude-local-jsonl",
+    classification: crate::strategy::SourceClassification::LocalStructuredData,
+    kill_switch: "",
+    version: "v1",
+}];
+
+pub const OPENAI_API_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
+    id: "openai-api-costs",
+    classification: crate::strategy::SourceClassification::OfficialApi,
+    kill_switch: "",
+    version: "v1",
+}];
+
+pub const NO_SOURCES: &[SourceDescriptor] = &[];
+
 const DESCRIPTORS: &[ProductDescriptor] = &[
     ProductDescriptor {
         provider_id: "openai",
@@ -65,9 +102,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "OpenAI",
         product_name: "Codex",
         glyph: "✣",
+        color: "#ff7a5c",
         capabilities: CODEX_CAPS,
         account_model: AccountModel::LocalClient,
         allowed_hosts: &[],
+        sources: CODEX_SOURCES,
         local_glob: Some("sessions/**/rollout-*.jsonl"),
         local_dir_env: Some("CODEX_HOME"),
         local_dir_name: Some(".codex"),
@@ -80,9 +119,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "Anthropic",
         product_name: "Claude Code",
         glyph: "A",
+        color: "#b895ff",
         capabilities: CLAUDE_CODE_CAPS,
         account_model: AccountModel::LocalClient,
         allowed_hosts: &[],
+        sources: CLAUDE_SOURCES,
         local_glob: Some("projects/**/*.jsonl"),
         local_dir_env: None,
         local_dir_name: Some(".claude"),
@@ -95,9 +136,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "OpenAI",
         product_name: "API",
         glyph: "✣",
+        color: "#46c9a7",
         capabilities: OPENAI_API_CAPS,
         account_model: AccountModel::ApiKey,
         allowed_hosts: crate::openai_api::OPENAI_API_HOSTS,
+        sources: OPENAI_API_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -113,6 +156,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
+        sources: NO_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -128,6 +172,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
+        sources: NO_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -140,9 +185,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "Google",
         product_name: "Antigravity",
         glyph: "G",
+        color: "#4c82ee",
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
+        sources: NO_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -155,9 +202,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "Google",
         product_name: "Gemini API",
         glyph: "G",
+        color: "#4c82ee",
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
+        sources: NO_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -170,9 +219,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "Z.ai",
         product_name: "GLM Coding Plan",
         glyph: "Z",
+        color: "#694bd7",
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
+        sources: NO_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -185,9 +236,11 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "OpenCode",
         product_name: "Zen",
         glyph: "◈",
+        color: "#2f9277",
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
+        sources: NO_SOURCES,
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
@@ -208,17 +261,28 @@ pub fn find_descriptor(provider_id: &str, product_id: &str) -> Option<&'static P
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SourceDto {
+    pub id: String,
+    pub classification: String,
+    pub kill_switch: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProductDescriptorDto {
     pub provider_id: String,
     pub product_id: String,
     pub provider_name: String,
     pub product_name: String,
     pub glyph: String,
+    pub color: String,
     pub capabilities: Vec<String>,
     pub account_model: AccountModel,
     pub allowed_hosts: Vec<String>,
     pub allow_custom_path: bool,
     pub needs_secret: bool,
+    pub sources: Vec<SourceDto>,
 }
 
 fn capability_name(value: Capability) -> String {
@@ -249,6 +313,7 @@ impl From<&ProductDescriptor> for ProductDescriptorDto {
             provider_name: d.provider_name.into(),
             product_name: d.product_name.into(),
             glyph: d.glyph.into(),
+            color: d.color.into(),
             capabilities: d
                 .capabilities
                 .iter()
@@ -259,6 +324,16 @@ impl From<&ProductDescriptor> for ProductDescriptorDto {
             allowed_hosts: d.allowed_hosts.iter().map(|h| h.to_string()).collect(),
             allow_custom_path: d.allow_custom_path,
             needs_secret: d.account_model == AccountModel::ApiKey,
+            sources: d
+                .sources
+                .iter()
+                .map(|s| SourceDto {
+                    id: s.id.into(),
+                    classification: format!("{:?}", s.classification),
+                    kill_switch: s.kill_switch.into(),
+                    version: s.version.into(),
+                })
+                .collect(),
         }
     }
 }

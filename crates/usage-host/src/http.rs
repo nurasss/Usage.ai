@@ -1,4 +1,4 @@
-use super::HostError;
+use super::{CancellationToken, HostError};
 use async_trait::async_trait;
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ pub struct HttpJsonRequest<'a> {
     pub timeout: Duration,
     pub max_bytes: usize,
     pub user_agent: &'a str,
+    pub cancel: CancellationToken,
 }
 
 pub struct HttpJsonResponse {
@@ -70,16 +71,24 @@ impl HttpHost for ReqwestHttpHost {
         builder = builder.header(reqwest::header::USER_AGENT, req.user_agent);
         // Cancel-safe: dropping the future drops the in-flight request.
         // The per-request timeout races the send, not the client.
-        let response = tokio::time::timeout(req.timeout, builder.send())
-            .await
-            .map_err(|_| HostError::Timeout)?
-            .map_err(|e| {
-                if e.is_timeout() {
-                    HostError::Timeout
-                } else {
-                    HostError::Unavailable
-                }
-            })?;
+        let send = async {
+            let response = tokio::time::timeout(req.timeout, builder.send())
+                .await
+                .map_err(|_| HostError::Timeout)?
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        HostError::Timeout
+                    } else {
+                        HostError::Unavailable
+                    }
+                })?;
+            Ok::<_, HostError>(response)
+        };
+        let response = tokio::select! {
+            biased;
+            _ = req.cancel.cancelled() => return Err(HostError::Cancelled),
+            result = send => result?,
+        };
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
             return Err(HostError::Policy);
@@ -157,6 +166,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 max_bytes: 1024,
                 user_agent: "Usage.ai-test",
+                cancel: CancellationToken::new(),
             })
             .await;
         assert!(matches!(result, Err(HostError::Policy)));
@@ -173,6 +183,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 max_bytes: 1024,
                 user_agent: "Usage.ai-test",
+                cancel: CancellationToken::new(),
             })
             .await;
         assert!(matches!(result, Err(HostError::Policy)));

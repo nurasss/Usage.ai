@@ -2,9 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use usage_providers::descriptor::{all_descriptors, find_descriptor, ProductDescriptorDto};
 
-/// Which strategy implementations serve a product, in trust order.
-/// Factories live in `refresh` so strategies can be built per account
-/// (custom roots) without shared mutable adapter state.
+/// Which strategy implementations serve a product. The ORDER comes
+/// from the product descriptor (`sources`); this mapping only resolves
+/// a declared source id to its constructor — there is no second list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrategyKind {
     CodexJsonl,
@@ -12,12 +12,45 @@ pub enum StrategyKind {
     OpenAiCosts,
 }
 
+pub fn strategy_kind(source_id: &str) -> Option<StrategyKind> {
+    match source_id {
+        "codex-local-jsonl" => Some(StrategyKind::CodexJsonl),
+        "claude-local-jsonl" => Some(StrategyKind::ClaudeJsonl),
+        "openai-api-costs" => Some(StrategyKind::OpenAiCosts),
+        _ => None,
+    }
+}
+
 pub fn strategies_for(provider_id: &str, product_id: &str) -> Vec<StrategyKind> {
-    match (provider_id, product_id) {
-        ("openai", "codex") => vec![StrategyKind::CodexJsonl],
-        ("anthropic", "claude-code") => vec![StrategyKind::ClaudeJsonl],
-        ("openai", "openai-api") => vec![StrategyKind::OpenAiCosts],
-        _ => vec![],
+    usage_providers::descriptor::find_descriptor(provider_id, product_id)
+        .map(|d| {
+            d.sources
+                .iter()
+                .filter_map(|s| strategy_kind(s.id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Host facade policy derived from exactly one descriptor: a strategy
+/// physically cannot reach hosts its product was not granted.
+pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::facade::FacadePolicy {
+    use usage_host::facade::FacadePolicy;
+    match usage_providers::descriptor::find_descriptor(provider_id, product_id) {
+        None => FacadePolicy {
+            files: false,
+            http: false,
+            keychain_service: None,
+        },
+        Some(d) => FacadePolicy {
+            files: d.local_glob.is_some(),
+            http: !d.allowed_hosts.is_empty(),
+            keychain_service: matches!(
+                d.account_model,
+                usage_providers::descriptor::AccountModel::ApiKey
+            )
+            .then_some("com.nurasss.usageai"),
+        },
     }
 }
 
@@ -118,6 +151,26 @@ mod tests {
             assert!(find_descriptor(provider, product).is_some());
             assert!(!strategies_for(provider, product).is_empty());
         }
+    }
+    #[test]
+    fn strategy_order_follows_descriptor_sources() {
+        let descriptor = find_descriptor("openai", "codex").unwrap();
+        let from_descriptor: Vec<_> = descriptor
+            .sources
+            .iter()
+            .filter_map(|s| strategy_kind(s.id))
+            .collect();
+        assert_eq!(from_descriptor, strategies_for("openai", "codex"));
+    }
+    #[test]
+    fn facade_policy_matches_descriptor_model() {
+        let codex = facade_policy_for("openai", "codex");
+        assert!(codex.files && !codex.http && codex.keychain_service.is_none());
+        let api = facade_policy_for("openai", "openai-api");
+        assert!(!api.files && api.http);
+        assert_eq!(api.keychain_service, Some("com.nurasss.usageai"));
+        let blocked = facade_policy_for("google", "antigravity");
+        assert!(!blocked.files && !blocked.http && blocked.keychain_service.is_none());
     }
     #[test]
     fn discovery_products_have_no_strategies() {

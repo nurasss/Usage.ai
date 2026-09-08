@@ -333,6 +333,7 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
                     timeout: ctx.timeout,
                     max_bytes: usage_host::policy::MAX_HTTP_BYTES,
                     user_agent: usage_host::policy::USER_AGENT,
+                    cancel: usage_host::CancellationToken::new(),
                 })
                 .await
                 .map_err(|e| match &e {
@@ -542,6 +543,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             custom_root: None,
             secret: Some(b"sk-test".to_vec()),
+            cancel: usage_host::CancellationToken::new(),
         }
     }
 

@@ -316,6 +316,8 @@ impl Coordinator {
                 timeout: policy::SOURCE_TIMEOUT,
                 custom_root: request.custom_root.clone(),
                 secret: request.secret.clone(),
+                // C4 threads the generation cancellation token through here.
+                cancel: usage_host::CancellationToken::new(),
             };
             match strategy.availability(&ctx).await {
                 Availability::Ready => {}

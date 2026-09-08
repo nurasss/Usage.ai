@@ -1,25 +1,33 @@
+pub mod cancel;
 pub mod clock;
 pub mod credentials;
 pub mod error;
+pub mod facade;
 pub mod files;
 pub mod http;
 pub mod keychain;
 pub mod logger;
 pub mod network;
 pub mod policy;
+pub mod process;
+pub mod pty;
 
 use std::sync::Arc;
 
+pub use cancel::CancellationToken;
 pub use clock::{ClockHost, FixedClock, SystemClock};
 pub use credentials::{fingerprint, SecretString};
 pub use error::{safe_code, HostError};
-pub use files::{FileIdentity, FilesHost, ScopedFiles, ScopedPath};
+pub use facade::HostFacade;
+pub use files::{FileIdentity, FilesHost, ScopedFile, ScopedFiles, ScopedPath, ScopedRoot};
 pub use http::{HttpHost, HttpJsonRequest, HttpJsonResponse, ReqwestHttpHost};
 #[cfg(target_os = "macos")]
 pub use keychain::KeyringHost;
-pub use keychain::{KeychainHost, MemoryKeychain};
+pub use keychain::{KeychainHost, MemoryKeychain, ScopedKeychain};
 pub use logger::{LoggerHost, NullLogger, TracingLogger};
 pub use network::{NetworkHost, ObservedNetwork, OnlineState};
+pub use process::{AllowlistedProcess, ProcessHost, SpawnOutput, SpawnRequest};
+pub use pty::{AllowlistedPty, PTYHost, PtyInput, PtyRequest};
 
 /// Scoped OS access bundle handed to provider strategies.
 /// Strategies never touch the OS except through these traits.

@@ -121,6 +121,9 @@ pub struct FetchContext<'a> {
     pub custom_root: Option<PathBuf>,
     /// Secret supplied by the runtime from Keychain for this call only.
     pub secret: Option<Vec<u8>>,
+    /// Cooperative cancellation: strategies and hosts must observe it
+    /// at every await/yield boundary.
+    pub cancel: usage_host::CancellationToken,
 }
 
 #[async_trait]

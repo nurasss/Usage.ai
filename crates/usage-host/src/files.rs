@@ -1,4 +1,4 @@
-use super::HostError;
+use super::{CancellationToken, HostError};
 use std::path::{Path, PathBuf};
 
 /// Stable file identity for replacement/rotation detection.
@@ -33,6 +33,33 @@ pub struct ScopedPath {
     pub identity: FileIdentity,
 }
 
+/// A product root validated by the host layer. Providers can only
+/// obtain one through `scope_root`; they cannot construct it and
+/// therefore cannot escape the declared product scope.
+#[derive(Debug, Clone)]
+pub struct ScopedRoot {
+    root: PathBuf,
+}
+
+/// A single file proven to live inside its `ScopedRoot`. The raw path
+/// stays inside the host boundary: providers see the stable identity
+/// (including the path hash) but never the path itself.
+#[derive(Debug, Clone)]
+pub struct ScopedFile {
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+impl ScopedFile {
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
+    pub fn path_hash(&self) -> &str {
+        &self.identity.path_hash
+    }
+}
+
 /// Scoped local-file access for provider strategies.
 ///
 /// - every access declares its product root up front;
@@ -60,6 +87,118 @@ pub trait FilesHost: Send + Sync {
         path: &Path,
         max_bytes: usize,
     ) -> Result<(Vec<u8>, FileIdentity), HostError>;
+
+    /// Explicit environment/config context for product root resolution.
+    /// Strategies must not read process env directly.
+    fn home_dir(&self) -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+    fn env_var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    /// Validate one product root: absolute, canonicalizable, directory.
+    fn scope_root(
+        &self,
+        root: &Path,
+        _cancel: &CancellationToken,
+    ) -> Result<ScopedRoot, HostError> {
+        if !root.is_absolute() {
+            return Err(HostError::Policy);
+        }
+        let canonical = root.canonicalize().map_err(|_| HostError::NotFound)?;
+        if !canonical.is_dir() {
+            return Err(HostError::NotFound);
+        }
+        Ok(ScopedRoot { root: canonical })
+    }
+
+    /// List files matching a relative glob inside a scoped root.
+    /// `..` patterns are rejected; escaping entries are skipped.
+    fn list_files(
+        &self,
+        root: &ScopedRoot,
+        pattern: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ScopedFile>, HostError> {
+        if pattern.contains("..") {
+            return Err(HostError::Policy);
+        }
+        if cancel.is_cancelled() {
+            return Err(HostError::Cancelled);
+        }
+        let full_pattern = format!("{}/{pattern}", root.root.display());
+        let mut out = vec![];
+        let entries = glob::glob(&full_pattern).map_err(|_| HostError::Policy)?;
+        for entry in entries {
+            if cancel.is_cancelled() {
+                return Err(HostError::Cancelled);
+            }
+            let Ok(path) = entry else { continue };
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&root.root) || !canonical.is_file() {
+                continue;
+            }
+            let Ok(identity) = file_identity(&canonical) else {
+                continue;
+            };
+            out.push(ScopedFile {
+                path: canonical,
+                identity,
+            });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    fn scoped_identity(&self, file: &ScopedFile) -> FileIdentity {
+        file.identity.clone()
+    }
+
+    fn read_scoped_range(
+        &self,
+        file: &ScopedFile,
+        offset: u64,
+        max_bytes: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, HostError> {
+        if cancel.is_cancelled() {
+            return Err(HostError::Cancelled);
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let size = file.identity.size;
+        let start = offset.min(size);
+        let mut handle = std::fs::File::open(&file.path).map_err(|_| HostError::NotFound)?;
+        handle
+            .seek(SeekFrom::Start(start))
+            .map_err(|_| HostError::Unavailable)?;
+        let mut buf = vec![0u8; max_bytes.min(size.saturating_sub(start) as usize)];
+        let mut read = 0usize;
+        while read < buf.len() {
+            if cancel.is_cancelled() {
+                return Err(HostError::Cancelled);
+            }
+            match handle.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(_) => return Err(HostError::Unavailable),
+            }
+        }
+        buf.truncate(read);
+        Ok(buf)
+    }
+
+    fn read_scoped_tail(
+        &self,
+        file: &ScopedFile,
+        max_bytes: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, HostError> {
+        let start = file.identity.size.saturating_sub(max_bytes as u64);
+        self.read_scoped_range(file, start, max_bytes, cancel)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

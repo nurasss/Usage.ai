@@ -16,6 +16,8 @@ pub enum HostError {
     Policy,
     #[error("operation timed out")]
     Timeout,
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 pub fn safe_code(error: &HostError) -> &'static str {
@@ -27,5 +29,6 @@ pub fn safe_code(error: &HostError) -> &'static str {
         HostError::NotFound => "not_found",
         HostError::Policy => "policy_violation",
         HostError::Timeout => "operation_timeout",
+        HostError::Cancelled => "cancelled",
     }
 }
