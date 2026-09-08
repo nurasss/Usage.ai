@@ -26,16 +26,26 @@ pub trait HttpHost: Send + Sync {
     async fn get_json(&self, req: HttpJsonRequest<'_>) -> Result<HttpJsonResponse, HostError>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct ReqwestHttpHost {
     max_bytes_default: usize,
+    client: tokio::sync::OnceCell<reqwest::Client>,
 }
 
-impl Default for ReqwestHttpHost {
-    fn default() -> Self {
-        Self {
-            max_bytes_default: super::policy::MAX_HTTP_BYTES,
-        }
+impl ReqwestHttpHost {
+    /// One reusable pooled client per host: connection reuse without
+    /// per-request rebuilds. Redirects stay denied and the safe
+    /// user agent is fixed at construction.
+    async fn client(&self) -> Result<&reqwest::Client, HostError> {
+        self.client
+            .get_or_try_init(|| async {
+                reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .user_agent(super::policy::USER_AGENT)
+                    .build()
+                    .map_err(|_| HostError::Unavailable)
+            })
+            .await
     }
 }
 
@@ -51,24 +61,25 @@ impl HttpHost for ReqwestHttpHost {
             return Err(HostError::Policy);
         }
         let limit = req.max_bytes.min(self.max_bytes_default).max(1024);
-        let client = reqwest::Client::builder()
-            .timeout(req.timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(req.user_agent)
-            .build()
-            .map_err(|_| HostError::Unavailable)?;
+        let client = self.client().await?;
         let mut builder = client.get(url);
         if let Some(secret) = req.bearer {
             let token = String::from_utf8(secret.to_vec()).map_err(|_| HostError::Policy)?;
             builder = builder.bearer_auth(token);
         }
-        let response = builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                HostError::Timeout
-            } else {
-                HostError::Unavailable
-            }
-        })?;
+        builder = builder.header(reqwest::header::USER_AGENT, req.user_agent);
+        // Cancel-safe: dropping the future drops the in-flight request.
+        // The per-request timeout races the send, not the client.
+        let response = tokio::time::timeout(req.timeout, builder.send())
+            .await
+            .map_err(|_| HostError::Timeout)?
+            .map_err(|e| {
+                if e.is_timeout() {
+                    HostError::Timeout
+                } else {
+                    HostError::Unavailable
+                }
+            })?;
         let status = response.status().as_u16();
         if (300..400).contains(&status) {
             return Err(HostError::Policy);
@@ -116,9 +127,19 @@ impl HttpHost for ReqwestHttpHost {
     }
 }
 
-/// Extract `Retry-After` seconds from a raw header value without logging it.
+/// Extract `Retry-After` delay in seconds without logging the value.
+/// Supports delta-seconds and the IMF-fixdate HTTP-date form; past
+/// dates saturate to zero and absurd values are capped.
 pub fn parse_retry_after(value: Option<&str>) -> Option<u64> {
-    value?.trim().parse::<u64>().ok()
+    let raw = value?.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs.min(3600));
+    }
+    let at: std::time::SystemTime = httpdate::parse_http_date(raw).ok()?;
+    let delta = at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    Some(delta.as_secs().min(3600))
 }
 
 #[cfg(test)]
@@ -158,9 +179,18 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_parses_digits_only() {
+    fn retry_after_parses_digits_and_http_date() {
         assert_eq!(parse_retry_after(Some("77")), Some(77));
         assert_eq!(parse_retry_after(Some("soon")), None);
         assert_eq!(parse_retry_after(None), None);
+        // Far-future HTTP-date is capped; past dates saturate to zero.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2099 07:28:00 GMT")),
+            Some(3600)
+        );
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            Some(0)
+        );
     }
 }

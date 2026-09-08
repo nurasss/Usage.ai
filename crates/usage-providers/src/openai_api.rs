@@ -8,8 +8,6 @@ use usage_core::{
 };
 use uuid::Uuid;
 
-use crate::http::{fetch_json, key_fingerprint};
-
 pub const OPENAI_API_HOSTS: &[&str] = &["api.openai.com"];
 pub const OPENAI_API_CONNECTOR_VERSION: &str = "openai-api-connector-v1";
 pub const OPENAI_COSTS_PARSER_VERSION: &str = "openai-costs-parser-v1";
@@ -24,9 +22,9 @@ pub struct OpenAiApiAdapter {
 pub struct ParsedCosts {
     pub records: Vec<CostDraft>,
     pub truncated: bool,
-    /// Opaque pagination cursor when the API offers one and more
-    /// pages remain; `None` means the result is complete.
-    pub next_cursor: Option<String>,
+    /// Official pagination cursor: response `next_page`, requested back
+    /// as query `page`. `None` with `truncated == false` means complete.
+    pub next_page: Option<String>,
     pub warnings: Vec<String>,
 }
 
@@ -39,6 +37,18 @@ pub struct CostDraft {
     pub currency: String,
     pub project_id: Option<String>,
     pub line_item: Option<String>,
+    pub api_key_id: Option<String>,
+}
+
+/// Decimal money from a JSON number. Providers emit decimal currency
+/// values (e.g. `19.99`); `f64`'s shortest round-trip representation
+/// reproduces those decimals exactly, so `Decimal` stays exact for all
+/// realistic billing amounts. (A workspace-wide `arbitrary_precision`
+/// switch was evaluated and rejected: it breaks `rust_decimal`
+/// number deserialization used by quota parsing.)
+fn decimal_from_number(value: &serde_json::Value) -> Option<Decimal> {
+    let number = value.as_number()?;
+    Decimal::from_str(&number.to_string()).ok()
 }
 
 /// Pure defensive parser for the OpenAI organization costs page.
@@ -50,20 +60,21 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
         .get("data")
         .and_then(|v| v.as_array())
         .ok_or_else(|| ProviderError::Parse("openai_costs_schema_changed".into()))?;
-    // Only an explicit cursor field is followed. Bucket/item ids are
-    // never guessed as pagination cursors: a wrong `starting_after`
-    // would silently skip or duplicate billing rows.
+    // Official contract only: response `next_page` ↔ query `page`
+    // (docs + openai-python + openai-node). No other field is ever
+    // guessed as a pagination cursor: a wrong cursor would silently
+    // skip or duplicate billing rows.
     let mut out = ParsedCosts {
         records: vec![],
         truncated: value
             .get("has_more")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        next_cursor: ["next_cursor", "starting_after"]
-            .iter()
-            .filter_map(|key| value.get(*key)?.as_str())
-            .map(|s| s.to_string())
-            .next(),
+        next_page: value
+            .get("next_page")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
         warnings: vec![],
     };
     for (bucket_idx, bucket) in data.iter().enumerate() {
@@ -86,23 +97,18 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
             .cloned()
             .unwrap_or_default();
         for (row_idx, row) in results.iter().enumerate() {
-            let amount_value = row
+            let amount = row
                 .get("amount")
                 .and_then(|a| a.get("value"))
-                .and_then(|v| v.as_f64());
+                .and_then(decimal_from_number);
             let currency = row
                 .get("amount")
                 .and_then(|a| a.get("currency"))
                 .and_then(|v| v.as_str())
                 .map(|c| c.to_ascii_uppercase());
-            let (Some(amount_value), Some(currency)) = (amount_value, currency) else {
+            let (Some(amount), Some(currency)) = (amount, currency) else {
                 out.warnings
                     .push(format!("bucket_{bucket_idx}_row_{row_idx}_incomplete"));
-                continue;
-            };
-            let Ok(amount) = Decimal::from_str(&amount_value.to_string()) else {
-                out.warnings
-                    .push(format!("bucket_{bucket_idx}_row_{row_idx}_bad_amount"));
                 continue;
             };
             let project_id = row
@@ -113,15 +119,20 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
                 .get("line_item")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let api_key_id = row
+                .get("api_key_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             out.records.push(CostDraft {
-                // Identity includes currency: two rows for the same
-                // bucket/scope in different currencies must not
+                // Identity includes currency/scope/key: two rows for the
+                // same bucket in different currencies or scopes must not
                 // overwrite each other. Amount is excluded on purpose:
                 // a corrected re-report must update, not duplicate.
                 source_record_id: format!(
-                    "openai-costs:{start}:{end}:{currency}:{}:{}",
+                    "openai-costs:{start}:{end}:{currency}:{}:{}:{}",
                     project_id.as_deref().unwrap_or("org"),
-                    line_item.as_deref().unwrap_or("all")
+                    line_item.as_deref().unwrap_or("all"),
+                    api_key_id.as_deref().unwrap_or("nokey")
                 ),
                 period_start: start,
                 period_end: end,
@@ -129,6 +140,7 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
                 currency,
                 project_id,
                 line_item,
+                api_key_id,
             });
         }
     }
@@ -137,98 +149,6 @@ pub fn parse_costs(value: &serde_json::Value, source: &str) -> Result<ParsedCost
 }
 
 impl OpenAiApiAdapter {
-    fn base(&self) -> String {
-        self.base_url
-            .clone()
-            .unwrap_or_else(|| "https://api.openai.com".into())
-    }
-
-    pub fn identity_for(&self, api_key: &str) -> String {
-        key_fingerprint("openai-api", api_key)
-    }
-
-    fn page_url(&self, start: DateTime<Utc>, end: DateTime<Utc>, cursor: Option<&str>) -> String {
-        let mut url = format!(
-            "{}{COSTS_PATH}?start_time={}&end_time={}&bucket_width=1d&limit=180",
-            self.base(),
-            start.timestamp(),
-            end.timestamp()
-        );
-        if let Some(cursor) = cursor {
-            use std::fmt::Write;
-            let _ = write!(url, "&starting_after={cursor}");
-        }
-        url
-    }
-
-    /// One logical fetch set: all pages share a single parsed payload
-    /// that produces the snapshot and the cost records together (P0-1).
-    /// Pagination is bounded; an unfinished tail degrades coverage to
-    /// `Partial` instead of silently truncating the bill.
-    pub async fn fetch_report(
-        &self,
-        account: &Account,
-        api_key: &str,
-        timeout: Duration,
-    ) -> Result<CostsReport, ProviderError> {
-        if api_key.trim().is_empty() {
-            return Err(ProviderError::AuthenticationRequired);
-        }
-        let end = Utc::now();
-        let start = end - chrono::Duration::days(30);
-        let mut drafts = vec![];
-        let mut warnings = vec![];
-        let mut cursor: Option<String> = None;
-        let mut truncated = false;
-        let mut pages = 0usize;
-        loop {
-            let url = self.page_url(start, end, cursor.as_deref());
-            let (_status, value) = fetch_json(&url, api_key, OPENAI_API_HOSTS, timeout).await?;
-            let parsed = parse_costs(&value, "openai-api-costs-v1")?;
-            warnings.extend(parsed.warnings);
-            drafts.extend(parsed.records);
-            pages += 1;
-            if !parsed.truncated {
-                break;
-            }
-            match parsed.next_cursor {
-                Some(next) if pages < usage_host::policy::MAX_API_PAGES => cursor = Some(next),
-                _ => {
-                    truncated = true;
-                    warnings.push("pagination_bounded_partial".into());
-                    break;
-                }
-            }
-        }
-        Ok(build_report(
-            account,
-            &self.capabilities(),
-            drafts,
-            warnings,
-            truncated,
-            start,
-        ))
-    }
-
-    pub async fn refresh_with_key(
-        &self,
-        account: &Account,
-        api_key: &str,
-        timeout: Duration,
-    ) -> Result<Snapshot, ProviderError> {
-        Ok(self.fetch_report(account, api_key, timeout).await?.snapshot)
-    }
-
-    pub async fn import_costs_with_key(
-        &self,
-        account: &Account,
-        api_key: &str,
-        timeout: Duration,
-    ) -> Result<(Vec<usage_core::CostRecord>, Vec<String>), ProviderError> {
-        let report = self.fetch_report(account, api_key, timeout).await?;
-        Ok((report.costs, report.warnings))
-    }
-
     pub fn balances_from(&self, _account_id: Uuid) -> Vec<MoneyBalance> {
         // No documented stable balance endpoint is verified for this adapter;
         // absence is reported as unknown, never as zero.
@@ -330,7 +250,10 @@ pub struct OpenAiCostsStrategy {
 }
 
 impl OpenAiCostsStrategy {
-    fn page_url(&self, start: DateTime<Utc>, end: DateTime<Utc>, cursor: Option<&str>) -> String {
+    /// Official pagination: opaque `next_page` cursor from the response
+    /// is sent back as query `page` (verified against the official Costs
+    /// reference + openai-python/openai-node SDK contracts).
+    fn page_url(&self, start: DateTime<Utc>, end: DateTime<Utc>, page: Option<&str>) -> String {
         let base = self
             .base_url
             .clone()
@@ -340,12 +263,27 @@ impl OpenAiCostsStrategy {
             start.timestamp(),
             end.timestamp()
         );
-        if let Some(cursor) = cursor {
+        if let Some(page) = page {
             use std::fmt::Write;
-            let _ = write!(url, "&starting_after={cursor}");
+            let _ = write!(url, "&page={}", percent_encode(page));
         }
         url
     }
+}
+
+/// Minimal percent-encoding for opaque cursor tokens (unreserved set
+/// passes through untouched).
+fn percent_encode(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -381,10 +319,10 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
         let start = end - chrono::Duration::days(30);
         let mut drafts = vec![];
         let mut warnings = vec![];
-        let mut cursor: Option<String> = None;
+        let mut page: Option<String> = None;
         let mut pages = 0usize;
         loop {
-            let url = self.page_url(start, end, cursor.as_deref());
+            let url = self.page_url(start, end, page.as_deref());
             let response = ctx
                 .hosts
                 .http
@@ -418,8 +356,8 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
             if !parsed.truncated {
                 break;
             }
-            match parsed.next_cursor {
-                Some(next) if pages < usage_host::policy::MAX_API_PAGES => cursor = Some(next),
+            match parsed.next_page {
+                Some(next) if pages < usage_host::policy::MAX_API_PAGES => page = Some(next),
                 _ => {
                     warnings.push("pagination_bounded_partial".into());
                     break;
@@ -504,8 +442,13 @@ mod tests {
     }
 
     struct ScriptHttp {
-        pages: std::sync::Mutex<Vec<serde_json::Value>>,
+        pages: std::sync::Mutex<Vec<ScriptResponse>>,
         calls: std::sync::Mutex<usize>,
+    }
+
+    enum ScriptResponse {
+        Page(serde_json::Value),
+        NetworkError,
     }
 
     #[async_trait::async_trait]
@@ -515,18 +458,18 @@ mod tests {
             _req: usage_host::HttpJsonRequest<'_>,
         ) -> Result<usage_host::HttpJsonResponse, usage_host::HostError> {
             *self.calls.lock().unwrap() += 1;
-            let body = self.pages.lock().unwrap().remove(0);
-            Ok(usage_host::HttpJsonResponse {
-                status: 200,
-                retry_after_secs: None,
-                body: Some(body),
-            })
+            match self.pages.lock().unwrap().remove(0) {
+                ScriptResponse::Page(body) => Ok(usage_host::HttpJsonResponse {
+                    status: 200,
+                    retry_after_secs: None,
+                    body: Some(body),
+                }),
+                ScriptResponse::NetworkError => Err(usage_host::HostError::Unavailable),
+            }
         }
     }
 
-    fn test_hosts(
-        pages: Vec<serde_json::Value>,
-    ) -> (usage_host::Hosts, std::sync::Arc<ScriptHttp>) {
+    fn test_hosts(pages: Vec<ScriptResponse>) -> (usage_host::Hosts, std::sync::Arc<ScriptHttp>) {
         use std::sync::Arc;
         let http = Arc::new(ScriptHttp {
             pages: std::sync::Mutex::new(pages),
@@ -543,43 +486,210 @@ mod tests {
         (hosts, http)
     }
 
-    fn cost_page(rows: &[(&str, f64)], has_more: bool, cursor: Option<&str>) -> serde_json::Value {
+    fn page(pages: Vec<serde_json::Value>) -> Vec<ScriptResponse> {
+        pages.into_iter().map(ScriptResponse::Page).collect()
+    }
+
+    /// Official-shape cost page: `object/data/has_more/next_page`,
+    /// bucket `object/start_time/end_time/results`, row
+    /// `object/amount{value,currency}/line_item/project_id/api_key_id`.
+    /// Amounts are JSON number literals parsed from decimal text.
+    fn cost_page(
+        bucket_start: i64,
+        rows: &[(&str, &str, Option<&str>)],
+        has_more: bool,
+        next_page: Option<&str>,
+    ) -> serde_json::Value {
         serde_json::json!({
             "object": "page",
             "has_more": has_more,
-            "next_cursor": cursor,
+            "next_page": next_page,
             "data": [{
-                "start_time": 1_725_000_000,
-                "end_time": 1_725_086_400,
-                "results": rows.iter().map(|(item, amount)| {
-                    serde_json::json!({"amount": {"value": amount, "currency": "usd"}, "line_item": item})
+                "object": "bucket",
+                "start_time": bucket_start,
+                "end_time": bucket_start + 86_400,
+                "results": rows.iter().map(|(item, amount, project)| {
+                    serde_json::json!({
+                        "object": "organization.costs.result",
+                        "amount": {"value": serde_json::from_str::<serde_json::Value>(amount).unwrap(), "currency": "usd"},
+                        "line_item": item,
+                        "project_id": project,
+                        "api_key_id": null
+                    })
                 }).collect::<Vec<_>>()
             }]
         })
     }
 
-    #[tokio::test]
-    async fn strategy_fetches_all_pages_once_per_refresh() {
-        use crate::strategy::{FetchContext, FetchStrategy};
-        let (hosts, http) = test_hosts(vec![
-            cost_page(&[("a", 1.0)], true, Some("c1")),
-            cost_page(&[("b", 2.0)], false, None),
-        ]);
-        let account = Account {
+    fn test_account() -> Account {
+        Account {
             id: Uuid::nil(),
             provider_id: "openai".into(),
             external_identity: None,
             label: "API".into(),
             connection_ref: None,
             lifecycle: usage_core::AccountLifecycle::Active,
-        };
-        let ctx = FetchContext {
-            account: &account,
-            hosts: &hosts,
+        }
+    }
+
+    fn test_ctx<'a>(
+        account: &'a Account,
+        hosts: &'a usage_host::Hosts,
+    ) -> crate::strategy::FetchContext<'a> {
+        crate::strategy::FetchContext {
+            account,
+            hosts,
             timeout: Duration::from_secs(5),
             custom_root: None,
             secret: Some(b"sk-test".to_vec()),
-        };
+        }
+    }
+
+    #[test]
+    fn decimal_amounts_stay_exact_without_float_roundtrip() {
+        let value = cost_page(1_725_000_000, &[("x", "19.99", None)], false, None);
+        assert_eq!(
+            parse_costs(&value, "test").unwrap().records[0].amount,
+            rust_decimal::Decimal::from_str("19.99").unwrap()
+        );
+        let tiny = cost_page(1_725_000_000, &[("x", "0.06", None)], false, None);
+        assert_eq!(
+            parse_costs(&tiny, "test").unwrap().records[0].amount,
+            rust_decimal::Decimal::from_str("0.06").unwrap()
+        );
+    }
+
+    #[test]
+    fn currencies_scopes_and_keys_get_distinct_identities() {
+        let value = serde_json::json!({
+            "object": "page", "has_more": false, "next_page": null,
+            "data": [{
+                "object": "bucket", "start_time": 1_725_000_000, "end_time": 1_725_086_400,
+                "results": [
+                    {"object": "organization.costs.result",
+                     "amount": {"value": 1.0, "currency": "usd"},
+                     "line_item": "gpt", "project_id": "p1", "api_key_id": null},
+                    {"object": "organization.costs.result",
+                     "amount": {"value": 1.0, "currency": "eur"},
+                     "line_item": "gpt", "project_id": "p1", "api_key_id": null},
+                    {"object": "organization.costs.result",
+                     "amount": {"value": 1.0, "currency": "usd"},
+                     "line_item": "gpt", "project_id": "p2", "api_key_id": "k1"}
+                ]
+            }]
+        });
+        let parsed = parse_costs(&value, "test").unwrap();
+        let ids: std::collections::HashSet<_> = parsed
+            .records
+            .iter()
+            .map(|r| r.source_record_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn one_refresh_fetches_each_page_exactly_once() {
+        use crate::strategy::FetchStrategy;
+        let (hosts, http) = test_hosts(page(vec![
+            cost_page(1_725_000_000, &[("a", "1.0", None)], true, Some("p2")),
+            cost_page(1_725_086_400, &[("b", "2.0", None)], true, Some("p3")),
+            cost_page(1_725_172_800, &[("c", "3.0", None)], false, None),
+        ]));
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
+        let payload = OpenAiCostsStrategy { base_url: None }
+            .fetch(&ctx)
+            .await
+            .unwrap();
+        // One logical refresh, N page requests, one normalized result.
+        assert!(payload.snapshot.is_some());
+        assert_eq!(payload.costs.len(), 3);
+        assert_eq!(*http.calls.lock().unwrap(), 3);
+        assert_eq!(payload.coverage, Coverage::ProviderDelayed);
+    }
+
+    #[tokio::test]
+    async fn duplicate_pages_collapse_onto_one_storage_key() {
+        let same = cost_page(1_725_000_000, &[("a", "1.0", None)], false, None);
+        let first = parse_costs(&same, "test").unwrap();
+        let second = parse_costs(&same, "test").unwrap();
+        assert_eq!(first.records[0], second.records[0]);
+        let unique: std::collections::HashSet<_> = first
+            .records
+            .iter()
+            .chain(second.records.iter())
+            .map(|r| r.source_record_id.clone())
+            .collect();
+        assert_eq!(unique.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn page_two_network_error_fails_without_partial_result() {
+        use crate::strategy::FetchStrategy;
+        let (hosts, http) = test_hosts(vec![
+            ScriptResponse::Page(cost_page(
+                1_725_000_000,
+                &[("a", "1.0", None)],
+                true,
+                Some("p2"),
+            )),
+            ScriptResponse::NetworkError,
+        ]);
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
+        let result = OpenAiCostsStrategy { base_url: None }.fetch(&ctx).await;
+        assert!(matches!(result, Err(crate::strategy::SourceError::Network)));
+        assert_eq!(*http.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_page_is_schema_error_not_empty_bill() {
+        use crate::strategy::FetchStrategy;
+        let (hosts, _) = test_hosts(page(vec![serde_json::json!({
+            "object": "page", "has_more": false, "data": "not-an-array"
+        })]));
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
+        let result = OpenAiCostsStrategy { base_url: None }.fetch(&ctx).await;
+        assert!(matches!(
+            result,
+            Err(crate::strategy::SourceError::Parse { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_cursor_fields_are_never_followed() {
+        // A response advertising only the old guessed cursor shape
+        // ends pagination as bounded-partial instead of looping.
+        use crate::strategy::FetchStrategy;
+        let (hosts, http) = test_hosts(page(vec![serde_json::json!({
+            "object": "page", "has_more": true, "starting_after": "xyz",
+            "data": [{
+                "object": "bucket", "start_time": 1_725_000_000, "end_time": 1_725_086_400,
+                "results": [{"object": "organization.costs.result",
+                             "amount": {"value": 1.0, "currency": "usd"},
+                             "line_item": "a", "project_id": null, "api_key_id": null}]
+            }]
+        })]));
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
+        let payload = OpenAiCostsStrategy { base_url: None }
+            .fetch(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(*http.calls.lock().unwrap(), 1);
+        assert_eq!(payload.coverage, Coverage::Partial);
+    }
+
+    #[tokio::test]
+    async fn strategy_fetches_all_pages_once_per_refresh() {
+        use crate::strategy::FetchStrategy;
+        let (hosts, http) = test_hosts(page(vec![
+            cost_page(1_725_000_000, &[("a", "1.0", None)], true, Some("c1")),
+            cost_page(1_725_086_400, &[("b", "2.0", None)], false, None),
+        ]));
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
         let payload = OpenAiCostsStrategy { base_url: None }
             .fetch(&ctx)
             .await
@@ -594,26 +704,20 @@ mod tests {
 
     #[tokio::test]
     async fn endless_pagination_is_bounded_and_partial() {
-        use crate::strategy::{FetchContext, FetchStrategy};
-        let endless: Vec<serde_json::Value> = (0..20)
-            .map(|_| cost_page(&[("a", 1.0)], true, Some("again")))
+        use crate::strategy::FetchStrategy;
+        let endless: Vec<ScriptResponse> = (0..20)
+            .map(|_| {
+                ScriptResponse::Page(cost_page(
+                    1_725_000_000,
+                    &[("a", "1.0", None)],
+                    true,
+                    Some("again"),
+                ))
+            })
             .collect();
         let (hosts, http) = test_hosts(endless);
-        let account = Account {
-            id: Uuid::nil(),
-            provider_id: "openai".into(),
-            external_identity: None,
-            label: "API".into(),
-            connection_ref: None,
-            lifecycle: usage_core::AccountLifecycle::Active,
-        };
-        let ctx = FetchContext {
-            account: &account,
-            hosts: &hosts,
-            timeout: Duration::from_secs(5),
-            custom_root: None,
-            secret: Some(b"sk-test".to_vec()),
-        };
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
         let payload = OpenAiCostsStrategy { base_url: None }
             .fetch(&ctx)
             .await
