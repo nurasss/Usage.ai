@@ -1,12 +1,14 @@
 # Usage.ai
 
-Local-first macOS menu bar utility for AI quota, usage, cost, and history. The first target is Intel (`x86_64-apple-darwin`) on macOS 13+.
+> [English version](README.en.md)
 
-The application never sends inference requests to monitor usage. Unknown metrics remain unknown; mock data is visibly marked.
+Локальная утилита для menu bar macOS: квоты, использование, расходы и история AI-сервисов в одной панели. Первая цель — Intel (`x86_64-apple-darwin`), macOS 13+.
 
-## Development
+Приложение никогда не отправляет inference-запросы ради мониторинга. Неизвестная метрика остаётся неизвестной; демо-данные явно помечены.
 
-Requirements: Node.js, Rust stable, Xcode Command Line Tools, and macOS 13 or newer.
+## Разработка
+
+Требования: Node.js, стабильный Rust, Xcode Command Line Tools, macOS 13 или новее.
 
 ```bash
 npm install
@@ -16,28 +18,27 @@ cargo test --workspace
 npm run tauri dev
 ```
 
-Build an Intel application and DMG on an Intel Mac:
+Сборка Intel-приложения и DMG на Intel Mac:
 
 ```bash
 rustup target add x86_64-apple-darwin
 npm run tauri build -- --target x86_64-apple-darwin
-file target/x86_64-apple-darwin/release/bundle/macos/Usage.ai.app/Contents/MacOS/Usage.ai
+file target/x86_64-apple-darwin/release/bundle/macos/Usage.ai.app/Contents/MacOS/usage-ai-app
 ```
 
-## Current integration status
+## Текущий статус интеграций
 
-- Codex: verified read-only local session schema for quota snapshots and token history on the target Mac.
-- Claude Code: verified read-only local JSONL token history; subscription quota source is not yet verified.
-- OpenAI API: connector implemented (`GET /v1/organization/costs`, allow-listed HTTPS, Keychain-held Admin key); activates only after the user adds an account, otherwise honest `NotConfigured`.
-- Other required products: adapter boundaries and Discovery records exist, but no metric is fabricated while source/auth verification remains incomplete.
-- Panel honesty: cost tabs render only stored Reported/Estimated values, unknown models are labeled `Модель не определена`, and empty periods render `Нет данных` instead of zero.
-- Diagnostics: per-provider safe diagnostics (`get_diagnostics`, separate `export_diagnostics`) with no secrets; accounts support add/enable/test-connection/custom-path/archive vs full delete.
-- Budgets: monthly Reported-vs-budget alerts per currency, no conversion; balances render only when a source provides them.
-- Refresh safety: per-source 15s timeout, per-account cooldown (manual refresh never bypasses it), single wake refresh, offline banner via cache + `navigator.onLine`.
+- Codex: проверенная read-only схема локальных сессий — снапшоты квот и история токенов.
+- Claude Code: проверенная read-only история токенов из локальных JSONL; источник квот подписки пока не подтверждён.
+- OpenAI API: коннектор реализован (`GET /v1/organization/costs`, HTTPS со allow-list, Admin-ключ в Keychain); активируется только после добавления аккаунта, иначе честный `NotConfigured`.
+- Остальные продукты: границы адаптеров и Discovery-записи есть, но метрики не выдумываются, пока источник/доступ не проверены.
+- Честность панели: расходы — только сохранённые Reported/Estimated, неизвестные модели — `Модель не определена`, пустые периоды — `Нет данных`, а не ноль.
+- Диагностика: безопасная диагностика по каждому провайдеру (`get_diagnostics`, отдельный `export_diagnostics`) без секретов; аккаунты: добавление, вкл/выкл, проверка подключения, кастомный путь, архив против полного удаления.
+- Бюджеты: месячные алерты «факт против бюджета» по валютам без конвертации; балансы показываются, только если их отдаёт источник.
+- Безопасность refresh: таймаут 15 с на источник, кулдаун на аккаунт (ручное обновление его не обходит), одиночный refresh после сна, офлайн-баннер из кэша + `navigator.onLine`.
 
-See [Phase 0 discovery](docs/PHASE0_DISCOVERY.md) and the [integration matrix](docs/INTEGRATION_MATRIX.md).
+См. [Phase 0 discovery](docs/PHASE0_DISCOVERY.md) и [матрицу интеграций](docs/INTEGRATION_MATRIX.md).
 
-## Privacy
+## Приватность
 
-Own API secrets are stored in macOS Keychain. SQLite, logs, fixtures, diagnostics, and exports contain no secrets, prompts, responses, emails, browser cookies, or raw provider responses. Local session files are read incrementally and never modified.
-
+Собственные API-секреты — только в macOS Keychain. В SQLite, логах, фикстурах, диагностике и экспорте нет секретов, промптов, ответов, email, браузерных cookie и сырых ответов провайдеров. Локальные файлы сессий читаются инкрементально и никогда не изменяются.
