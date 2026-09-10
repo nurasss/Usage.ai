@@ -1,5 +1,7 @@
 # Usage.ai — Technical Audit of Master Spec v1.1 Implementation
 
+> Historical baseline audit. Remediation work and current verification are recorded in [`P0_REMEDIATION_REPORT.md`](../P0_REMEDIATION_REPORT.md); this document is intentionally retained as the pre-remediation finding set.
+
 Дата аудита: 2026-09-08  
 Проверенный документ: `/Users/nuras/Downloads/Usage.ai_MASTER_SPEC_v1.1.md` (полностью, разделы 0–54)  
 Reference only: [CodexBar](https://github.com/steipete/CodexBar)  
