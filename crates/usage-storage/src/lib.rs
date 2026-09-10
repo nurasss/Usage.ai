@@ -7,11 +7,22 @@ use std::{
 };
 use usage_core::{Account, CostRecord, UsageRecord};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 7;
+
+const USAGE_UPSERT_SQL: &str = "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,cache_read_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=MAX(usage_records.period_start,excluded.period_start),period_end=MAX(usage_records.period_end,excluded.period_end),model=COALESCE(usage_records.model,excluded.model),input_tokens=CASE WHEN excluded.input_tokens IS NULL THEN usage_records.input_tokens WHEN usage_records.input_tokens IS NULL THEN excluded.input_tokens ELSE MAX(usage_records.input_tokens,excluded.input_tokens) END,output_tokens=CASE WHEN excluded.output_tokens IS NULL THEN usage_records.output_tokens WHEN usage_records.output_tokens IS NULL THEN excluded.output_tokens ELSE MAX(usage_records.output_tokens,excluded.output_tokens) END,cached_tokens=CASE WHEN excluded.cached_tokens IS NULL THEN usage_records.cached_tokens WHEN usage_records.cached_tokens IS NULL THEN excluded.cached_tokens ELSE MAX(usage_records.cached_tokens,excluded.cached_tokens) END,cache_creation_tokens=CASE WHEN excluded.cache_creation_tokens IS NULL THEN usage_records.cache_creation_tokens WHEN usage_records.cache_creation_tokens IS NULL THEN excluded.cache_creation_tokens ELSE MAX(usage_records.cache_creation_tokens,excluded.cache_creation_tokens) END,cache_read_tokens=CASE WHEN excluded.cache_read_tokens IS NULL THEN usage_records.cache_read_tokens WHEN usage_records.cache_read_tokens IS NULL THEN excluded.cache_read_tokens ELSE MAX(usage_records.cache_read_tokens,excluded.cache_read_tokens) END,reasoning_tokens=CASE WHEN excluded.reasoning_tokens IS NULL THEN usage_records.reasoning_tokens WHEN usage_records.reasoning_tokens IS NULL THEN excluded.reasoning_tokens ELSE MAX(usage_records.reasoning_tokens,excluded.reasoning_tokens) END,total_tokens=CASE WHEN excluded.total_tokens IS NULL THEN usage_records.total_tokens WHEN usage_records.total_tokens IS NULL THEN excluded.total_tokens ELSE MAX(usage_records.total_tokens,excluded.total_tokens) END,requests=CASE WHEN excluded.requests IS NULL THEN usage_records.requests WHEN usage_records.requests IS NULL THEN excluded.requests ELSE MAX(usage_records.requests,excluded.requests) END,coverage=excluded.coverage,connection_id=COALESCE(excluded.connection_id,usage_records.connection_id),file_id=COALESCE(excluded.file_id,usage_records.file_id),file_generation=MAX(usage_records.file_generation,excluded.file_generation)";
 
 pub struct Storage {
     conn: Connection,
     path: Option<PathBuf>,
+    import_fault: Option<StorageFault>,
+}
+
+/// Deterministic fault injection for end-to-end import rollback tests. This
+/// is never enabled by normal construction and is intentionally limited to a
+/// failure boundary inside the atomic import transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFault {
+    ImportBeforeCheckpoint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,9 +84,87 @@ pub struct ImportBatchCommit<'a> {
     pub last_source_record_id: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommitBundleResult {
+    Committed(BundleReport),
+    AccountInactive,
+    AccountMissing,
+}
+
+pub trait PermissionHardener: Send + Sync {
+    fn harden_permissions(&self, db_path: &Path) -> Result<()>;
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SystemPermissionHardener;
+
+impl PermissionHardener for SystemPermissionHardener {
+    fn harden_permissions(&self, db_path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use anyhow::Context;
+            use std::os::unix::fs::PermissionsExt;
+
+            if let Some(parent) = db_path.parent() {
+                if parent.exists() {
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                        .context("failed to chmod 0700 db parent directory")?;
+                    let meta = parent.metadata().context("failed to read parent metadata")?;
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        anyhow::bail!(
+                            "parent directory has insecure permissions: {:o}",
+                            meta.permissions().mode()
+                        );
+                    }
+                }
+            }
+
+            if db_path.exists() {
+                std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+                    .context("failed to chmod 0600 db file")?;
+                let meta = db_path.metadata().context("failed to read db file metadata")?;
+                if meta.permissions().mode() & 0o077 != 0 {
+                    anyhow::bail!(
+                        "db file has insecure permissions: {:o}",
+                        meta.permissions().mode()
+                    );
+                }
+            }
+
+            for suffix in ["-wal", "-shm"] {
+                let mut sidecar = db_path.as_os_str().to_os_string();
+                sidecar.push(suffix);
+                let sidecar_path = Path::new(&sidecar);
+                if sidecar_path.exists() {
+                    std::fs::set_permissions(sidecar_path, std::fs::Permissions::from_mode(0o600))
+                        .context("failed to chmod 0600 sidecar file")?;
+                    let meta = sidecar_path
+                        .metadata()
+                        .context("failed to read sidecar metadata")?;
+                    if meta.permissions().mode() & 0o077 != 0 {
+                        anyhow::bail!(
+                            "sidecar file has insecure permissions: {:o}",
+                            meta.permissions().mode()
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = db_path;
+        }
+        Ok(())
+    }
+}
+
 impl Storage {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open_with_hardener(
+        path: impl AsRef<Path>,
+        hardener: std::sync::Arc<dyn PermissionHardener>,
+    ) -> Result<Self> {
         let path = path.as_ref();
+        hardener.harden_permissions(path)?;
         if path.exists() {
             let probe = Connection::open(path)?;
             let version: u32 = probe
@@ -91,41 +180,35 @@ impl Storage {
         let mut storage = Self {
             conn,
             path: Some(path.to_path_buf()),
+            import_fault: None,
         };
         storage.migrate()?;
-        Self::harden_db_permissions(path);
+        hardener.harden_permissions(path)?;
         Ok(storage)
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_hardener(path, std::sync::Arc::new(SystemPermissionHardener))
     }
 
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let mut s = Self { conn, path: None };
+        let mut s = Self {
+            conn,
+            path: None,
+            import_fault: None,
+        };
         s.migrate()?;
         Ok(s)
     }
-
-    /// User-only permissions for the database and its WAL/SHM sidecars.
-    /// SQLite recreates sidecars across its lifecycle, so this runs at
-    /// open time; the app-data directory itself is user-owned.
-    fn harden_db_permissions(db_path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(db_path, mode.clone());
-            for suffix in ["-wal", "-shm"] {
-                let mut sidecar = db_path.as_os_str().to_os_string();
-                sidecar.push(suffix);
-                let _ = std::fs::set_permissions(Path::new(&sidecar), mode.clone());
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = db_path;
-        }
-    }
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
+    }
+
+    /// Test-only control surface for proving callers observe transaction
+    /// rollback at the runtime/storage boundary.
+    pub fn inject_fault(&mut self, fault: StorageFault) {
+        self.import_fault = Some(fault);
     }
 
     fn migrate(&mut self) -> Result<()> {
@@ -153,6 +236,13 @@ impl Storage {
         if current < 5 {
             tx.execute_batch(include_str!("../migrations/005_provenance.sql"))?;
         }
+        if current < 6 {
+            tx.execute_batch(include_str!("../migrations/006_legacy_identity.sql"))?;
+            migrate_legacy_rows(&tx)?;
+        }
+        if current < 7 {
+            tx.execute_batch(include_str!("../migrations/007_claude_cache_buckets.sql"))?;
+        }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
         Ok(())
@@ -160,8 +250,30 @@ impl Storage {
 
     pub fn upsert_usage(&mut self, record: &UsageRecord) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage,connection_id=excluded.connection_id,file_id=excluded.file_id,file_generation=excluded.file_generation",
-            params![record.account_id.to_string(),record.product_id,record.billing_scope_id,record.source_record_id,record.period_start.to_rfc3339(),record.period_end.to_rfc3339(),record.model,record.input_tokens,record.output_tokens,record.cached_tokens,record.reasoning_tokens,record.total_tokens,record.requests,record.source,format!("{:?}",record.coverage),record.connection_id,record.file_id,record.file_generation.unwrap_or(1)])?;
+            USAGE_UPSERT_SQL,
+            params![
+                record.account_id.to_string(),
+                record.product_id,
+                record.billing_scope_id,
+                record.source_record_id,
+                record.period_start.to_rfc3339(),
+                record.period_end.to_rfc3339(),
+                record.model,
+                record.input_tokens,
+                record.output_tokens,
+                record.cached_tokens,
+                record.cache_creation_tokens,
+                record.cache_read_tokens,
+                record.reasoning_tokens,
+                record.total_tokens,
+                record.requests,
+                record.source,
+                format!("{:?}", record.coverage),
+                record.connection_id,
+                record.file_id,
+                record.file_generation.unwrap_or(1)
+            ],
+        )?;
         Ok(())
     }
 
@@ -182,12 +294,33 @@ impl Storage {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Provenance children must be removed before their parent connection
+        // rows because foreign keys are enabled for every storage handle.
+        tx.execute(
+            "DELETE FROM file_imports WHERE file_id IN (SELECT id FROM source_files WHERE connection_id IN (SELECT id FROM source_connections WHERE account_id=?))",
+            [account_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM import_checkpoints WHERE path_hash IN (SELECT path_hash FROM source_files WHERE connection_id IN (SELECT id FROM source_connections WHERE account_id=?))",
+            [account_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM source_files WHERE connection_id IN (SELECT id FROM source_connections WHERE account_id=?)",
+            [account_id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM source_connections WHERE account_id=?",
+            [account_id.to_string()],
+        )?;
         for table in [
             "snapshots",
             "usage_records",
             "cost_records",
             "budgets",
             "balances",
+            "source_attempts",
+            "cooldowns",
+            "notification_deliveries",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE account_id=?"),
@@ -268,8 +401,20 @@ impl Storage {
             &uuid::Uuid::NAMESPACE_URL,
             format!("usage.ai/connection/{provider_id}/{product_id}/{root_hash}").as_bytes(),
         );
+        if let Some(existing) = self.get_connection(&id.to_string())? {
+            if existing.account_id != account_id.to_string() {
+                anyhow::bail!(
+                    "source connection already belongs to another account; explicit migration required"
+                );
+            }
+            self.conn.execute(
+                "UPDATE source_connections SET root_hint=?,kind=? WHERE id=?",
+                params![root_hint, kind, id.to_string()],
+            )?;
+            return Ok(existing);
+        }
         self.conn.execute(
-            "INSERT INTO source_connections(id,account_id,provider_id,product_id,root_hash,root_hint,kind,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET account_id=excluded.account_id,root_hint=excluded.root_hint,kind=excluded.kind",
+            "INSERT INTO source_connections(id,account_id,provider_id,product_id,root_hash,root_hint,kind,created_at) VALUES(?,?,?,?,?,?,?,?)",
             params![
                 id.to_string(),
                 account_id.to_string(),
@@ -306,6 +451,28 @@ impl Storage {
                 },
             )
             .optional()?)
+    }
+
+    pub fn list_connections(&self) -> Result<Vec<SourceConnection>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,account_id,provider_id,product_id,root_hash,root_hint,kind,identity_fingerprint,identity_confidence FROM source_connections",
+        )?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(SourceConnection {
+                    id: r.get(0)?,
+                    account_id: r.get(1)?,
+                    provider_id: r.get(2)?,
+                    product_id: r.get(3)?,
+                    root_hash: r.get(4)?,
+                    root_hint: r.get(5)?,
+                    kind: r.get(6)?,
+                    identity_fingerprint: r.get(7)?,
+                    identity_confidence: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn set_connection_identity(
@@ -386,6 +553,7 @@ impl Storage {
     /// offset/checkpoint update. A failure before commit leaves neither
     /// records nor checkpoint partially stored.
     pub fn commit_import_batch(&mut self, commit: &ImportBatchCommit<'_>) -> Result<usize> {
+        let import_fault = self.import_fault.take();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -406,7 +574,7 @@ impl Storage {
         }
         let mut accepted = 0usize;
         {
-            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage,connection_id=excluded.connection_id,file_id=excluded.file_id,file_generation=excluded.file_generation")?;
+            let mut statement = tx.prepare(USAGE_UPSERT_SQL)?;
             for record in commit.records {
                 statement.execute(params![
                     record.account_id.to_string(),
@@ -419,6 +587,8 @@ impl Storage {
                     record.input_tokens,
                     record.output_tokens,
                     record.cached_tokens,
+                    record.cache_creation_tokens,
+                    record.cache_read_tokens,
                     record.reasoning_tokens,
                     record.total_tokens,
                     record.requests,
@@ -430,6 +600,9 @@ impl Storage {
                 ])?;
                 accepted += 1;
             }
+        }
+        if matches!(import_fault, Some(StorageFault::ImportBeforeCheckpoint)) {
+            anyhow::bail!("injected_import_failure_before_checkpoint");
         }
         tx.execute(
             "INSERT INTO file_imports(file_id,byte_offset,schema_version,last_source_record_id,touched_at) VALUES(?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET byte_offset=excluded.byte_offset,schema_version=excluded.schema_version,last_source_record_id=excluded.last_source_record_id,touched_at=excluded.touched_at",
@@ -501,7 +674,7 @@ impl Storage {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut accepted = 0usize;
         {
-            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
+            let mut statement = tx.prepare(USAGE_UPSERT_SQL)?;
             for record in records {
                 statement.execute(params![
                     record.account_id.to_string(),
@@ -514,6 +687,8 @@ impl Storage {
                     record.input_tokens,
                     record.output_tokens,
                     record.cached_tokens,
+                    record.cache_creation_tokens,
+                    record.cache_read_tokens,
                     record.reasoning_tokens,
                     record.total_tokens,
                     record.requests,
@@ -561,10 +736,30 @@ impl Storage {
     /// Single-transaction refresh commit: snapshot payload, usage batch
     /// and cost batch land atomically. A failure anywhere leaves the
     /// previous last-known-good state intact.
-    pub fn commit_refresh_bundle(&mut self, bundle: &RefreshBundle<'_>) -> Result<BundleReport> {
+    pub fn commit_refresh_bundle_if_active(
+        &mut self,
+        bundle: &RefreshBundle<'_>,
+    ) -> Result<CommitBundleResult> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let account_state: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT lifecycle, enabled FROM accounts WHERE id = ?",
+                params![bundle.account_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((lifecycle, enabled)) = account_state else {
+            return Ok(CommitBundleResult::AccountMissing);
+        };
+
+        if enabled == 0 || lifecycle == "Archived" || lifecycle == "Disconnected" {
+            return Ok(CommitBundleResult::AccountInactive);
+        }
+
         tx.execute(
             "INSERT INTO snapshots(account_id,product_id,payload_json,observed_at,fetched_at) VALUES(?,?,?,?,?)",
             params![
@@ -577,7 +772,7 @@ impl Storage {
         )?;
         let mut usage_accepted = 0usize;
         {
-            let mut statement = tx.prepare("INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=excluded.period_start,period_end=excluded.period_end,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,cached_tokens=excluded.cached_tokens,reasoning_tokens=excluded.reasoning_tokens,total_tokens=excluded.total_tokens,requests=excluded.requests,coverage=excluded.coverage")?;
+            let mut statement = tx.prepare(USAGE_UPSERT_SQL)?;
             for record in bundle.usage {
                 statement.execute(params![
                     record.account_id.to_string(),
@@ -590,6 +785,8 @@ impl Storage {
                     record.input_tokens,
                     record.output_tokens,
                     record.cached_tokens,
+                    record.cache_creation_tokens,
+                    record.cache_read_tokens,
                     record.reasoning_tokens,
                     record.total_tokens,
                     record.requests,
@@ -623,10 +820,18 @@ impl Storage {
             }
         }
         tx.commit()?;
-        Ok(BundleReport {
+        Ok(CommitBundleResult::Committed(BundleReport {
             usage_accepted,
             costs_accepted,
-        })
+        }))
+    }
+
+    pub fn commit_refresh_bundle(&mut self, bundle: &RefreshBundle<'_>) -> Result<BundleReport> {
+        match self.commit_refresh_bundle_if_active(bundle)? {
+            CommitBundleResult::Committed(report) => Ok(report),
+            CommitBundleResult::AccountInactive => anyhow::bail!("account_inactive"),
+            CommitBundleResult::AccountMissing => anyhow::bail!("account_missing"),
+        }
     }
 
     pub fn record_attempt(&mut self, attempt: &AttemptLog<'_>) -> Result<()> {
@@ -772,46 +977,46 @@ impl Storage {
     }
 
     fn safe_export_rows(&self) -> Result<Vec<SafeExportRow>> {
-        let mut statement = self.conn.prepare("SELECT product_id,period_start,period_end,model,input_tokens,output_tokens,total_tokens,requests,source,coverage FROM usage_records ORDER BY period_start")?;
+        let mut statement = self.conn.prepare("SELECT usage_records.product_id,COALESCE(NULLIF(accounts.alias,''),'Аккаунт не определён'),usage_records.period_start,usage_records.period_end,usage_records.model,usage_records.input_tokens,usage_records.output_tokens,usage_records.total_tokens,usage_records.requests,usage_records.source,usage_records.coverage FROM usage_records LEFT JOIN accounts ON accounts.id=usage_records.account_id ORDER BY usage_records.period_start")?;
         let mut rows = statement
             .query_map([], |r| {
                 Ok(SafeExportRow {
                     provider_product: r.get(0)?,
-                    account_alias: "Аккаунт 1".into(),
-                    period_start: r.get(1)?,
-                    period_end: r.get(2)?,
-                    model: r.get(3)?,
-                    input_tokens: r.get(4)?,
-                    output_tokens: r.get(5)?,
-                    total_tokens: r.get(6)?,
-                    requests: r.get(7)?,
+                    account_alias: r.get(1)?,
+                    period_start: r.get(2)?,
+                    period_end: r.get(3)?,
+                    model: r.get(4)?,
+                    input_tokens: r.get(5)?,
+                    output_tokens: r.get(6)?,
+                    total_tokens: r.get(7)?,
+                    requests: r.get(8)?,
                     amount_decimal: None,
                     currency: None,
                     cost_kind: None,
-                    source_type: r.get(8)?,
-                    coverage: r.get(9)?,
+                    source_type: r.get(9)?,
+                    coverage: r.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut costs=self.conn.prepare("SELECT product_id,period_start,period_end,amount_decimal,currency,kind,source,coverage FROM cost_records ORDER BY period_start")?;
+        let mut costs=self.conn.prepare("SELECT cost_records.product_id,COALESCE(NULLIF(accounts.alias,''),'Аккаунт не определён'),cost_records.period_start,cost_records.period_end,cost_records.amount_decimal,cost_records.currency,cost_records.kind,cost_records.source,cost_records.coverage FROM cost_records LEFT JOIN accounts ON accounts.id=cost_records.account_id ORDER BY cost_records.period_start")?;
         rows.extend(
             costs
                 .query_map([], |r| {
                     Ok(SafeExportRow {
                         provider_product: r.get(0)?,
-                        account_alias: "Аккаунт 1".into(),
-                        period_start: r.get(1)?,
-                        period_end: r.get(2)?,
+                        account_alias: r.get(1)?,
+                        period_start: r.get(2)?,
+                        period_end: r.get(3)?,
                         model: None,
                         input_tokens: None,
                         output_tokens: None,
                         total_tokens: None,
                         requests: None,
-                        amount_decimal: r.get(3)?,
-                        currency: r.get(4)?,
-                        cost_kind: r.get(5)?,
-                        source_type: r.get(6)?,
-                        coverage: r.get(7)?,
+                        amount_decimal: r.get(4)?,
+                        currency: r.get(5)?,
+                        cost_kind: r.get(6)?,
+                        source_type: r.get(7)?,
+                        coverage: r.get(8)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?,
@@ -875,6 +1080,50 @@ impl Storage {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn verified_token_totals_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage != 'UnverifiedSemantics' GROUP BY product_id ORDER BY product_id",
+        )?;
+        let rows = statement
+            .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn unverified_token_totals_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage = 'UnverifiedSemantics' GROUP BY product_id ORDER BY product_id",
+        )?;
+        let rows = statement
+            .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn excluded_unverified_count_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut statement = self.conn.prepare(
+            "SELECT COUNT(DISTINCT product_id) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage = 'UnverifiedSemantics'",
+        )?;
+        let count: u64 = statement.query_row(params![start.to_rfc3339(), end.to_rfc3339()], |r| r.get(0))?;
+        Ok(count)
     }
 
     pub fn tokens_for_account_between(
@@ -944,6 +1193,20 @@ impl Storage {
         end: DateTime<Utc>,
     ) -> Result<Vec<(Option<String>, u64)>> {
         let mut statement = self.conn.prepare("SELECT model,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? GROUP BY model ORDER BY model")?;
+        let rows = statement
+            .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn verified_model_totals_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(Option<String>, u64)>> {
+        let mut statement = self.conn.prepare("SELECT model,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage != 'UnverifiedSemantics' GROUP BY model ORDER BY model")?;
         let rows = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -1206,7 +1469,26 @@ impl Storage {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for row in &mut rows {
             if row.0.trim().is_empty() {
-                row.0 = "Аккаунт 1".into();
+                row.0 = "Аккаунт не определён".into();
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn verified_account_product_totals_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(String, String, String, u64)>> {
+        let mut statement = self.conn.prepare("SELECT accounts.alias,usage_records.account_id,usage_records.product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records LEFT JOIN accounts ON accounts.id=usage_records.account_id WHERE period_start>=? AND period_start<? AND usage_records.coverage != 'UnverifiedSemantics' GROUP BY usage_records.account_id,usage_records.product_id ORDER BY accounts.alias")?;
+        let mut rows: Vec<(String, String, String, u64)> = statement
+            .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for row in &mut rows {
+            if row.0.trim().is_empty() {
+                row.0 = "Аккаунт не определён".into();
             }
         }
         Ok(rows)
@@ -1221,6 +1503,39 @@ impl Storage {
         let rows = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
                 Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn verified_project_totals_between(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(Option<String>, u64)>> {
+        let mut statement = self.conn.prepare("SELECT billing_scope_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage != 'UnverifiedSemantics' GROUP BY billing_scope_id ORDER BY billing_scope_id")?;
+        let rows = statement
+            .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_attribution(&self) -> Result<Vec<RecordAttribution>> {
+        let mut statement = self.conn.prepare(
+            "SELECT account_id,product_id,connection_id,file_id,file_generation,source_record_id FROM usage_records ORDER BY period_start",
+        )?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(RecordAttribution {
+                    account_id: r.get(0)?,
+                    product_id: r.get(1)?,
+                    connection_id: r.get(2)?,
+                    file_id: r.get(3)?,
+                    file_generation: r.get(4)?,
+                    source_record_id: r.get(5)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -1262,6 +1577,209 @@ impl Storage {
             db_bytes,
         })
     }
+}
+
+/// Legacy rows have no trustworthy source provenance. Keep them available,
+/// but move them into an explicit unknown-identity account and connection so
+/// they cannot be mistaken for a newly confirmed local account.
+///
+/// CRITICAL DATA INTEGRITY INVARIANT:
+/// Trustworthy records (such as OpenAI API cost records or snapshots with
+/// confirmed account attribution) must NEVER have their account changed.
+/// Only rows with genuinely missing or ambiguous provenance (e.g. nil UUID,
+/// orphaned records, or local client records with missing connection_id)
+/// are migrated.
+fn migrate_legacy_rows(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let products: Vec<String> = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT product_id FROM usage_records WHERE connection_id IS NULL
+             UNION
+             SELECT DISTINCT product_id FROM cost_records WHERE account_id = '00000000-0000-0000-0000-000000000000' OR account_id NOT IN (SELECT id FROM accounts)
+             UNION
+             SELECT DISTINCT product_id FROM snapshots WHERE account_id = '00000000-0000-0000-0000-000000000000' OR account_id NOT IN (SELECT id FROM accounts)",
+        )?;
+        let products = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        products
+    };
+
+    for product_id in products {
+        let provider_id = match product_id.as_str() {
+            "codex" | "openai-api" => "openai",
+            "claude-code" | "claude-ai" => "anthropic",
+            "antigravity" | "gemini-api" => "google",
+            "glm-coding" => "zai",
+            "zen" => "opencode",
+            _ => "legacy",
+        };
+        let root_hash = format!("legacy-unattributed/{product_id}");
+        let account_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("usage.ai/legacy-account/{provider_id}/{product_id}").as_bytes(),
+        );
+        let connection_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            format!("usage.ai/connection/{provider_id}/{product_id}/{root_hash}").as_bytes(),
+        );
+        tx.execute(
+            "INSERT OR IGNORE INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            params![
+                account_id.to_string(),
+                provider_id,
+                product_id,
+                Option::<String>::None,
+                "Legacy / Identity unknown",
+                Option::<String>::None,
+                "Active",
+                1i64,
+                Option::<String>::None,
+                "Unknown",
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO source_connections(id,account_id,provider_id,product_id,root_hash,root_hint,kind,identity_fingerprint,identity_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            params![
+                connection_id.to_string(),
+                account_id.to_string(),
+                provider_id,
+                product_id,
+                root_hash,
+                "Legacy / Identity unknown",
+                "legacy-unattributed",
+                Option::<String>::None,
+                "Unknown",
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        // Only update usage_records that lack connection_id AND lack trustworthy account attribution
+        tx.execute(
+            "UPDATE usage_records SET account_id=?,connection_id=? WHERE product_id=? AND connection_id IS NULL AND (
+                account_id = '00000000-0000-0000-0000-000000000000'
+                OR account_id NOT IN (SELECT id FROM accounts)
+                OR account_id IN (
+                    SELECT id FROM accounts
+                    WHERE external_identity_fingerprint IS NULL
+                      AND (connection_ref IS NULL OR connection_ref LIKE '%-local')
+                      AND identity_confidence = 'Unknown'
+                )
+            )",
+            params![account_id.to_string(), connection_id.to_string(), product_id],
+        )?;
+
+        // If there are any usage_records for this product that belong to a valid managed account but have connection_id IS NULL,
+        // attach a dedicated connection for that account without touching its account_id.
+        {
+            let mut managed_stmt = tx.prepare(
+                "SELECT DISTINCT account_id FROM usage_records WHERE product_id=? AND connection_id IS NULL"
+            )?;
+            let managed_accounts = managed_stmt
+                .query_map(params![product_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            for m_acc in managed_accounts {
+                let m_conn_hash = format!("account-connection/{m_acc}/{product_id}");
+                let m_conn_id = uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_URL,
+                    format!("usage.ai/connection/{provider_id}/{product_id}/{m_conn_hash}").as_bytes(),
+                );
+                let account_identity: Option<(Option<String>, String)> = tx
+                    .query_row(
+                        "SELECT external_identity_fingerprint, identity_confidence FROM accounts WHERE id = ?",
+                        params![m_acc],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+
+                let (fp, confidence) = match account_identity {
+                    Some((Some(ref fp_val), ref conf)) if !fp_val.trim().is_empty() && conf == "Verified" => {
+                        (Some(fp_val.clone()), "Verified")
+                    }
+                    Some((Some(ref fp_val), _)) if !fp_val.trim().is_empty() => {
+                        (Some(fp_val.clone()), "Weak")
+                    }
+                    _ => (None, "Unknown"),
+                };
+
+                tx.execute(
+                    "INSERT OR IGNORE INTO source_connections(id,account_id,provider_id,product_id,root_hash,root_hint,kind,identity_fingerprint,identity_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    params![
+                        m_conn_id.to_string(),
+                        m_acc,
+                        provider_id,
+                        product_id,
+                        m_conn_hash,
+                        "Managed connection",
+                        "managed",
+                        fp,
+                        confidence,
+                        Utc::now().to_rfc3339(),
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE usage_records SET connection_id=? WHERE product_id=? AND account_id=? AND connection_id IS NULL",
+                    params![m_conn_id.to_string(), product_id, m_acc],
+                )?;
+            }
+        }
+
+        // Only update cost_records that lack trustworthy account attribution
+        tx.execute(
+            "UPDATE cost_records SET account_id=? WHERE product_id=? AND (
+                account_id = '00000000-0000-0000-0000-000000000000'
+                OR account_id NOT IN (SELECT id FROM accounts)
+                OR account_id IN (
+                    SELECT id FROM accounts
+                    WHERE external_identity_fingerprint IS NULL
+                      AND (connection_ref IS NULL OR connection_ref LIKE '%-local')
+                      AND identity_confidence = 'Unknown'
+                )
+            )",
+            params![account_id.to_string(), product_id],
+        )?;
+
+        // Only update snapshots that lack trustworthy account attribution
+        let mut snap_stmt = tx.prepare(
+            "SELECT id, payload_json FROM snapshots WHERE product_id=? AND (
+                account_id = '00000000-0000-0000-0000-000000000000'
+                OR account_id NOT IN (SELECT id FROM accounts)
+                OR account_id IN (
+                    SELECT id FROM accounts
+                    WHERE external_identity_fingerprint IS NULL
+                      AND (connection_ref IS NULL OR connection_ref LIKE '%-local')
+                      AND identity_confidence = 'Unknown'
+                )
+            )",
+        )?;
+        let snap_rows = snap_stmt
+            .query_map(params![product_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
+
+        for (snap_id, payload_json) in snap_rows {
+            let updated_payload = if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&payload_json) {
+                if let Some(map) = val.as_object_mut() {
+                    map.insert(
+                        "account_id".to_string(),
+                        serde_json::Value::String(account_id.to_string()),
+                    );
+                    map.insert(
+                        "accountId".to_string(),
+                        serde_json::Value::String(account_id.to_string()),
+                    );
+                }
+                val.to_string()
+            } else {
+                payload_json
+            };
+            tx.execute(
+                "UPDATE snapshots SET account_id=?, payload_json=? WHERE id=?",
+                params![account_id.to_string(), updated_payload, snap_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1322,6 +1840,17 @@ pub struct StorageStatus {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RecordAttribution {
+    pub account_id: String,
+    pub product_id: String,
+    pub connection_id: Option<String>,
+    pub file_id: Option<String>,
+    pub file_generation: Option<i64>,
+    pub source_record_id: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StoredSnapshot {
     pub account_id: String,
     pub product_id: String,
@@ -1364,7 +1893,7 @@ pub struct AttemptLog<'a> {
     pub finished_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BundleReport {
     pub usage_accepted: usize,
@@ -1404,7 +1933,10 @@ struct SafeExportRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use usage_core::Coverage;
+    use chrono::TimeZone;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+    use usage_core::{CostKind, Coverage};
     use uuid::Uuid;
     fn usage(id: &str, total: u64) -> UsageRecord {
         let now = Utc::now();
@@ -1419,6 +1951,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             cached_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
             reasoning_tokens: None,
             total_tokens: Some(total),
             requests: Some(1),
@@ -1437,6 +1971,41 @@ mod tests {
         assert_eq!(s.usage_count().unwrap(), 1);
         assert!(s.export_json().unwrap().contains("20"));
     }
+
+    #[test]
+    fn late_claude_chunk_preserves_monotonic_totals_and_cache_buckets() {
+        let mut s = Storage::in_memory().unwrap();
+        let mut newer = usage("msg:m1:r1", 70);
+        newer.product_id = "claude-code".into();
+        newer.source = "claude-code-local-session-v1".into();
+        newer.model = Some("claude-test".into());
+        newer.input_tokens = Some(30);
+        newer.output_tokens = Some(40);
+        newer.cached_tokens = Some(5);
+        newer.cache_read_tokens = Some(5);
+        s.upsert_usage(&newer).unwrap();
+
+        let mut older = newer.clone();
+        older.period_start -= chrono::Duration::seconds(1);
+        older.period_end = older.period_start;
+        older.input_tokens = Some(10);
+        older.output_tokens = Some(20);
+        older.total_tokens = Some(30);
+        older.cached_tokens = None;
+        older.cache_read_tokens = None;
+        s.upsert_usage(&older).unwrap();
+
+        let row: (u64, Option<u64>, Option<u64>, Option<u64>) = s
+            .conn
+            .query_row(
+                "SELECT total_tokens,cache_creation_tokens,cache_read_tokens,cached_tokens FROM usage_records WHERE source_record_id=?",
+                ["msg:m1:r1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (70, None, Some(5), Some(5)));
+    }
+
     #[test]
     fn truncation_resets_offset() {
         let mut s = Storage::in_memory().unwrap();
@@ -1620,7 +2189,17 @@ mod tests {
         }
         let storage = Storage::open(&path).unwrap();
         assert_eq!(storage.usage_count().unwrap(), 1);
-        assert_eq!(storage.list_managed_accounts().unwrap().len(), 1);
+        assert_eq!(storage.list_managed_accounts().unwrap().len(), 2);
+        let migrated = storage.record_attribution().unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert!(migrated[0].connection_id.is_some());
+        let legacy_id = migrated[0].account_id.parse::<Uuid>().unwrap();
+        let legacy = storage.get_account(legacy_id).unwrap().unwrap();
+        assert_eq!(legacy.label, "Legacy / Identity unknown");
+        assert_eq!(
+            legacy.identity_confidence,
+            usage_core::IdentityConfidence::Unknown
+        );
         assert!(storage
             .last_known_good(Uuid::nil(), "codex")
             .unwrap()
@@ -1629,11 +2208,309 @@ mod tests {
         assert!(path.with_extension("db.pre-migration.bak").exists());
     }
     #[test]
+    fn migration_case_a_legacy_local_contamination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES('00000000-0000-0000-0000-000000000000','openai','Local','Active','2026-01-01T00:00:00Z')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES('00000000-0000-0000-0000-000000000000','codex','codex-1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',100,1,'local','UnverifiedSemantics')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES('00000000-0000-0000-0000-000000000000','claude-code','claude-1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',200,1,'local','UnverifiedSemantics')",
+                [],
+            ).unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(storage.usage_count().unwrap(), 2);
+        let records = storage.record_attribution().unwrap();
+        assert_eq!(records.len(), 2);
+        for r in records {
+            assert!(r.connection_id.is_some());
+            let acc_id = r.account_id.parse::<Uuid>().unwrap();
+            let acc = storage.get_account(acc_id).unwrap().unwrap();
+            assert_eq!(acc.label, "Legacy / Identity unknown");
+            assert_eq!(acc.identity_confidence, usage_core::IdentityConfidence::Unknown);
+        }
+    }
+    #[test]
+    fn migration_case_b_trustworthy_openai_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let api_acc_id = "11111111-1111-1111-1111-111111111111";
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 5u32).unwrap();
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','openai-api','key-fingerprint-abc','Work API','keychain:openai:work','Active',1,'Verified','2026-01-01T00:00:00Z')",
+                [api_acc_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,'openai-api','org-1','c1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','19.99','USD','reported','official-api','Complete')",
+                [api_acc_id],
+            ).unwrap();
+            let payload = format!(r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#);
+            conn.execute(
+                "INSERT INTO snapshots(account_id,product_id,payload_json,fetched_at) VALUES(?,'openai-api',?,'2026-09-01T00:00:00Z')",
+                params![api_acc_id, payload],
+            ).unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
+        let acc = storage.get_account(api_uuid).unwrap().unwrap();
+        assert_eq!(acc.label, "Work API");
+        assert_eq!(acc.connection_ref.as_deref(), Some("keychain:openai:work"));
+        assert_eq!(acc.identity_confidence, usage_core::IdentityConfidence::Verified);
+
+        let costs = storage.cost_records_between(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+        ).unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].account_id, api_uuid);
+        assert_eq!(costs[0].amount_decimal, Decimal::from_str("19.99").unwrap());
+
+        let lkg = storage.last_known_good(api_uuid, "openai-api").unwrap();
+        assert!(lkg.is_some(), "LKG for account A must be preserved");
+        assert_eq!(lkg.unwrap().account_id, api_acc_id);
+    }
+    #[test]
+    fn migration_case_c_mixed_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let api_acc_id = "22222222-2222-2222-2222-222222222222";
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 5u32).unwrap();
+
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES('00000000-0000-0000-0000-000000000000','openai','Local','Active','2026-01-01T00:00:00Z')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES('00000000-0000-0000-0000-000000000000','codex','codex-1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',100,1,'local','UnverifiedSemantics')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES('00000000-0000-0000-0000-000000000000','claude-code','claude-1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',200,1,'local','UnverifiedSemantics')",
+                [],
+            ).unwrap();
+
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','openai-api','key-fp','Work API','keychain:openai:work','Active',1,'Verified','2026-01-01T00:00:00Z')",
+                [api_acc_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,'openai-api','org-1','c1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','49.95','USD','reported','official-api','Complete')",
+                [api_acc_id],
+            ).unwrap();
+            let payload = format!(r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#);
+            conn.execute(
+                "INSERT INTO snapshots(account_id,product_id,payload_json,fetched_at) VALUES(?,'openai-api',?,'2026-09-01T00:00:00Z')",
+                params![api_acc_id, payload],
+            ).unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+
+        assert_eq!(storage.usage_count().unwrap(), 2);
+        let records = storage.record_attribution().unwrap();
+        for r in records {
+            let acc = storage.get_account(r.account_id.parse().unwrap()).unwrap().unwrap();
+            assert_eq!(acc.label, "Legacy / Identity unknown");
+        }
+        let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
+        let costs = storage.cost_records_between(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+        ).unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].account_id, api_uuid);
+        assert_eq!(costs[0].amount_decimal, Decimal::from_str("49.95").unwrap());
+
+        let lkg = storage.last_known_good(api_uuid, "openai-api").unwrap().unwrap();
+        assert_eq!(lkg.account_id, api_acc_id);
+    }
+    #[test]
+    fn migration_case_d_idempotence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let api_acc_id = "33333333-3333-3333-3333-333333333333";
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 5u32).unwrap();
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','openai-api','key-fp','Work API','keychain:openai:work','Active',1,'Verified','2026-01-01T00:00:00Z')",
+                [api_acc_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,'openai-api','org-1','c1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','10.50','USD','reported','official-api','Complete')",
+                [api_acc_id],
+            ).unwrap();
+        }
+        let storage1 = Storage::open(&path).unwrap();
+        let counts1 = storage1.storage_status().unwrap();
+        drop(storage1);
+
+        let storage2 = Storage::open(&path).unwrap();
+        let counts2 = storage2.storage_status().unwrap();
+        assert_eq!(counts1.accounts, counts2.accounts);
+        assert_eq!(counts1.cost_records, counts2.cost_records);
+        assert_eq!(counts1.usage_records, counts2.usage_records);
+        assert_eq!(counts1.checkpoints, counts2.checkpoints);
+
+        let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
+        let costs = storage2.cost_records_between(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+        ).unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].account_id, api_uuid);
+    }
+    #[test]
+    fn migration_managed_api_account_records_never_change_account_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let api_acc_id = "44444444-4444-4444-4444-444444444444";
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.pragma_update(None, "user_version", 5u32).unwrap();
+
+            conn.execute(
+                "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','openai-api','key-fingerprint-prod','Managed Production API','keychain:openai:prod','Active',1,'Verified','2026-01-01T00:00:00Z')",
+                [api_acc_id],
+            ).unwrap();
+
+            // Insert usage record with connection_id IS NULL (simulating pre-v5 / v5 state before migration 006)
+            conn.execute(
+                "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES(?,'openai-api','openai-usage-1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',500,5,'api','Complete')",
+                [api_acc_id],
+            ).unwrap();
+
+            // Insert cost record
+            conn.execute(
+                "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,'openai-api','org-prod','c-prod','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','123.45','USD','reported','official-api','Complete')",
+                [api_acc_id],
+            ).unwrap();
+
+            // Insert snapshot
+            let payload = format!(r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#);
+            conn.execute(
+                "INSERT INTO snapshots(account_id,product_id,payload_json,fetched_at) VALUES(?,'openai-api',?,'2026-09-01T00:00:00Z')",
+                params![api_acc_id, payload],
+            ).unwrap();
+        }
+
+        // Open and migrate to v6/v7
+        let storage = Storage::open(&path).unwrap();
+        let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
+
+        // Check account itself
+        let acc = storage.get_account(api_uuid).unwrap().expect("account must exist");
+        assert_eq!(acc.label, "Managed Production API");
+        assert_eq!(acc.identity_confidence, usage_core::IdentityConfidence::Verified);
+
+        // Check usage records: account_id MUST NOT have changed to legacy account
+        let usage_records = storage.record_attribution().unwrap();
+        let matched_usage = usage_records.iter().find(|u| u.source_record_id == "openai-usage-1").expect("usage record must exist");
+        assert_eq!(matched_usage.account_id, api_acc_id, "Usage record account_id must NOT change during migration");
+        assert!(matched_usage.connection_id.is_some(), "Connection ID must have been attached");
+
+        // Check cost records: account_id MUST NOT have changed
+        let costs = storage.cost_records_between(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+        ).unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].account_id, api_uuid, "Cost record account_id must NOT change during migration");
+        assert_eq!(costs[0].amount_decimal, Decimal::from_str("123.45").unwrap());
+
+        // Check snapshot: account_id and LKG MUST remain with the managed account
+        let lkg = storage.last_known_good(api_uuid, "openai-api").unwrap().expect("LKG must be preserved");
+        assert_eq!(lkg.account_id, api_acc_id, "Snapshot account_id must NOT change during migration");
+    }
+    #[test]
+    fn sqlite_exact_decimal_roundtrip() {
+        let mut storage = Storage::in_memory().unwrap();
+        let acc_id = Uuid::new_v4();
+        let test_values = [
+            "0.1",
+            "0.2",
+            "0.3",
+            "0.00000001",
+            "123456789.123456789",
+            "999999999999.999999",
+        ];
+        let start = Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0).unwrap();
+        for (i, val_str) in test_values.iter().enumerate() {
+            let decimal = Decimal::from_str(val_str).unwrap();
+            let record = CostRecord {
+                account_id: acc_id,
+                product_id: "openai-api".into(),
+                billing_scope_id: None,
+                source_record_id: format!("rec-{i}"),
+                period_start: start,
+                period_end: start,
+                amount_decimal: decimal,
+                currency: "USD".into(),
+                kind: CostKind::Reported,
+                source: "official-api".into(),
+                coverage: Coverage::Complete,
+            };
+            storage.upsert_cost(&record).unwrap();
+        }
+
+        let fetched = storage.cost_records_between(
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+        ).unwrap();
+        assert_eq!(fetched.len(), test_values.len());
+
+        for (i, val_str) in test_values.iter().enumerate() {
+            let found = fetched.iter().find(|r| r.source_record_id == format!("rec-{i}")).unwrap();
+            let expected = Decimal::from_str(val_str).unwrap();
+            assert_eq!(found.amount_decimal, expected);
+            assert_eq!(found.amount_decimal.to_string(), *val_str);
+        }
+
+        let d1 = Decimal::from_str("0.1").unwrap();
+        let d2 = Decimal::from_str("0.2").unwrap();
+        let d3 = Decimal::from_str("0.3").unwrap();
+        assert_eq!(d1 + d2, d3);
+    }
+    #[test]
     fn export_uses_safe_alias_and_no_identity() {
         let mut s = Storage::in_memory().unwrap();
         s.upsert_usage(&usage("one", 10)).unwrap();
         let out = s.export_json().unwrap();
-        assert!(out.contains("Аккаунт 1"));
+        assert!(out.contains("Аккаунт не определён"));
         assert!(!out.to_ascii_lowercase().contains("email"));
     }
     #[test]
@@ -1649,10 +2526,39 @@ mod tests {
         };
         s.upsert_account(&account).unwrap();
         s.upsert_usage(&usage("one", 10)).unwrap();
+        let connection = s
+            .ensure_connection(
+                account.id,
+                "openai",
+                "codex",
+                "delete-root",
+                "root",
+                "default-local",
+            )
+            .unwrap();
+        let file = s
+            .ensure_source_file(&connection.id, "delete-file", 1, 2)
+            .unwrap();
+        let record = provenanced("one", 10, &connection.id, &file.id, 1);
+        s.commit_import_batch(&ImportBatchCommit {
+            file_id: &file.id,
+            file_generation: 1,
+            is_replacement: false,
+            device: 1,
+            inode: 2,
+            records: &[record],
+            byte_offset: 4,
+            schema_version: 1,
+            last_source_record_id: Some("one"),
+        })
+        .unwrap();
         s.archive_account(account.id).unwrap();
         assert_eq!(s.usage_count().unwrap(), 1);
         s.delete_account_and_history(account.id).unwrap();
         assert_eq!(s.usage_count().unwrap(), 0);
+        assert!(s.get_connection(&connection.id).unwrap().is_none());
+        assert!(s.get_source_file(&file.id).unwrap().is_none());
+        assert!(s.file_import_state(&file.id).unwrap().is_none());
     }
     #[test]
     fn budgets_validate_and_roundtrip() {
@@ -1799,6 +2705,48 @@ mod tests {
         // Same path hash under different connections: distinct file rows.
         assert_ne!(file_a.id, file_b.id);
     }
+
+    #[test]
+    fn same_root_cannot_silently_rebind_between_accounts() {
+        let mut s = Storage::in_memory().unwrap();
+        let account_a = Account {
+            id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            external_identity: None,
+            label: "A".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+        };
+        let account_b = Account {
+            id: Uuid::new_v4(),
+            ..account_a.clone()
+        };
+        s.upsert_account(&account_a).unwrap();
+        s.upsert_account(&account_b).unwrap();
+        let original = s
+            .ensure_connection(
+                account_a.id,
+                "openai",
+                "codex",
+                "same-root",
+                "default",
+                "default-local",
+            )
+            .unwrap();
+        let rebinding = s.ensure_connection(
+            account_b.id,
+            "openai",
+            "codex",
+            "same-root",
+            "custom",
+            "custom-local",
+        );
+        assert!(rebinding.is_err());
+        assert_eq!(
+            s.get_connection(&original.id).unwrap().unwrap().account_id,
+            account_a.id.to_string()
+        );
+    }
     #[test]
     fn replacement_rebuilds_old_generation_rows_atomically() {
         let mut s = Storage::in_memory().unwrap();
@@ -1906,8 +2854,111 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.db");
-        let _storage = Storage::open(&path).unwrap();
+        let mut storage = Storage::open(&path).unwrap();
+        storage.upsert_usage(&usage("test-perm", 10)).unwrap();
+        let parent_mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o700);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar_path = std::path::PathBuf::from(sidecar);
+            if sidecar_path.exists() {
+                let sidecar_mode = std::fs::metadata(&sidecar_path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(sidecar_mode, 0o600, "sidecar {suffix} must be 0600");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_and_shm_sidecars_are_hardened_and_fail_closed_if_insecure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let storage = Storage::open(&path).unwrap();
+        drop(storage);
+
+        // Manually create both -wal and -shm sidecars with insecure permissions (0o666)
+        let wal_path = dir.path().join("usage.db-wal");
+        let shm_path = dir.path().join("usage.db-shm");
+        std::fs::write(&wal_path, b"dummy wal content").unwrap();
+        std::fs::write(&shm_path, b"dummy shm content").unwrap();
+        std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_ne!(std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_ne!(std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        // Harden permissions must fix both to 0o600
+        let hardener = SystemPermissionHardener;
+        hardener.harden_permissions(&path).unwrap();
+        let wal_mode = std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777;
+        let shm_mode = std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(wal_mode, 0o600, "insecure wal sidecar must be hardened to 0600");
+        assert_eq!(shm_mode, 0o600, "insecure shm sidecar must be hardened to 0600");
+    }
+
+    struct FailingHardener;
+    impl PermissionHardener for FailingHardener {
+        fn harden_permissions(&self, _db_path: &Path) -> Result<()> {
+            anyhow::bail!("forced permission chmod failure")
+        }
+    }
+
+    #[test]
+    fn forced_permission_hardening_failure_aborts_storage_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let res = Storage::open_with_hardener(&path, std::sync::Arc::new(FailingHardener));
+        assert!(res.is_err(), "Storage::open must fail closed on chmod error");
+        let err_msg = res.err().unwrap().to_string();
+        assert!(err_msg.contains("forced permission chmod failure"));
+    }
+
+    struct InsecureModeHardener;
+    impl PermissionHardener for InsecureModeHardener {
+        fn harden_permissions(&self, _db_path: &Path) -> Result<()> {
+            anyhow::bail!("db file has insecure permissions: 666")
+        }
+    }
+
+    #[test]
+    fn bad_resulting_mode_aborts_storage_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let res = Storage::open_with_hardener(&path, std::sync::Arc::new(InsecureModeHardener));
+        assert!(res.is_err(), "Storage::open must fail closed when mode is insecure");
+    }
+
+    #[test]
+    fn migration_backfilled_unknown_account_connection_remains_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+
+        let local_acc_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','codex',NULL,'Local Codex','local','Active',1,'Unknown','2026-01-01T00:00:00Z')",
+            params![local_acc_id.to_string()],
+        ).unwrap();
+
+        // Insert usage row with connection_id IS NULL belonging to local account
+        conn.execute(
+            "INSERT INTO usage_records(account_id,product_id,source_record_id,period_start,period_end,total_tokens,requests,source,coverage) VALUES(?,'codex','r1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z',50,1,'local','UnverifiedSemantics')",
+            params![local_acc_id.to_string()],
+        ).unwrap();
+        drop(conn);
+
+        let storage = Storage::open(&path).unwrap();
+        let conns = storage.list_connections().unwrap();
+        let backfilled = conns.iter().find(|c| c.account_id == local_acc_id.to_string()).unwrap();
+        assert_eq!(backfilled.identity_confidence, "Unknown", "Backfilled local connection without fingerprint must remain Unknown");
     }
 }
