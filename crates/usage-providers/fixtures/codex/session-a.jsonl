@@ -1,0 +1,8 @@
+# EXPECTED (hand-verified): 3 requests =>
+# input 400 (120+80+200), cached 70 (20+0+50), output 100 (30+20+50),
+# reasoning 15 (10+5+0), total 510 (150+100+260);
+# models {gpt-a: 2, gpt-b: 1}. Final line is a quota-only snapshot.
+{"timestamp":"2026-09-08T12:00:00Z","type":"event_msg","payload":{"type":"token_count","model":"gpt-a","info":{"last_token_usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30,"reasoning_output_tokens":10,"total_tokens":150}}}}
+{"timestamp":"2026-09-08T12:05:00Z","type":"event_msg","payload":{"type":"token_count","model":"gpt-a","info":{"last_token_usage":{"input_tokens":80,"cached_input_tokens":0,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":100}}}}
+{"timestamp":"2026-09-08T12:10:00Z","type":"event_msg","payload":{"type":"token_count","model":"gpt-b","info":{"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":260}}}}
+{"timestamp":"2026-09-08T12:11:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex-weekly","limit_name":"Weekly","primary":{"used_percent":32.5,"window_minutes":10080,"resets_at":1789477200},"secondary":null,"plan_type":"team"}}}

@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use std::path::PathBuf;
 use std::time::Duration;
 use usage_core::{MoneyBalance, Snapshot, UsageRecord};
-use usage_host::Hosts;
+use usage_host::{ProviderHostFacade, ScopedRoot};
 
 /// Stable source identity inside a product pipeline.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -72,6 +71,7 @@ impl SourceError {
                 | SourceError::Cooldown
                 | SourceError::AuthenticationRequired
                 | SourceError::InsufficientScope
+                | SourceError::Cancelled
         )
     }
 
@@ -111,14 +111,23 @@ pub struct FetchPayload {
     pub schema_fingerprint: &'static str,
     pub coverage: usage_core::Coverage,
     pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A source may commit a valid partial result while reporting the
+    /// failure that stopped pagination. This is intentionally separate from
+    /// `Result::Err`: page 1 data must not be discarded when page 2 fails.
+    pub source_error: Option<SourceError>,
 }
 
 pub struct FetchContext<'a> {
     pub account: &'a usage_core::Account,
-    pub hosts: &'a Hosts,
+    /// ProviderHostFacade is constructed by runtime policy. Strategies do
+    /// not receive the unrestricted host bundle.
+    pub facade: ProviderHostFacade<'a>,
+    pub descriptor: &'static crate::descriptor::ProductDescriptor,
     pub timeout: Duration,
-    /// Product-scoped local root override (user-selected custom path).
-    pub custom_root: Option<PathBuf>,
+    /// Product root was resolved and scoped by runtime before strategy
+    /// invocation. Providers can only use the opaque root and scoped file
+    /// methods exposed by the facade.
+    pub local_root: Option<ScopedRoot>,
     /// Secret supplied by the runtime from Keychain for this call only.
     pub secret: Option<Vec<u8>>,
     /// Cooperative cancellation: strategies and hosts must observe it
@@ -145,6 +154,35 @@ pub trait FetchStrategy: Send + Sync {
     }
 }
 
+/// Byte-level log parser for file-backed strategies. Parsing is pure
+/// over caller-supplied bytes: no filesystem, no environment, no
+/// network. The runtime supplies scoped reads and commits results
+/// with file provenance.
+pub trait FileLogParser: Send + Sync {
+    fn source_id(&self) -> SourceId;
+    fn schema_fingerprint(&self) -> &'static str;
+    fn parse_chunk(
+        &self,
+        account: &usage_core::Account,
+        path_hash: &str,
+        base_offset: u64,
+        bytes: &[u8],
+    ) -> ParsedChunk;
+}
+
+/// One parsed byte range: records plus resume metadata. `consumed`
+/// is the next offset to read from; a trailing partial line is never
+/// consumed. `malformed` counts unparseable JSON lines separately
+/// from silently skipped non-event lines.
+#[derive(Debug, Default)]
+pub struct ParsedChunk {
+    pub records: Vec<UsageRecord>,
+    pub consumed: u64,
+    pub partial: bool,
+    pub warnings: Vec<String>,
+    pub malformed: usize,
+}
+
 pub fn map_host_error(error: &usage_host::HostError) -> SourceError {
     match error {
         usage_host::HostError::Denied => SourceError::AuthenticationRequired,
@@ -153,6 +191,7 @@ pub fn map_host_error(error: &usage_host::HostError) -> SourceError {
             retry_after_secs: *retry_after_secs,
         },
         usage_host::HostError::Timeout | usage_host::HostError::Unavailable => SourceError::Network,
+        usage_host::HostError::Cancelled => SourceError::Cancelled,
         usage_host::HostError::NotFound => SourceError::Unavailable,
         usage_host::HostError::Policy => SourceError::Policy,
     }

@@ -1,0 +1,8 @@
+# EXPECTED parser-level: 4 events, identities
+# [msg:m1:r1, msg:m1:r1, msg:m1:r1, uuid:u-b1].
+# EXPECTED stored: m1 collapses to the final chunk (30/40, cached 5),
+# m2 stores 10. Chunks of one logical response never inflate totals.
+{"timestamp":"2026-09-08T12:00:00Z","uuid":"u-a1","requestId":"r1","message":{"id":"m1","model":"sonnet","usage":{"input_tokens":10,"output_tokens":20}}}
+{"timestamp":"2026-09-08T12:00:01Z","uuid":"u-a2","requestId":"r1","message":{"id":"m1","model":"sonnet","usage":{"input_tokens":10,"output_tokens":20}}}
+{"timestamp":"2026-09-08T12:00:02Z","uuid":"u-a3","requestId":"r1","message":{"id":"m1","model":"sonnet","usage":{"input_tokens":30,"output_tokens":40,"cache_read_input_tokens":5}}}
+{"timestamp":"2026-09-08T12:01:00Z","uuid":"u-b1","message":{"model":"opus","usage":{"input_tokens":5,"output_tokens":5}}}

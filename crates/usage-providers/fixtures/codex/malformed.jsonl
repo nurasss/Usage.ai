@@ -1,0 +1,6 @@
+# EXPECTED: 1 record (7/3/10); malformed == 1 (`{"broken":`);
+# non-JSON and valid non-token lines are skipped silently (not malformed).
+not json at all
+{"type":"event_msg","payload":{"type":"other"}}
+{"broken": 
+{"timestamp":"2026-09-08T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}}

@@ -1,0 +1,5 @@
+# EXPECTED: 1 request => input 10, output 5, total 15, model missing.
+# Quota observed 12:30 is NEWER than session-a quota (12:11): cross-file
+# scan must report used_percent 40.0, never the newest-file snapshot.
+{"timestamp":"2026-09-08T11:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+{"timestamp":"2026-09-08T12:30:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex-weekly","limit_name":"Weekly","primary":{"used_percent":40.0,"window_minutes":10080,"resets_at":1789477200},"secondary":null,"plan_type":"team"}}}

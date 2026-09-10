@@ -1,0 +1,2 @@
+# EXPECTED (archived session): 1 request => input 5, output 5, total 10.
+{"timestamp":"2026-09-01T09:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"output_tokens":5,"total_tokens":10}}}}

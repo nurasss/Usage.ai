@@ -1,0 +1,5 @@
+# EXPECTED parser-level: 2 reduced events (older duplicate shares id).
+# EXPECTED stored: 2 rows; cache = creation + read = 7, total excludes cache.
+{"timestamp":"2026-09-08T12:05:00Z","uuid":"u-1","message":{"usage":{"input_tokens":1,"output_tokens":1}}}
+{"timestamp":"2026-09-08T12:03:00Z","uuid":"u-2","message":{"model":"haiku","usage":{"input_tokens":2,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}}}
+{"timestamp":"2026-09-08T12:04:00Z","uuid":"u-2","message":{"model":"haiku","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}

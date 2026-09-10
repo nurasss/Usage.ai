@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
-use std::{collections::BTreeSet, str::FromStr, time::Duration};
+use std::collections::BTreeSet;
 use usage_core::{
     Account, Capability, ConnectionState, Coverage, Freshness, MoneyBalance, ProviderAdapter,
     ProviderError, Snapshot,
@@ -40,15 +40,16 @@ pub struct CostDraft {
     pub api_key_id: Option<String>,
 }
 
-/// Decimal money from a JSON number. Providers emit decimal currency
-/// values (e.g. `19.99`); `f64`'s shortest round-trip representation
-/// reproduces those decimals exactly, so `Decimal` stays exact for all
-/// realistic billing amounts. (A workspace-wide `arbitrary_precision`
-/// switch was evaluated and rejected: it breaks `rust_decimal`
-/// number deserialization used by quota parsing.)
+/// Decimal money from a JSON number parsed with arbitrary_precision.
+/// The workspace enables serde_json "arbitrary_precision" and rust_decimal
+/// "serde-with-arbitrary-precision", guaranteeing that JSON number tokens
+/// are preserved as exact decimal text without IEEE-754 binary float roundtrip.
 fn decimal_from_number(value: &serde_json::Value) -> Option<Decimal> {
-    let number = value.as_number()?;
-    Decimal::from_str(&number.to_string()).ok()
+    match value {
+        serde_json::Value::Number(n) => Decimal::from_str_exact(&n.to_string()).ok(),
+        serde_json::Value::String(s) => Decimal::from_str_exact(s.trim()).ok(),
+        _ => None,
+    }
 }
 
 /// Pure defensive parser for the OpenAI organization costs page.
@@ -271,6 +272,17 @@ impl OpenAiCostsStrategy {
     }
 }
 
+fn map_costs_http_error(error: &usage_host::HostError) -> crate::strategy::SourceError {
+    match error {
+        usage_host::HostError::RateLimited(retry_after_secs) => {
+            crate::strategy::SourceError::RateLimited {
+                retry_after_secs: *retry_after_secs,
+            }
+        }
+        other => crate::strategy::map_host_error(other),
+    }
+}
+
 /// Minimal percent-encoding for opaque cursor tokens (unreserved set
 /// passes through untouched).
 fn percent_encode(raw: &str) -> String {
@@ -298,7 +310,10 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
         &self,
         ctx: &crate::strategy::FetchContext<'_>,
     ) -> crate::strategy::Availability {
-        if ctx.secret.as_deref().is_some_and(|s| !s.is_empty()) {
+        if ctx.secret.as_deref().is_some_and(|s| !s.is_empty())
+            && ctx.facade.http.is_some()
+            && !ctx.facade.allowed_hosts.is_empty()
+        {
             crate::strategy::Availability::Ready
         } else {
             crate::strategy::Availability::NotConfigured
@@ -315,42 +330,68 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
         if secret.is_empty() {
             return Err(SourceError::AuthenticationRequired);
         }
-        let end = ctx.hosts.clock.now();
+        let Some(http) = ctx.facade.http else {
+            return Err(SourceError::Policy);
+        };
+        let end = ctx.facade.clock.now();
         let start = end - chrono::Duration::days(30);
         let mut drafts = vec![];
         let mut warnings = vec![];
         let mut page: Option<String> = None;
         let mut pages = 0usize;
+        let mut source_error = None;
         loop {
             let url = self.page_url(start, end, page.as_deref());
-            let response = ctx
-                .hosts
-                .http
+            let response = match http
                 .get_json(usage_host::HttpJsonRequest {
                     url: &url,
                     bearer: Some(secret),
-                    allowed_hosts: OPENAI_API_HOSTS,
+                    allowed_hosts: ctx.facade.allowed_hosts,
                     timeout: ctx.timeout,
                     max_bytes: usage_host::policy::MAX_HTTP_BYTES,
                     user_agent: usage_host::policy::USER_AGENT,
-                    cancel: usage_host::CancellationToken::new(),
+                    cancel: ctx.cancel.clone(),
                 })
                 .await
-                .map_err(|e| match &e {
-                    usage_host::HostError::RateLimited(retry_after_secs) => {
-                        SourceError::RateLimited {
-                            retry_after_secs: *retry_after_secs,
-                        }
-                    }
-                    other => crate::strategy::map_host_error(other),
-                })?;
-            let body = response.body.ok_or(SourceError::Parse {
-                schema: openai_api_schema(),
-            })?;
-            let parsed =
-                parse_costs(&body, "openai-api-costs-v1").map_err(|_| SourceError::Parse {
-                    schema: openai_api_schema(),
-                })?;
+            {
+                Ok(response) => response,
+                Err(error) if pages == 0 => return Err(map_costs_http_error(&error)),
+                Err(error) => {
+                    source_error = Some(map_costs_http_error(&error));
+                    warnings.push("pagination_page_fetch_failed".into());
+                    break;
+                }
+            };
+            let body = match response.body {
+                Some(body) => body,
+                None if pages == 0 => {
+                    return Err(SourceError::Parse {
+                        schema: openai_api_schema(),
+                    });
+                }
+                None => {
+                    source_error = Some(SourceError::Parse {
+                        schema: openai_api_schema(),
+                    });
+                    warnings.push("pagination_page_schema_failed".into());
+                    break;
+                }
+            };
+            let parsed = match parse_costs(&body, "openai-api-costs-v1") {
+                Ok(parsed) => parsed,
+                Err(_) if pages == 0 => {
+                    return Err(SourceError::Parse {
+                        schema: openai_api_schema(),
+                    });
+                }
+                Err(_) => {
+                    source_error = Some(SourceError::Parse {
+                        schema: openai_api_schema(),
+                    });
+                    warnings.push("pagination_page_schema_failed".into());
+                    break;
+                }
+            };
             warnings.extend(parsed.warnings);
             drafts.extend(parsed.records);
             pages += 1;
@@ -361,11 +402,15 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
                 Some(next) if pages < usage_host::policy::MAX_API_PAGES => page = Some(next),
                 _ => {
                     warnings.push("pagination_bounded_partial".into());
+                    source_error = Some(SourceError::Parse {
+                        schema: openai_api_schema(),
+                    });
                     break;
                 }
             }
         }
-        let truncated = warnings.iter().any(|w| w == "pagination_bounded_partial");
+        let truncated =
+            source_error.is_some() || warnings.iter().any(|w| w == "pagination_bounded_partial");
         let account = ctx.account;
         let caps: BTreeSet<Capability> =
             crate::descriptor::OPENAI_API_CAPS.iter().copied().collect();
@@ -384,6 +429,7 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
                 Coverage::ProviderDelayed
             },
             observed_at,
+            source_error,
         })
     }
 }
@@ -395,6 +441,10 @@ pub fn openai_api_schema() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use crate::strategy::FetchStrategy;
     #[test]
     fn parses_realistic_cost_page() {
         let value = serde_json::json!({
@@ -476,12 +526,14 @@ mod tests {
             pages: std::sync::Mutex::new(pages),
             calls: std::sync::Mutex::new(0),
         });
+        let files = Arc::new(usage_host::ScopedFiles);
         let hosts = usage_host::Hosts {
             clock: Arc::new(usage_host::SystemClock),
             logger: Arc::new(usage_host::NullLogger),
             keychain: Arc::new(usage_host::MemoryKeychain::default()),
             http: http.clone(),
-            files: Arc::new(usage_host::ScopedFiles),
+            files: files.clone(),
+            file_scope: files,
             network: Arc::new(usage_host::ObservedNetwork::default()),
         };
         (hosts, http)
@@ -539,11 +591,17 @@ mod tests {
     ) -> crate::strategy::FetchContext<'a> {
         crate::strategy::FetchContext {
             account,
-            hosts,
+            facade: hosts.facade(&usage_host::facade::FacadePolicy {
+                files: false,
+                http: true,
+                allowed_hosts: OPENAI_API_HOSTS,
+                keychain_service: Some("com.nurasss.usageai"),
+            }),
             timeout: Duration::from_secs(5),
-            custom_root: None,
+            local_root: None,
             secret: Some(b"sk-test".to_vec()),
             cancel: usage_host::CancellationToken::new(),
+            descriptor: crate::descriptor::find_descriptor("openai", "openai-api").unwrap(),
         }
     }
 
@@ -559,6 +617,66 @@ mod tests {
             parse_costs(&tiny, "test").unwrap().records[0].amount,
             rust_decimal::Decimal::from_str("0.06").unwrap()
         );
+
+        // High-precision literal that would be corrupted by IEEE-754 binary float (f64)
+        // 0.1234567890123456789 would round to 0.12345678901234568 under f64
+        let precision_raw = r#"{
+            "object": "page",
+            "has_more": false,
+            "next_page": null,
+            "data": [{
+                "object": "bucket",
+                "start_time": 1725000000,
+                "end_time": 1725086400,
+                "results": [{
+                    "object": "organization.costs.result",
+                    "amount": {"value": 0.1234567890123456789, "currency": "usd"},
+                    "line_item": "gpt",
+                    "project_id": "p1"
+                }]
+            }]
+        }"#;
+        let parsed_json: serde_json::Value = serde_json::from_str(precision_raw).unwrap();
+        let costs = parse_costs(&parsed_json, "test").unwrap();
+        let expected = rust_decimal::Decimal::from_str("0.1234567890123456789").unwrap();
+        assert_eq!(costs.records[0].amount, expected);
+        assert_eq!(costs.records[0].amount.to_string(), "0.1234567890123456789");
+
+        // Mandatory exact equality tests: 0.1, 0.2, 0.3, 0.00000001, 123456789.123456789, 999999999999.999999
+        let mandatory_literals = [
+            "0.1",
+            "0.2",
+            "0.3",
+            "0.00000001",
+            "123456789.123456789",
+            "999999999999.999999",
+        ];
+        for lit in mandatory_literals {
+            // Test lexical JSON number parsing directly into Decimal
+            let json_str = format!(
+                r#"{{"object":"page","has_more":false,"next_page":null,"data":[{{"object":"bucket","start_time":1725000000,"end_time":1725086400,"results":[{{"object":"organization.costs.result","amount":{{"value":{lit},"currency":"usd"}},"line_item":"gpt","project_id":"p1"}}]}}]}}"#
+            );
+            let parsed_json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+            let costs = parse_costs(&parsed_json, "test").unwrap();
+            let expected = rust_decimal::Decimal::from_str_exact(lit).unwrap();
+            assert_eq!(costs.records[0].amount, expected);
+            assert_eq!(costs.records[0].amount.to_string(), lit);
+
+            // Test string literal parsing directly into Decimal
+            let json_str_lit = format!(
+                r#"{{"object":"page","has_more":false,"next_page":null,"data":[{{"object":"bucket","start_time":1725000000,"end_time":1725086400,"results":[{{"object":"organization.costs.result","amount":{{"value":"{lit}","currency":"usd"}},"line_item":"gpt","project_id":"p1"}}]}}]}}"#
+            );
+            let parsed_json_lit: serde_json::Value = serde_json::from_str(&json_str_lit).unwrap();
+            let costs_lit = parse_costs(&parsed_json_lit, "test").unwrap();
+            assert_eq!(costs_lit.records[0].amount, expected);
+            assert_eq!(costs_lit.records[0].amount.to_string(), lit);
+        }
+
+        // Exact decimal arithmetic: 0.1 + 0.2 == 0.3
+        let d1 = rust_decimal::Decimal::from_str_exact("0.1").unwrap();
+        let d2 = rust_decimal::Decimal::from_str_exact("0.2").unwrap();
+        let d3 = rust_decimal::Decimal::from_str_exact("0.3").unwrap();
+        assert_eq!(d1 + d2, d3);
     }
 
     #[test]
@@ -626,7 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_two_network_error_fails_without_partial_result() {
+    async fn page_two_network_error_preserves_partial_result() {
         use crate::strategy::FetchStrategy;
         let (hosts, http) = test_hosts(vec![
             ScriptResponse::Page(cost_page(
@@ -639,8 +757,53 @@ mod tests {
         ]);
         let account = test_account();
         let ctx = test_ctx(&account, &hosts);
-        let result = OpenAiCostsStrategy { base_url: None }.fetch(&ctx).await;
-        assert!(matches!(result, Err(crate::strategy::SourceError::Network)));
+        let payload = OpenAiCostsStrategy { base_url: None }
+            .fetch(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(payload.costs.len(), 1);
+        assert_eq!(payload.coverage, Coverage::Partial);
+        assert!(matches!(
+            payload.source_error,
+            Some(crate::strategy::SourceError::Network)
+        ));
+        assert!(payload
+            .warnings
+            .contains(&"pagination_page_fetch_failed".to_string()));
+        assert_eq!(*http.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_page_two_preserves_partial_result() {
+        use crate::strategy::FetchStrategy;
+        let (hosts, http) = test_hosts(vec![
+            ScriptResponse::Page(cost_page(
+                1_725_000_000,
+                &[("a", "1.0", None)],
+                true,
+                Some("p2"),
+            )),
+            ScriptResponse::Page(serde_json::json!({
+                "object": "page",
+                "has_more": false,
+                "data": "malformed"
+            })),
+        ]);
+        let account = test_account();
+        let ctx = test_ctx(&account, &hosts);
+        let payload = OpenAiCostsStrategy { base_url: None }
+            .fetch(&ctx)
+            .await
+            .unwrap();
+        assert_eq!(payload.costs.len(), 1);
+        assert_eq!(payload.coverage, Coverage::Partial);
+        assert!(matches!(
+            payload.source_error,
+            Some(crate::strategy::SourceError::Parse { .. })
+        ));
+        assert!(payload
+            .warnings
+            .contains(&"pagination_page_schema_failed".to_string()));
         assert_eq!(*http.calls.lock().unwrap(), 2);
     }
 
@@ -732,5 +895,201 @@ mod tests {
         assert!(payload
             .warnings
             .contains(&"pagination_bounded_partial".to_string()));
+    }
+
+    #[tokio::test]
+    async fn openai_provider_integration_via_real_http_host() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        // Multi-page mock HTTP server on real TCP loopback
+        let server_handle = tokio::spawn(async move {
+            let mut page_count = 0;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+
+                if req_str.is_empty() {
+                    continue;
+                }
+
+                // Verify Bearer secret is forwarded (case-insensitive header)
+                assert!(req_str.to_lowercase().contains("authorization: bearer sk-test-real-host"));
+
+                let (body, has_more) = if !req_str.contains("page=page2_cursor") {
+                    // Page 1: multi-kilobyte payload (> 2 KiB) with exact decimals
+                    let p1 = r#"{
+                        "object": "page",
+                        "has_more": true,
+                        "next_page": "page2_cursor",
+                        "data": [{
+                            "object": "bucket",
+                            "start_time": 1725000000,
+                            "end_time": 1725086400,
+                            "results": [
+                                {"object": "organization.costs.result", "amount": {"value": 0.1234567890123456789, "currency": "usd"}, "line_item": "gpt-4o-1", "project_id": "p1"},
+                                {"object": "organization.costs.result", "amount": {"value": 123456789.123456789, "currency": "usd"}, "line_item": "gpt-4o-2", "project_id": "p1"}
+                            ]
+                        }]
+                    }"#;
+                    let padding = " ".repeat(2500);
+                    (format!("{p1}{padding}"), true)
+                } else {
+                    // Page 2: multi-kilobyte payload with exact decimals
+                    let p2 = r#"{
+                        "object": "page",
+                        "has_more": false,
+                        "next_page": null,
+                        "data": [{
+                            "object": "bucket",
+                            "start_time": 1725086400,
+                            "end_time": 1725172800,
+                            "results": [
+                                {"object": "organization.costs.result", "amount": {"value": 999999999999.999999, "currency": "usd"}, "line_item": "gpt-4o-3", "project_id": "p2"},
+                                {"object": "organization.costs.result", "amount": {"value": 0.00000001, "currency": "usd"}, "line_item": "gpt-4o-4", "project_id": "p2"}
+                            ]
+                        }]
+                    }"#;
+                    let padding = " ".repeat(2500);
+                    (format!("{p2}{padding}"), false)
+                };
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                page_count += 1;
+                if !has_more || page_count >= 2 {
+                    break;
+                }
+            }
+        });
+
+        let files = Arc::new(usage_host::ScopedFiles);
+        let hosts = usage_host::Hosts {
+            clock: Arc::new(usage_host::SystemClock),
+            logger: Arc::new(usage_host::NullLogger),
+            keychain: Arc::new(usage_host::MemoryKeychain::default()),
+            http: Arc::new(usage_host::ReqwestHttpHost::default()),
+            files: files.clone(),
+            file_scope: files,
+            network: Arc::new(usage_host::ObservedNetwork::default()),
+        };
+        let facade = hosts.facade(&usage_host::facade::FacadePolicy {
+            files: false,
+            http: true,
+            allowed_hosts: &["127.0.0.1"],
+            keychain_service: Some("com.nurasss.usageai"),
+        });
+        let account = test_account();
+        let descriptor = crate::descriptor::find_descriptor("openai", "openai-api").unwrap();
+        let cancel = usage_host::CancellationToken::new();
+        let ctx = crate::strategy::FetchContext {
+            account: &account,
+            facade,
+            local_root: None,
+            secret: Some(b"sk-test-real-host".to_vec()),
+            timeout: std::time::Duration::from_secs(5),
+            cancel: cancel.clone(),
+            descriptor,
+        };
+
+        let strategy = OpenAiCostsStrategy {
+            base_url: Some(base_url.clone()),
+        };
+
+        let payload = strategy
+            .fetch(&ctx)
+            .await
+            .expect("Fetch through real production ReqwestHttpHost must succeed");
+
+        assert!(payload.snapshot.is_some());
+        assert_eq!(payload.costs.len(), 4);
+        assert_eq!(
+            payload.costs[0].amount_decimal,
+            rust_decimal::Decimal::from_str_exact("0.1234567890123456789").unwrap()
+        );
+        assert_eq!(
+            payload.costs[1].amount_decimal,
+            rust_decimal::Decimal::from_str_exact("123456789.123456789").unwrap()
+        );
+        assert_eq!(
+            payload.costs[2].amount_decimal,
+            rust_decimal::Decimal::from_str_exact("999999999999.999999").unwrap()
+        );
+        assert_eq!(
+            payload.costs[3].amount_decimal,
+            rust_decimal::Decimal::from_str_exact("0.00000001").unwrap()
+        );
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test]
+    async fn openai_provider_real_http_host_cancellation_during_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cancel = usage_host::CancellationToken::new();
+        let cancel_trigger = cancel.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                // Send headers and partial valid chunk
+                let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let _ = stream.write_all(b"5\r\n{\"a\":\r\n").await;
+                // Cancel in flight
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                cancel_trigger.cancel();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+
+        let files = Arc::new(usage_host::ScopedFiles);
+        let hosts = usage_host::Hosts {
+            clock: Arc::new(usage_host::SystemClock),
+            logger: Arc::new(usage_host::NullLogger),
+            keychain: Arc::new(usage_host::MemoryKeychain::default()),
+            http: Arc::new(usage_host::ReqwestHttpHost::default()),
+            files: files.clone(),
+            file_scope: files,
+            network: Arc::new(usage_host::ObservedNetwork::default()),
+        };
+        let facade = hosts.facade(&usage_host::facade::FacadePolicy {
+            files: false,
+            http: true,
+            allowed_hosts: &["127.0.0.1"],
+            keychain_service: Some("com.nurasss.usageai"),
+        });
+        let account = test_account();
+        let descriptor = crate::descriptor::find_descriptor("openai", "openai-api").unwrap();
+        let ctx = crate::strategy::FetchContext {
+            account: &account,
+            facade,
+            local_root: None,
+            secret: Some(b"sk-test-real-host".to_vec()),
+            timeout: std::time::Duration::from_secs(5),
+            cancel,
+            descriptor,
+        };
+
+        let strategy = OpenAiCostsStrategy {
+            base_url: Some(base_url),
+        };
+
+        let res = strategy.fetch(&ctx).await;
+        assert!(matches!(res, Err(crate::strategy::SourceError::Cancelled)), "Expected Cancelled, got: {res:?}");
+        let _ = server_handle.await;
     }
 }

@@ -1,0 +1,8 @@
+# EXPECTED: 2 independent synthetic requests, explicitly identified by
+# requestId r1/r2 (delta policy) => input 20, output 10, total 30.
+# Re-import of the same bytes must yield 0 new records via the byte-offset
+# checkpoint, never double totals. A repeated requestId is not an independent
+# request and must reuse the same storage identity; real-client semantics stay
+# UnverifiedSemantics until a redacted Codex corpus is supplied.
+{"timestamp":"2026-09-08T12:00:00Z","requestId":"r1","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}
+{"timestamp":"2026-09-08T12:01:00Z","requestId":"r2","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}}

@@ -107,7 +107,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         account_model: AccountModel::LocalClient,
         allowed_hosts: &[],
         sources: CODEX_SOURCES,
-        local_glob: Some("sessions/**/rollout-*.jsonl"),
+        local_glob: Some("sessions/**/rollout-*.jsonl;archived_sessions/**/rollout-*.jsonl"),
         local_dir_env: Some("CODEX_HOME"),
         local_dir_name: Some(".codex"),
         allow_custom_path: true,
@@ -125,7 +125,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         allowed_hosts: &[],
         sources: CLAUDE_SOURCES,
         local_glob: Some("projects/**/*.jsonl"),
-        local_dir_env: None,
+        local_dir_env: Some("CLAUDE_CONFIG_DIR"),
         local_dir_name: Some(".claude"),
         allow_custom_path: true,
         diagnostics_version: "claude-local-v1",
@@ -153,6 +153,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "OpenAI",
         product_name: "ChatGPT",
         glyph: "✣",
+        color: "#ff7a5c",
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
@@ -169,6 +170,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         provider_name: "Anthropic",
         product_name: "claude.ai",
         glyph: "A",
+        color: "#b87858",
         capabilities: NO_CAPS,
         account_model: AccountModel::DiscoveryOnly,
         allowed_hosts: &[],
@@ -282,6 +284,10 @@ pub struct ProductDescriptorDto {
     pub allowed_hosts: Vec<String>,
     pub allow_custom_path: bool,
     pub needs_secret: bool,
+    pub local_glob: Option<String>,
+    pub local_dir_env: Option<String>,
+    pub local_dir_name: Option<String>,
+    pub diagnostics_version: String,
     pub sources: Vec<SourceDto>,
 }
 
@@ -324,6 +330,10 @@ impl From<&ProductDescriptor> for ProductDescriptorDto {
             allowed_hosts: d.allowed_hosts.iter().map(|h| h.to_string()).collect(),
             allow_custom_path: d.allow_custom_path,
             needs_secret: d.account_model == AccountModel::ApiKey,
+            local_glob: d.local_glob.map(str::to_string),
+            local_dir_env: d.local_dir_env.map(str::to_string),
+            local_dir_name: d.local_dir_name.map(str::to_string),
+            diagnostics_version: d.diagnostics_version.into(),
             sources: d
                 .sources
                 .iter()
@@ -382,6 +392,17 @@ mod tests {
             );
         }
         assert!(dto.needs_secret);
-        assert_eq!(dto.allowed_hosts, vec!["api.openai.com".to_string()]);
+        assert!(dto.allowed_hosts.contains(&"api.openai.com".to_string()));
+
+        let codex = ProductDescriptorDto::from(find_descriptor("openai", "codex").unwrap());
+        assert_eq!(codex.glyph, "✣");
+        assert_eq!(codex.color, "#ff7a5c");
+        assert_eq!(
+            codex.local_glob.as_deref(),
+            Some("sessions/**/rollout-*.jsonl;archived_sessions/**/rollout-*.jsonl")
+        );
+        assert_eq!(codex.local_dir_env.as_deref(), Some("CODEX_HOME"));
+        assert_eq!(codex.diagnostics_version, "codex-local-v1");
+        assert_eq!(codex.sources[0].id, "codex-local-jsonl");
     }
 }
