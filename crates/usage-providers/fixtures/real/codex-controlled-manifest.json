@@ -1,0 +1,10 @@
+{
+  "experiment": "codex-close-flush-1",
+  "prompts_submitted": 3,
+  "responses_completed": 3,
+  "retry_used": false,
+  "resume_used": false,
+  "background_request_known": false,
+  "final_response_completed_at_utc": "2026-09-09T09:56:50Z",
+  "client_closed_at_utc": "2026-09-09T09:57:00Z"
+}
