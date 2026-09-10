@@ -1803,6 +1803,7 @@ pub struct Budget {
     pub account_id: uuid::Uuid,
     pub product_id: String,
     pub currency: String,
+    #[serde(with = "rust_decimal::serde::arbitrary_precision")]
     pub amount_decimal: rust_decimal::Decimal,
     pub period: String,
 }

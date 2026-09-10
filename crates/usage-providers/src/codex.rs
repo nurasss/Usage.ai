@@ -57,6 +57,7 @@ pub struct RateLimits {
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct RateWindow {
+    #[serde(with = "rust_decimal::serde::arbitrary_precision_option", default)]
     used_percent: Option<Decimal>,
     window_minutes: Option<u64>,
     resets_at: Option<i64>,

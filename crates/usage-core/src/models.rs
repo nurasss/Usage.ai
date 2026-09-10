@@ -86,7 +86,9 @@ pub struct Quota {
     pub name: String,
     pub used: Option<u64>,
     pub limit: Option<u64>,
+    #[serde(with = "rust_decimal::serde::arbitrary_precision_option")]
     pub used_percent: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::arbitrary_precision_option")]
     pub remaining_percent: Option<Decimal>,
     pub unit: MetricUnit,
     pub window_start: Option<DateTime<Utc>>,
@@ -269,6 +271,30 @@ pub enum ValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+    #[test]
+    fn decimal_percents_roundtrip_exactly_through_json() {
+        // LKG snapshots serialize quotas to SQLite JSON: 32.5 and
+        // 19.99 must survive the round trip bit-exact, never via f64.
+        let quota = Quota {
+            pool_id: "x".into(),
+            window_id: None,
+            name: "x".into(),
+            used: None,
+            limit: None,
+            used_percent: Some(Decimal::from_str("32.5").unwrap()),
+            remaining_percent: Some(Decimal::from_str("19.99").unwrap()),
+            unit: MetricUnit::Percent,
+            window_start: None,
+            resets_at: None,
+            window_kind: WindowKind::Unknown,
+            source: "fixture".into(),
+        };
+        let json = serde_json::to_string(&quota).unwrap();
+        assert!(json.contains("32.5") && json.contains("19.99"));
+        let back: Quota = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, quota);
+    }
     #[test]
     fn rejects_invalid_percentage() {
         let quota = Quota {
