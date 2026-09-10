@@ -436,7 +436,9 @@ mod tests {
             now2 + chrono::Duration::minutes(5),
         );
         assert!(
-            !reset_notices.iter().any(|n| n.metric.starts_with("quota-reset:")),
+            !reset_notices
+                .iter()
+                .any(|n| n.metric.starts_with("quota-reset:")),
             "unverified semantics must not emit reset notices"
         );
     }
@@ -468,6 +470,9 @@ mod tests {
 
         assert_eq!(n1.len(), 1, "verified provider must emit threshold notice");
         assert_eq!(n1[0].account_id, "a1");
-        assert!(n2.is_empty(), "unverified provider notices must be completely suppressed");
+        assert!(
+            n2.is_empty(),
+            "unverified provider notices must be completely suppressed"
+        );
     }
 }

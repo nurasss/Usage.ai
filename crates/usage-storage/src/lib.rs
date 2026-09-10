@@ -7,7 +7,7 @@ use std::{
 };
 use usage_core::{Account, CostRecord, UsageRecord};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 const USAGE_UPSERT_SQL: &str = "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,cache_read_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=MAX(usage_records.period_start,excluded.period_start),period_end=MAX(usage_records.period_end,excluded.period_end),model=COALESCE(usage_records.model,excluded.model),input_tokens=CASE WHEN excluded.input_tokens IS NULL THEN usage_records.input_tokens WHEN usage_records.input_tokens IS NULL THEN excluded.input_tokens ELSE MAX(usage_records.input_tokens,excluded.input_tokens) END,output_tokens=CASE WHEN excluded.output_tokens IS NULL THEN usage_records.output_tokens WHEN usage_records.output_tokens IS NULL THEN excluded.output_tokens ELSE MAX(usage_records.output_tokens,excluded.output_tokens) END,cached_tokens=CASE WHEN excluded.cached_tokens IS NULL THEN usage_records.cached_tokens WHEN usage_records.cached_tokens IS NULL THEN excluded.cached_tokens ELSE MAX(usage_records.cached_tokens,excluded.cached_tokens) END,cache_creation_tokens=CASE WHEN excluded.cache_creation_tokens IS NULL THEN usage_records.cache_creation_tokens WHEN usage_records.cache_creation_tokens IS NULL THEN excluded.cache_creation_tokens ELSE MAX(usage_records.cache_creation_tokens,excluded.cache_creation_tokens) END,cache_read_tokens=CASE WHEN excluded.cache_read_tokens IS NULL THEN usage_records.cache_read_tokens WHEN usage_records.cache_read_tokens IS NULL THEN excluded.cache_read_tokens ELSE MAX(usage_records.cache_read_tokens,excluded.cache_read_tokens) END,reasoning_tokens=CASE WHEN excluded.reasoning_tokens IS NULL THEN usage_records.reasoning_tokens WHEN usage_records.reasoning_tokens IS NULL THEN excluded.reasoning_tokens ELSE MAX(usage_records.reasoning_tokens,excluded.reasoning_tokens) END,total_tokens=CASE WHEN excluded.total_tokens IS NULL THEN usage_records.total_tokens WHEN usage_records.total_tokens IS NULL THEN excluded.total_tokens ELSE MAX(usage_records.total_tokens,excluded.total_tokens) END,requests=CASE WHEN excluded.requests IS NULL THEN usage_records.requests WHEN usage_records.requests IS NULL THEN excluded.requests ELSE MAX(usage_records.requests,excluded.requests) END,coverage=excluded.coverage,connection_id=COALESCE(excluded.connection_id,usage_records.connection_id),file_id=COALESCE(excluded.file_id,usage_records.file_id),file_generation=MAX(usage_records.file_generation,excluded.file_generation)";
 
@@ -35,6 +35,18 @@ pub struct ImportCheckpoint {
     pub last_source_record_id: Option<String>,
     pub device: i64,
     pub inode: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileCandidate {
+    pub root_hash: String,
+    pub provider_id: String,
+    pub product_id: String,
+    pub root_hint: String,
+    pub status: String,
+    pub seen_at: String,
+    pub connected_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -109,7 +121,9 @@ impl PermissionHardener for SystemPermissionHardener {
                 if parent.exists() {
                     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
                         .context("failed to chmod 0700 db parent directory")?;
-                    let meta = parent.metadata().context("failed to read parent metadata")?;
+                    let meta = parent
+                        .metadata()
+                        .context("failed to read parent metadata")?;
                     if meta.permissions().mode() & 0o077 != 0 {
                         anyhow::bail!(
                             "parent directory has insecure permissions: {:o}",
@@ -122,7 +136,9 @@ impl PermissionHardener for SystemPermissionHardener {
             if db_path.exists() {
                 std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
                     .context("failed to chmod 0600 db file")?;
-                let meta = db_path.metadata().context("failed to read db file metadata")?;
+                let meta = db_path
+                    .metadata()
+                    .context("failed to read db file metadata")?;
                 if meta.permissions().mode() & 0o077 != 0 {
                     anyhow::bail!(
                         "db file has insecure permissions: {:o}",
@@ -242,6 +258,9 @@ impl Storage {
         }
         if current < 7 {
             tx.execute_batch(include_str!("../migrations/007_claude_cache_buckets.sql"))?;
+        }
+        if current < 8 {
+            tx.execute_batch(include_str!("../migrations/008_profile_candidates.sql"))?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -453,6 +472,34 @@ impl Storage {
             .optional()?)
     }
 
+    /// Binding lookup for discovery: which account (if any) already owns
+    /// this physical root. Used to reject silent rebinding and to mark
+    /// candidates as connected.
+    pub fn connection_for_root(
+        &self,
+        provider_id: &str,
+        product_id: &str,
+        root_hash: &str,
+    ) -> Result<Option<SourceConnection>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,account_id,provider_id,product_id,root_hash,root_hint,kind,identity_fingerprint,identity_confidence FROM source_connections WHERE provider_id=? AND product_id=? AND root_hash=? LIMIT 1",
+        )?;
+        let mut rows = statement.query_map(params![provider_id, product_id, root_hash], |r| {
+            Ok(SourceConnection {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                provider_id: r.get(2)?,
+                product_id: r.get(3)?,
+                root_hash: r.get(4)?,
+                root_hint: r.get(5)?,
+                kind: r.get(6)?,
+                identity_fingerprint: r.get(7)?,
+                identity_confidence: r.get(8)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
     pub fn list_connections(&self) -> Result<Vec<SourceConnection>> {
         let mut statement = self.conn.prepare(
             "SELECT id,account_id,provider_id,product_id,root_hash,root_hint,kind,identity_fingerprint,identity_confidence FROM source_connections",
@@ -486,6 +533,91 @@ impl Storage {
             params![fingerprint, confidence, connection_id],
         )?;
         Ok(())
+    }
+
+    /// Discovered-but-untrusted profile roots. A candidate never
+    /// becomes an account/connection without an explicit user
+    /// connect; `ignored` roots stay silent across rescans.
+    pub fn upsert_candidate(
+        &mut self,
+        root_hash: &str,
+        provider_id: &str,
+        product_id: &str,
+        root_hint: &str,
+    ) -> Result<ProfileCandidate> {
+        self.conn.execute(
+            "INSERT INTO profile_candidates(root_hash,provider_id,product_id,root_hint,status,seen_at) VALUES(?,?,?,?,?,?) ON CONFLICT(root_hash) DO UPDATE SET root_hint=excluded.root_hint,seen_at=excluded.seen_at",
+            params![
+                root_hash,
+                provider_id,
+                product_id,
+                root_hint,
+                "pending",
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        // Never overwrite an explicit user decision on rescan.
+        self.conn.execute(
+            "UPDATE profile_candidates SET status=CASE WHEN status IN ('connected','ignored') THEN status ELSE 'pending' END WHERE root_hash=?",
+            [root_hash],
+        )?;
+        self.get_candidate(root_hash)?
+            .ok_or_else(|| anyhow::anyhow!("candidate missing after upsert"))
+    }
+
+    pub fn get_candidate(&self, root_hash: &str) -> Result<Option<ProfileCandidate>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT root_hash,provider_id,product_id,root_hint,status,seen_at,connected_at FROM profile_candidates WHERE root_hash=?",
+                [root_hash],
+                |r| {
+                    Ok(ProfileCandidate {
+                        root_hash: r.get(0)?,
+                        provider_id: r.get(1)?,
+                        product_id: r.get(2)?,
+                        root_hint: r.get(3)?,
+                        status: r.get(4)?,
+                        seen_at: r.get(5)?,
+                        connected_at: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn list_candidates(&self, only_pending: bool) -> Result<Vec<ProfileCandidate>> {
+        let sql = if only_pending {
+            "SELECT root_hash,provider_id,product_id,root_hint,status,seen_at,connected_at FROM profile_candidates WHERE status='pending' ORDER BY seen_at"
+        } else {
+            "SELECT root_hash,provider_id,product_id,root_hint,status,seen_at,connected_at FROM profile_candidates ORDER BY seen_at"
+        };
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement
+            .query_map([], |r| {
+                Ok(ProfileCandidate {
+                    root_hash: r.get(0)?,
+                    provider_id: r.get(1)?,
+                    product_id: r.get(2)?,
+                    root_hint: r.get(3)?,
+                    status: r.get(4)?,
+                    seen_at: r.get(5)?,
+                    connected_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_candidate_status(&mut self, root_hash: &str, status: &str) -> Result<bool> {
+        if !matches!(status, "pending" | "connected" | "ignored") {
+            anyhow::bail!("invalid candidate status");
+        }
+        let changed = self.conn.execute(
+            "UPDATE profile_candidates SET status=?,connected_at=CASE WHEN ?= 'connected' THEN ? ELSE connected_at END WHERE root_hash=?",
+            params![status, status, Utc::now().to_rfc3339(), root_hash],
+        )?;
+        Ok(changed > 0)
     }
 
     /// Stable internal file identity per connection. The file UUID is
@@ -1122,7 +1254,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "SELECT COUNT(DISTINCT product_id) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage = 'UnverifiedSemantics'",
         )?;
-        let count: u64 = statement.query_row(params![start.to_rfc3339(), end.to_rfc3339()], |r| r.get(0))?;
+        let count: u64 =
+            statement.query_row(params![start.to_rfc3339(), end.to_rfc3339()], |r| r.get(0))?;
         Ok(count)
     }
 
@@ -1681,7 +1814,8 @@ fn migrate_legacy_rows(tx: &rusqlite::Transaction<'_>) -> Result<()> {
                 let m_conn_hash = format!("account-connection/{m_acc}/{product_id}");
                 let m_conn_id = uuid::Uuid::new_v5(
                     &uuid::Uuid::NAMESPACE_URL,
-                    format!("usage.ai/connection/{provider_id}/{product_id}/{m_conn_hash}").as_bytes(),
+                    format!("usage.ai/connection/{provider_id}/{product_id}/{m_conn_hash}")
+                        .as_bytes(),
                 );
                 let account_identity: Option<(Option<String>, String)> = tx
                     .query_row(
@@ -1692,7 +1826,9 @@ fn migrate_legacy_rows(tx: &rusqlite::Transaction<'_>) -> Result<()> {
                     .optional()?;
 
                 let (fp, confidence) = match account_identity {
-                    Some((Some(ref fp_val), ref conf)) if !fp_val.trim().is_empty() && conf == "Verified" => {
+                    Some((Some(ref fp_val), ref conf))
+                        if !fp_val.trim().is_empty() && conf == "Verified" =>
+                    {
                         (Some(fp_val.clone()), "Verified")
                     }
                     Some((Some(ref fp_val), _)) if !fp_val.trim().is_empty() => {
@@ -1758,21 +1894,22 @@ fn migrate_legacy_rows(tx: &rusqlite::Transaction<'_>) -> Result<()> {
             .collect::<rusqlite::Result<Vec<(i64, String)>>>()?;
 
         for (snap_id, payload_json) in snap_rows {
-            let updated_payload = if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&payload_json) {
-                if let Some(map) = val.as_object_mut() {
-                    map.insert(
-                        "account_id".to_string(),
-                        serde_json::Value::String(account_id.to_string()),
-                    );
-                    map.insert(
-                        "accountId".to_string(),
-                        serde_json::Value::String(account_id.to_string()),
-                    );
-                }
-                val.to_string()
-            } else {
-                payload_json
-            };
+            let updated_payload =
+                if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&payload_json) {
+                    if let Some(map) = val.as_object_mut() {
+                        map.insert(
+                            "account_id".to_string(),
+                            serde_json::Value::String(account_id.to_string()),
+                        );
+                        map.insert(
+                            "accountId".to_string(),
+                            serde_json::Value::String(account_id.to_string()),
+                        );
+                    }
+                    val.to_string()
+                } else {
+                    payload_json
+                };
             tx.execute(
                 "UPDATE snapshots SET account_id=?, payload_json=? WHERE id=?",
                 params![account_id.to_string(), updated_payload, snap_id],
@@ -2214,8 +2351,10 @@ mod tests {
         let path = dir.path().join("usage.db");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+                .unwrap();
             conn.pragma_update(None, "user_version", 2u32).unwrap();
             conn.execute(
                 "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES('00000000-0000-0000-0000-000000000000','openai','Local','Active','2026-01-01T00:00:00Z')",
@@ -2239,7 +2378,10 @@ mod tests {
             let acc_id = r.account_id.parse::<Uuid>().unwrap();
             let acc = storage.get_account(acc_id).unwrap().unwrap();
             assert_eq!(acc.label, "Legacy / Identity unknown");
-            assert_eq!(acc.identity_confidence, usage_core::IdentityConfidence::Unknown);
+            assert_eq!(
+                acc.identity_confidence,
+                usage_core::IdentityConfidence::Unknown
+            );
         }
     }
     #[test]
@@ -2249,11 +2391,16 @@ mod tests {
         let api_acc_id = "11111111-1111-1111-1111-111111111111";
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql"))
+                .unwrap();
             conn.pragma_update(None, "user_version", 5u32).unwrap();
             conn.execute(
                 "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','openai-api','key-fingerprint-abc','Work API','keychain:openai:work','Active',1,'Verified','2026-01-01T00:00:00Z')",
@@ -2263,7 +2410,9 @@ mod tests {
                 "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,'openai-api','org-1','c1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','19.99','USD','reported','official-api','Complete')",
                 [api_acc_id],
             ).unwrap();
-            let payload = format!(r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#);
+            let payload = format!(
+                r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#
+            );
             conn.execute(
                 "INSERT INTO snapshots(account_id,product_id,payload_json,fetched_at) VALUES(?,'openai-api',?,'2026-09-01T00:00:00Z')",
                 params![api_acc_id, payload],
@@ -2274,12 +2423,17 @@ mod tests {
         let acc = storage.get_account(api_uuid).unwrap().unwrap();
         assert_eq!(acc.label, "Work API");
         assert_eq!(acc.connection_ref.as_deref(), Some("keychain:openai:work"));
-        assert_eq!(acc.identity_confidence, usage_core::IdentityConfidence::Verified);
+        assert_eq!(
+            acc.identity_confidence,
+            usage_core::IdentityConfidence::Verified
+        );
 
-        let costs = storage.cost_records_between(
-            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
-        ).unwrap();
+        let costs = storage
+            .cost_records_between(
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(costs.len(), 1);
         assert_eq!(costs[0].account_id, api_uuid);
         assert_eq!(costs[0].amount_decimal, Decimal::from_str("19.99").unwrap());
@@ -2295,11 +2449,16 @@ mod tests {
         let api_acc_id = "22222222-2222-2222-2222-222222222222";
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql"))
+                .unwrap();
             conn.pragma_update(None, "user_version", 5u32).unwrap();
 
             conn.execute(
@@ -2323,7 +2482,9 @@ mod tests {
                 "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,'openai-api','org-1','c1','2026-09-01T00:00:00Z','2026-09-01T00:00:00Z','49.95','USD','reported','official-api','Complete')",
                 [api_acc_id],
             ).unwrap();
-            let payload = format!(r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#);
+            let payload = format!(
+                r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#
+            );
             conn.execute(
                 "INSERT INTO snapshots(account_id,product_id,payload_json,fetched_at) VALUES(?,'openai-api',?,'2026-09-01T00:00:00Z')",
                 params![api_acc_id, payload],
@@ -2334,19 +2495,27 @@ mod tests {
         assert_eq!(storage.usage_count().unwrap(), 2);
         let records = storage.record_attribution().unwrap();
         for r in records {
-            let acc = storage.get_account(r.account_id.parse().unwrap()).unwrap().unwrap();
+            let acc = storage
+                .get_account(r.account_id.parse().unwrap())
+                .unwrap()
+                .unwrap();
             assert_eq!(acc.label, "Legacy / Identity unknown");
         }
         let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
-        let costs = storage.cost_records_between(
-            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
-        ).unwrap();
+        let costs = storage
+            .cost_records_between(
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(costs.len(), 1);
         assert_eq!(costs[0].account_id, api_uuid);
         assert_eq!(costs[0].amount_decimal, Decimal::from_str("49.95").unwrap());
 
-        let lkg = storage.last_known_good(api_uuid, "openai-api").unwrap().unwrap();
+        let lkg = storage
+            .last_known_good(api_uuid, "openai-api")
+            .unwrap()
+            .unwrap();
         assert_eq!(lkg.account_id, api_acc_id);
     }
     #[test]
@@ -2356,11 +2525,16 @@ mod tests {
         let api_acc_id = "33333333-3333-3333-3333-333333333333";
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql"))
+                .unwrap();
             conn.pragma_update(None, "user_version", 5u32).unwrap();
             conn.execute(
                 "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,identity_confidence,created_at) VALUES(?,'openai','openai-api','key-fp','Work API','keychain:openai:work','Active',1,'Verified','2026-01-01T00:00:00Z')",
@@ -2383,10 +2557,12 @@ mod tests {
         assert_eq!(counts1.checkpoints, counts2.checkpoints);
 
         let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
-        let costs = storage2.cost_records_between(
-            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
-        ).unwrap();
+        let costs = storage2
+            .cost_records_between(
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(costs.len(), 1);
         assert_eq!(costs[0].account_id, api_uuid);
     }
@@ -2397,11 +2573,16 @@ mod tests {
         let api_acc_id = "44444444-4444-4444-4444-444444444444";
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
-            conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+            conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../migrations/005_provenance.sql"))
+                .unwrap();
             conn.pragma_update(None, "user_version", 5u32).unwrap();
 
             conn.execute(
@@ -2422,7 +2603,9 @@ mod tests {
             ).unwrap();
 
             // Insert snapshot
-            let payload = format!(r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#);
+            let payload = format!(
+                r#"{{"account_id":"{api_acc_id}","provider_id":"openai","product_id":"openai-api","connection_state":"Connected","freshness":{{"kind":"Fresh"}},"coverage":"Complete","fetched_at":"2026-09-01T00:00:00Z","capabilities":[],"quotas":[],"balances":[]}}"#
+            );
             conn.execute(
                 "INSERT INTO snapshots(account_id,product_id,payload_json,fetched_at) VALUES(?,'openai-api',?,'2026-09-01T00:00:00Z')",
                 params![api_acc_id, payload],
@@ -2434,28 +2617,57 @@ mod tests {
         let api_uuid = api_acc_id.parse::<Uuid>().unwrap();
 
         // Check account itself
-        let acc = storage.get_account(api_uuid).unwrap().expect("account must exist");
+        let acc = storage
+            .get_account(api_uuid)
+            .unwrap()
+            .expect("account must exist");
         assert_eq!(acc.label, "Managed Production API");
-        assert_eq!(acc.identity_confidence, usage_core::IdentityConfidence::Verified);
+        assert_eq!(
+            acc.identity_confidence,
+            usage_core::IdentityConfidence::Verified
+        );
 
         // Check usage records: account_id MUST NOT have changed to legacy account
         let usage_records = storage.record_attribution().unwrap();
-        let matched_usage = usage_records.iter().find(|u| u.source_record_id == "openai-usage-1").expect("usage record must exist");
-        assert_eq!(matched_usage.account_id, api_acc_id, "Usage record account_id must NOT change during migration");
-        assert!(matched_usage.connection_id.is_some(), "Connection ID must have been attached");
+        let matched_usage = usage_records
+            .iter()
+            .find(|u| u.source_record_id == "openai-usage-1")
+            .expect("usage record must exist");
+        assert_eq!(
+            matched_usage.account_id, api_acc_id,
+            "Usage record account_id must NOT change during migration"
+        );
+        assert!(
+            matched_usage.connection_id.is_some(),
+            "Connection ID must have been attached"
+        );
 
         // Check cost records: account_id MUST NOT have changed
-        let costs = storage.cost_records_between(
-            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
-        ).unwrap();
+        let costs = storage
+            .cost_records_between(
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(costs.len(), 1);
-        assert_eq!(costs[0].account_id, api_uuid, "Cost record account_id must NOT change during migration");
-        assert_eq!(costs[0].amount_decimal, Decimal::from_str("123.45").unwrap());
+        assert_eq!(
+            costs[0].account_id, api_uuid,
+            "Cost record account_id must NOT change during migration"
+        );
+        assert_eq!(
+            costs[0].amount_decimal,
+            Decimal::from_str("123.45").unwrap()
+        );
 
         // Check snapshot: account_id and LKG MUST remain with the managed account
-        let lkg = storage.last_known_good(api_uuid, "openai-api").unwrap().expect("LKG must be preserved");
-        assert_eq!(lkg.account_id, api_acc_id, "Snapshot account_id must NOT change during migration");
+        let lkg = storage
+            .last_known_good(api_uuid, "openai-api")
+            .unwrap()
+            .expect("LKG must be preserved");
+        assert_eq!(
+            lkg.account_id, api_acc_id,
+            "Snapshot account_id must NOT change during migration"
+        );
     }
     #[test]
     fn sqlite_exact_decimal_roundtrip() {
@@ -2488,14 +2700,19 @@ mod tests {
             storage.upsert_cost(&record).unwrap();
         }
 
-        let fetched = storage.cost_records_between(
-            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
-        ).unwrap();
+        let fetched = storage
+            .cost_records_between(
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 12, 31, 0, 0, 0).unwrap(),
+            )
+            .unwrap();
         assert_eq!(fetched.len(), test_values.len());
 
         for (i, val_str) in test_values.iter().enumerate() {
-            let found = fetched.iter().find(|r| r.source_record_id == format!("rec-{i}")).unwrap();
+            let found = fetched
+                .iter()
+                .find(|r| r.source_record_id == format!("rec-{i}"))
+                .unwrap();
             let expected = Decimal::from_str(val_str).unwrap();
             assert_eq!(found.amount_decimal, expected);
             assert_eq!(found.amount_decimal.to_string(), *val_str);
@@ -2866,7 +3083,11 @@ mod tests {
             sidecar.push(suffix);
             let sidecar_path = std::path::PathBuf::from(sidecar);
             if sidecar_path.exists() {
-                let sidecar_mode = std::fs::metadata(&sidecar_path).unwrap().permissions().mode() & 0o777;
+                let sidecar_mode = std::fs::metadata(&sidecar_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
                 assert_eq!(sidecar_mode, 0o600, "sidecar {suffix} must be 0600");
             }
         }
@@ -2888,16 +3109,28 @@ mod tests {
         std::fs::write(&shm_path, b"dummy shm content").unwrap();
         std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o666)).unwrap();
         std::fs::set_permissions(&shm_path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert_ne!(std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_ne!(std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(
+            std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         // Harden permissions must fix both to 0o600
         let hardener = SystemPermissionHardener;
         hardener.harden_permissions(&path).unwrap();
         let wal_mode = std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777;
         let shm_mode = std::fs::metadata(&shm_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(wal_mode, 0o600, "insecure wal sidecar must be hardened to 0600");
-        assert_eq!(shm_mode, 0o600, "insecure shm sidecar must be hardened to 0600");
+        assert_eq!(
+            wal_mode, 0o600,
+            "insecure wal sidecar must be hardened to 0600"
+        );
+        assert_eq!(
+            shm_mode, 0o600,
+            "insecure shm sidecar must be hardened to 0600"
+        );
     }
 
     struct FailingHardener;
@@ -2912,7 +3145,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.db");
         let res = Storage::open_with_hardener(&path, std::sync::Arc::new(FailingHardener));
-        assert!(res.is_err(), "Storage::open must fail closed on chmod error");
+        assert!(
+            res.is_err(),
+            "Storage::open must fail closed on chmod error"
+        );
         let err_msg = res.err().unwrap().to_string();
         assert!(err_msg.contains("forced permission chmod failure"));
     }
@@ -2929,7 +3165,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.db");
         let res = Storage::open_with_hardener(&path, std::sync::Arc::new(InsecureModeHardener));
-        assert!(res.is_err(), "Storage::open must fail closed when mode is insecure");
+        assert!(
+            res.is_err(),
+            "Storage::open must fail closed when mode is insecure"
+        );
     }
 
     #[test]
@@ -2937,11 +3176,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v5.db");
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(include_str!("../migrations/001_initial.sql")).unwrap();
-        conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql")).unwrap();
-        conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql")).unwrap();
-        conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql")).unwrap();
-        conn.execute_batch(include_str!("../migrations/005_provenance.sql")).unwrap();
+        conn.execute_batch(include_str!("../migrations/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/002_accounts_budgets.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/003_attempts_cooldowns.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/004_identity_confidence.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/005_provenance.sql"))
+            .unwrap();
         conn.pragma_update(None, "user_version", 5).unwrap();
 
         let local_acc_id = Uuid::new_v4();
@@ -2959,7 +3203,61 @@ mod tests {
 
         let storage = Storage::open(&path).unwrap();
         let conns = storage.list_connections().unwrap();
-        let backfilled = conns.iter().find(|c| c.account_id == local_acc_id.to_string()).unwrap();
-        assert_eq!(backfilled.identity_confidence, "Unknown", "Backfilled local connection without fingerprint must remain Unknown");
+        let backfilled = conns
+            .iter()
+            .find(|c| c.account_id == local_acc_id.to_string())
+            .unwrap();
+        assert_eq!(
+            backfilled.identity_confidence, "Unknown",
+            "Backfilled local connection without fingerprint must remain Unknown"
+        );
     }
+}
+#[test]
+fn candidate_decisions_survive_rescan_and_migration() {
+    let mut s = Storage::in_memory().unwrap();
+    let first = s
+        .upsert_candidate("aabbcc", "openai", "codex", ".codex-work")
+        .unwrap();
+    assert_eq!(first.status, "pending");
+    assert!(s.set_candidate_status("aabbcc", "ignored").unwrap());
+    // Rescan refreshes metadata but never overwrites the decision.
+    let again = s
+        .upsert_candidate("aabbcc", "openai", "codex", ".codex-work-renamed")
+        .unwrap();
+    assert_eq!(again.status, "ignored");
+    assert!(s.list_candidates(true).unwrap().is_empty());
+    assert_eq!(s.list_candidates(false).unwrap().len(), 1);
+    assert!(s.get_candidate("missing").unwrap().is_none());
+}
+
+#[test]
+fn migrates_v7_database_with_candidates_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usage.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for migration in [
+            "migrations/001_initial.sql",
+            "migrations/002_accounts_budgets.sql",
+            "migrations/003_attempts_cooldowns.sql",
+            "migrations/004_identity_confidence.sql",
+            "migrations/005_provenance.sql",
+            "migrations/006_legacy_identity.sql",
+            "migrations/007_claude_cache_buckets.sql",
+        ] {
+            let sql = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(migration),
+            )
+            .unwrap();
+            conn.execute_batch(&sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7u32).unwrap();
+    }
+    let mut storage = Storage::open(&path).unwrap();
+    // v8 table works immediately after the upgrade path.
+    storage
+        .upsert_candidate("ff00", "anthropic", "claude-code", ".claude-work")
+        .unwrap();
+    assert_eq!(storage.list_candidates(true).unwrap().len(), 1);
 }

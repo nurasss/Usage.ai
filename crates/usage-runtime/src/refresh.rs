@@ -297,7 +297,9 @@ impl Coordinator {
                 .lock()
                 .ok()
                 .and_then(|s| s.get_account(account_id).ok().flatten())
-                .map(|acc| !acc.enabled || matches!(acc.lifecycle, usage_core::AccountLifecycle::Archived))
+                .map(|acc| {
+                    !acc.enabled || matches!(acc.lifecycle, usage_core::AccountLifecycle::Archived)
+                })
                 .unwrap_or(true)
         };
         if is_disabled {
@@ -860,7 +862,10 @@ fn build_strategy(kind: StrategyKind, custom_root: Option<PathBuf>) -> Box<dyn F
             custom_root,
         )),
         StrategyKind::OpenAiCosts => Box::new(usage_providers::openai_api::OpenAiCostsStrategy {
-            base_url: custom_root.as_ref().and_then(|p| p.to_str()).map(str::to_string),
+            base_url: custom_root
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .map(str::to_string),
         }),
     }
 }
@@ -1234,8 +1239,21 @@ mod tests {
             .iter()
             .all(|o| matches!(o.error, Some(SourceError::Cancelled))));
         // Active disable must guarantee no commit
-        assert!(storage.lock().unwrap().last_known_good(account_id, "openai-api").unwrap().is_none());
-        assert_eq!(storage.lock().unwrap().storage_status().unwrap().cost_records, 0);
+        assert!(storage
+            .lock()
+            .unwrap()
+            .last_known_good(account_id, "openai-api")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .storage_status()
+                .unwrap()
+                .cost_records,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1283,9 +1301,30 @@ mod tests {
             .iter()
             .all(|o| matches!(o.error, Some(SourceError::Cancelled))));
         // Transaction inside storage aborted atomically: zero snapshots and zero cost records committed
-        assert!(storage.lock().unwrap().last_known_good(account_id, "openai-api").unwrap().is_none());
-        assert_eq!(storage.lock().unwrap().storage_status().unwrap().cost_records, 0);
-        assert_eq!(storage.lock().unwrap().storage_status().unwrap().usage_records, 0);
+        assert!(storage
+            .lock()
+            .unwrap()
+            .last_known_good(account_id, "openai-api")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .storage_status()
+                .unwrap()
+                .cost_records,
+            0
+        );
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .storage_status()
+                .unwrap()
+                .usage_records,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1333,8 +1372,24 @@ mod tests {
             .iter()
             .all(|o| matches!(o.error, Some(SourceError::Unavailable))));
         // Zero snapshots or costs committed
-        assert_eq!(storage.lock().unwrap().storage_status().unwrap().cost_records, 0);
-        assert_eq!(storage.lock().unwrap().storage_status().unwrap().usage_records, 0);
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .storage_status()
+                .unwrap()
+                .cost_records,
+            0
+        );
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .storage_status()
+                .unwrap()
+                .usage_records,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1355,7 +1410,11 @@ mod tests {
         };
 
         // Delete account from storage and cancel it
-        storage.lock().unwrap().delete_account_and_history(acc.id).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .delete_account_and_history(acc.id)
+            .unwrap();
         coordinator.cancel_account(acc.id);
 
         let outcome = coordinator
@@ -1370,7 +1429,11 @@ mod tests {
 
         assert!(outcome.stale);
         assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
-        assert_eq!(*http.calls.lock().unwrap(), 0, "Deleted account must never make HTTP calls");
+        assert_eq!(
+            *http.calls.lock().unwrap(),
+            0,
+            "Deleted account must never make HTTP calls"
+        );
     }
 
     #[tokio::test]
@@ -1668,7 +1731,11 @@ mod tests {
 
         assert!(outcome.stale);
         assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
-        assert_eq!(*http.calls.lock().unwrap(), 0, "No network call must be made for cancelled account");
+        assert_eq!(
+            *http.calls.lock().unwrap(),
+            0,
+            "No network call must be made for cancelled account"
+        );
     }
 
     #[tokio::test]
@@ -1721,7 +1788,11 @@ mod tests {
         let outcome = refresh_handle.await.unwrap();
         assert!(outcome.stale);
         assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
-        assert_eq!(*http.calls.lock().unwrap(), 0, "Cancelled queued job must not execute upon acquiring permit");
+        assert_eq!(
+            *http.calls.lock().unwrap(),
+            0,
+            "Cancelled queued job must not execute upon acquiring permit"
+        );
     }
 
     #[tokio::test]
@@ -1735,7 +1806,11 @@ mod tests {
         let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
         let acc = account("openai", "API");
         storage.lock().unwrap().upsert_account(&acc).unwrap();
-        storage.lock().unwrap().update_managed_account(acc.id, None, Some(false), None).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .update_managed_account(acc.id, None, Some(false), None)
+            .unwrap();
         let scope = ScopeKey {
             account_id: acc.id,
             provider_id: "openai".into(),

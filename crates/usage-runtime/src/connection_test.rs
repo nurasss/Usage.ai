@@ -1,7 +1,7 @@
-use std::path::{PathBuf};
-use std::sync::Mutex;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use usage_core::{Account, ConnectionState, Coverage, Freshness};
 use usage_host::policy::SOURCE_TIMEOUT;
 use usage_host::{CancellationToken, HostError, Hosts};
@@ -66,28 +66,26 @@ pub async fn test_connection(
         AccountModel::LocalClient => {
             test_local_connection(hosts, &managed, descriptor, &product, &capabilities, now).await
         }
-        AccountModel::DiscoveryOnly => {
-            Ok(ConnectionTestDiagnostics {
-                provider: managed.provider_id,
-                product,
-                account_alias: managed.label,
-                selected_source: descriptor.sources.first().map(|s| s.id.to_string()),
-                connection_state: ConnectionState::UnsupportedSource,
-                last_refresh_attempt: Some(now.to_rfc3339()),
-                last_successful_refresh: None,
-                last_data_observed_at: None,
-                freshness: Freshness::Unknown,
-                coverage: Coverage::UnverifiedSemantics,
-                status_class: Some("error".into()),
-                connector_version: descriptor.diagnostics_version.into(),
-                parser_version: descriptor.diagnostics_version.into(),
-                schema_fingerprint: None,
-                capabilities_detected: capabilities,
-                cooldown_until: None,
-                last_safe_error_code: Some("unsupported_source".into()),
-                warnings: vec!["discovery_only_source".into()],
-            })
-        }
+        AccountModel::DiscoveryOnly => Ok(ConnectionTestDiagnostics {
+            provider: managed.provider_id,
+            product,
+            account_alias: managed.label,
+            selected_source: descriptor.sources.first().map(|s| s.id.to_string()),
+            connection_state: ConnectionState::UnsupportedSource,
+            last_refresh_attempt: Some(now.to_rfc3339()),
+            last_successful_refresh: None,
+            last_data_observed_at: None,
+            freshness: Freshness::Unknown,
+            coverage: Coverage::UnverifiedSemantics,
+            status_class: Some("error".into()),
+            connector_version: descriptor.diagnostics_version.into(),
+            parser_version: descriptor.diagnostics_version.into(),
+            schema_fingerprint: None,
+            capabilities_detected: capabilities,
+            cooldown_until: None,
+            last_safe_error_code: Some("unsupported_source".into()),
+            warnings: vec!["discovery_only_source".into()],
+        }),
     }
 }
 
@@ -182,7 +180,9 @@ async fn test_local_connection(
     let root_path = if let Some(custom) = custom_path {
         Some(custom)
     } else {
-        product_root_candidates(hosts, descriptor, None).into_iter().next()
+        product_root_candidates(hosts, descriptor, None)
+            .into_iter()
+            .next()
     };
 
     let Some(root) = root_path else {
@@ -368,10 +368,7 @@ async fn test_local_connection(
             capabilities_detected: capabilities.to_vec(),
             cooldown_until: None,
             last_safe_error_code: Some("files_empty".into()),
-            warnings: vec![
-                "files_empty".into(),
-                "unverified_local_semantics".into(),
-            ],
+            warnings: vec!["files_empty".into(), "unverified_local_semantics".into()],
         });
     };
 
@@ -475,7 +472,10 @@ fn build_strategy(kind: StrategyKind, custom_root: Option<PathBuf>) -> Box<dyn F
             custom_root,
         )),
         StrategyKind::OpenAiCosts => Box::new(usage_providers::openai_api::OpenAiCostsStrategy {
-            base_url: custom_root.as_ref().and_then(|p| p.to_str()).map(str::to_string),
+            base_url: custom_root
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .map(str::to_string),
         }),
     }
 }
@@ -487,7 +487,9 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use usage_core::{AccountLifecycle, IdentityConfidence};
-    use usage_host::{MemoryKeychain, NullLogger, ObservedNetwork, ReqwestHttpHost, ScopedFiles, SystemClock};
+    use usage_host::{
+        MemoryKeychain, NullLogger, ObservedNetwork, ReqwestHttpHost, ScopedFiles, SystemClock,
+    };
     use usage_storage::{ManagedAccount, Storage};
 
     fn test_hosts() -> Hosts {
@@ -523,7 +525,11 @@ mod tests {
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
         };
-        storage.lock().unwrap().create_managed_account(&managed).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed)
+            .unwrap();
 
         let diag = test_connection(&hosts, &storage, account_id).await.unwrap();
         assert_eq!(diag.connection_state, ConnectionState::Unavailable);
@@ -533,7 +539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_test_connection_existing_root_with_valid_files_returns_unverified_semantics_warning() {
+    async fn local_test_connection_existing_root_with_valid_files_returns_unverified_semantics_warning(
+    ) {
         let temp = tempdir().unwrap();
         let db_path = temp.path().join("usage.db");
         let storage = Mutex::new(Storage::open(&db_path).unwrap());
@@ -562,14 +569,20 @@ mod tests {
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
         };
-        storage.lock().unwrap().create_managed_account(&managed).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed)
+            .unwrap();
 
         let diag = test_connection(&hosts, &storage, account_id).await.unwrap();
         assert_eq!(diag.connection_state, ConnectionState::Connected);
         assert_eq!(diag.coverage, Coverage::UnverifiedSemantics);
         // Honest warning, NOT ok!
         assert_eq!(diag.status_class.as_deref(), Some("warning"));
-        assert!(diag.warnings.contains(&"unverified_local_semantics".to_string()));
+        assert!(diag
+            .warnings
+            .contains(&"unverified_local_semantics".to_string()));
     }
 
     #[tokio::test]
@@ -595,12 +608,18 @@ mod tests {
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
         };
-        storage.lock().unwrap().create_managed_account(&managed).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed)
+            .unwrap();
 
         let diag = test_connection(&hosts, &storage, account_id).await.unwrap();
         assert_eq!(diag.connection_state, ConnectionState::Unavailable);
         assert_eq!(diag.status_class.as_deref(), Some("error"));
-        assert!(diag.warnings.contains(&"no_candidate_files_found".to_string()));
+        assert!(diag
+            .warnings
+            .contains(&"no_candidate_files_found".to_string()));
     }
 
     #[tokio::test]
@@ -629,12 +648,19 @@ mod tests {
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
         };
-        storage.lock().unwrap().create_managed_account(&managed).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed)
+            .unwrap();
 
         let diag = test_connection(&hosts, &storage, account_id).await.unwrap();
         assert_eq!(diag.connection_state, ConnectionState::UnsupportedSource);
         assert_eq!(diag.status_class.as_deref(), Some("error"));
-        assert_eq!(diag.last_safe_error_code.as_deref(), Some("no_recognized_events"));
+        assert_eq!(
+            diag.last_safe_error_code.as_deref(),
+            Some("no_recognized_events")
+        );
     }
 
     #[tokio::test]
@@ -657,7 +683,11 @@ mod tests {
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
         };
-        storage.lock().unwrap().create_managed_account(&managed).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed)
+            .unwrap();
 
         let diag = test_connection(&hosts, &storage, account_id).await.unwrap();
         assert_eq!(diag.connection_state, ConnectionState::Unavailable);
@@ -691,12 +721,19 @@ mod tests {
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
         };
-        storage.lock().unwrap().create_managed_account(&managed).unwrap();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&managed)
+            .unwrap();
 
         let diag = test_connection(&hosts, &storage, account_id).await.unwrap();
         assert_eq!(diag.connection_state, ConnectionState::ParseError);
         assert_eq!(diag.coverage, Coverage::UnverifiedSemantics);
         assert_eq!(diag.status_class.as_deref(), Some("error"));
-        assert_eq!(diag.last_safe_error_code.as_deref(), Some("schema_mismatch"));
+        assert_eq!(
+            diag.last_safe_error_code.as_deref(),
+            Some("schema_mismatch")
+        );
     }
 }

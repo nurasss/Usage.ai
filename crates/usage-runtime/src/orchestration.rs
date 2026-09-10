@@ -315,3 +315,151 @@ mod tests {
         assert_eq!(account.id, stable_local_account("codex"));
     }
 }
+
+#[cfg(test)]
+mod profile_isolation_tests {
+    use super::*;
+    use usage_host::{
+        FileScopeHost, MemoryKeychain, NullLogger, ObservedNetwork, ReqwestHttpHost, ScopedFiles,
+        SystemClock,
+    };
+    use usage_storage::ManagedAccount;
+
+    struct SandboxScope {
+        home: PathBuf,
+    }
+
+    impl usage_host::FilesHost for SandboxScope {}
+    impl FileScopeHost for SandboxScope {
+        fn home_dir(&self) -> Option<PathBuf> {
+            Some(self.home.clone())
+        }
+        fn env_var(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn sandbox_hosts(home: PathBuf) -> Arc<Hosts> {
+        let scope: Arc<dyn usage_host::FileScopeHost> = Arc::new(SandboxScope { home });
+        Arc::new(Hosts {
+            clock: Arc::new(SystemClock),
+            logger: Arc::new(NullLogger),
+            keychain: Arc::new(MemoryKeychain::default()),
+            http: Arc::new(ReqwestHttpHost::default()),
+            files: Arc::new(ScopedFiles),
+            file_scope: scope,
+            network: Arc::new(ObservedNetwork::default()),
+        })
+    }
+
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../usage-providers/fixtures/codex")
+            .join(name);
+        std::fs::read(path).unwrap()
+    }
+
+    fn managed_with_root(
+        storage: &Arc<Mutex<Storage>>,
+        label: &str,
+        root: &Path,
+        enabled: bool,
+    ) -> ManagedAccount {
+        let account = ManagedAccount {
+            id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            product_id: Some("codex".into()),
+            external_identity: None,
+            label: label.into(),
+            connection_ref: None,
+            lifecycle: AccountLifecycle::Active,
+            enabled,
+            custom_path: Some(root.to_string_lossy().into_owned()),
+            identity_confidence: usage_core::IdentityConfidence::Unknown,
+        };
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&account)
+            .unwrap();
+        account
+    }
+
+    fn rows_for(storage: &Arc<Mutex<Storage>>, account_id: Uuid) -> Vec<(String, String)> {
+        // (connection_id, source_record_id) for one account.
+        storage
+            .lock()
+            .unwrap()
+            .record_attribution()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.account_id == account_id.to_string())
+            .map(|r| (r.connection_id.unwrap_or_default(), r.source_record_id))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn profile_a_b_a_isolation_with_disable_and_delete() {
+        let home = tempfile::tempdir().unwrap();
+        let profile_a = home.path().join("profile-a");
+        let profile_b = home.path().join("profile-b");
+        std::fs::create_dir_all(profile_a.join("sessions").join("x")).unwrap();
+        std::fs::create_dir_all(profile_b.join("sessions").join("y")).unwrap();
+        std::fs::write(
+            profile_a.join("sessions").join("x").join("rollout-a.jsonl"),
+            fixture_bytes("session-a.jsonl"),
+        )
+        .unwrap();
+        std::fs::write(
+            profile_b.join("sessions").join("y").join("rollout-b.jsonl"),
+            fixture_bytes("duplicates.jsonl"),
+        )
+        .unwrap();
+
+        let hosts = sandbox_hosts(home.path().to_path_buf());
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let coordinator = Coordinator::new(hosts.clone(), storage.clone());
+        let acc_a = managed_with_root(&storage, "A", &profile_a, true);
+        let acc_b = managed_with_root(&storage, "B", &profile_b, true);
+
+        // Round 1: A imports 3 rows, B imports 2 rows, no mixing.
+        import_all_history(&hosts, &storage, &coordinator, 90).await;
+        let rows_a = rows_for(&storage, acc_a.id);
+        let rows_b = rows_for(&storage, acc_b.id);
+        assert_eq!(rows_a.len(), 3);
+        assert_eq!(rows_b.len(), 2);
+        let conn_a: std::collections::HashSet<_> = rows_a.iter().map(|(c, _)| c.clone()).collect();
+        let conn_b: std::collections::HashSet<_> = rows_b.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(conn_a.len(), 1);
+        assert_eq!(conn_b.len(), 1);
+        assert_ne!(conn_a, conn_b);
+
+        // Round 2 (A again after B): totals frozen, identities stable.
+        import_all_history(&hosts, &storage, &coordinator, 90).await;
+        assert_eq!(rows_for(&storage, acc_a.id).len(), 3);
+        assert_eq!(rows_for(&storage, acc_b.id).len(), 2);
+
+        // Disable B: its rows stay frozen and present; A is unaffected.
+        storage
+            .lock()
+            .unwrap()
+            .update_managed_account(acc_b.id, None, Some(false), None)
+            .unwrap();
+        import_all_history(&hosts, &storage, &coordinator, 90).await;
+        assert_eq!(rows_for(&storage, acc_b.id).len(), 2);
+        assert_eq!(rows_for(&storage, acc_a.id).len(), 3);
+
+        // Delete B entirely: A keeps every row with the same connection.
+        storage
+            .lock()
+            .unwrap()
+            .delete_account_and_history(acc_b.id)
+            .unwrap();
+        let rows_a_after = rows_for(&storage, acc_a.id);
+        assert_eq!(rows_a_after.len(), 3);
+        let conn_after: std::collections::HashSet<_> =
+            rows_a_after.iter().map(|(c, _)| c.clone()).collect();
+        assert_eq!(conn_after, conn_a);
+        assert_eq!(rows_for(&storage, acc_b.id).len(), 0);
+    }
+}

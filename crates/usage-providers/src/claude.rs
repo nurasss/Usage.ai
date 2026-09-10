@@ -424,14 +424,14 @@ mod tests {
             "\"uuid\":\"uuid_0001\",",
             "\"requestId\":\"req_0001\",",
             "\"message\":{",
-                "\"id\":\"msg_0001\",",
-                "\"model\":\"claude-3-5-sonnet\",",
-                "\"usage\":{",
-                    "\"input_tokens\":50,",
-                    "\"output_tokens\":25,",
-                    "\"cache_read_input_tokens\":10,",
-                    "\"cache_creation_input_tokens\":5",
-                "}",
+            "\"id\":\"msg_0001\",",
+            "\"model\":\"claude-3-5-sonnet\",",
+            "\"usage\":{",
+            "\"input_tokens\":50,",
+            "\"output_tokens\":25,",
+            "\"cache_read_input_tokens\":10,",
+            "\"cache_creation_input_tokens\":5",
+            "}",
             "}}\n"
         );
 
@@ -472,15 +472,15 @@ mod tests {
                 "\"uuid\":\"real-uuid-444\",",
                 "\"requestId\":\"sensitive-req-claude-999\",",
                 "\"message\":{",
-                    "\"id\":\"msg-secret-id\",",
-                    "\"model\":\"claude-3-5-sonnet\",",
-                    "\"content\":\"TOP SECRET PROMPT BODY\",",
-                    "\"usage\":{",
-                        "\"input_tokens\":60,",
-                        "\"output_tokens\":40,",
-                        "\"cache_creation_input_tokens\":10,",
-                        "\"cache_read_input_tokens\":5",
-                    "}",
+                "\"id\":\"msg-secret-id\",",
+                "\"model\":\"claude-3-5-sonnet\",",
+                "\"content\":\"TOP SECRET PROMPT BODY\",",
+                "\"usage\":{",
+                "\"input_tokens\":60,",
+                "\"output_tokens\":40,",
+                "\"cache_creation_input_tokens\":10,",
+                "\"cache_read_input_tokens\":5",
+                "}",
                 "}}\n"
             );
             std::fs::write(&input_path, raw_sensitive).unwrap();
@@ -538,9 +538,7 @@ mod real_corpus_evidence {
             .lines()
             .filter(|l| !l.trim().is_empty())
             .enumerate()
-            .map(|(i, l)| {
-                parse_usage_line(l, "h", i as u64, now).expect("corpus line must parse")
-            })
+            .map(|(i, l)| parse_usage_line(l, "h", i as u64, now).expect("corpus line must parse"))
             .collect()
     }
 
@@ -560,7 +558,9 @@ mod real_corpus_evidence {
         }
         for (id, group) in &by_id {
             assert!(
-                group.windows(2).all(|w| w[0].total_tokens == w[1].total_tokens),
+                group
+                    .windows(2)
+                    .all(|w| w[0].total_tokens == w[1].total_tokens),
                 "chunks of {id} disagree"
             );
         }

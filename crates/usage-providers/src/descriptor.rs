@@ -44,6 +44,9 @@ pub struct ProductDescriptor {
     pub local_dir_env: Option<&'static str>,
     /// Dot-directory under `$HOME`, e.g. `.codex`.
     pub local_dir_name: Option<&'static str>,
+    /// Sibling profile directory prefix for discovery, e.g. `.codex-`
+    /// matches `~/.codex-work`. `None` disables slug discovery.
+    pub profile_dir_prefix: Option<&'static str>,
     pub allow_custom_path: bool,
     pub diagnostics_version: &'static str,
 }
@@ -110,6 +113,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: Some("sessions/**/rollout-*.jsonl;archived_sessions/**/rollout-*.jsonl"),
         local_dir_env: Some("CODEX_HOME"),
         local_dir_name: Some(".codex"),
+        profile_dir_prefix: Some(".codex-"),
         allow_custom_path: true,
         diagnostics_version: "codex-local-v1",
     },
@@ -127,6 +131,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: Some("projects/**/*.jsonl"),
         local_dir_env: Some("CLAUDE_CONFIG_DIR"),
         local_dir_name: Some(".claude"),
+        profile_dir_prefix: Some(".claude-"),
         allow_custom_path: true,
         diagnostics_version: "claude-local-v1",
     },
@@ -144,6 +149,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "openai-api-v1",
     },
@@ -161,6 +167,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "discovery-v1",
     },
@@ -178,6 +185,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "discovery-v1",
     },
@@ -195,6 +203,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "discovery-v1",
     },
@@ -212,6 +221,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "discovery-v1",
     },
@@ -229,6 +239,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "discovery-v1",
     },
@@ -246,6 +257,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_glob: None,
         local_dir_env: None,
         local_dir_name: None,
+        profile_dir_prefix: None,
         allow_custom_path: false,
         diagnostics_version: "discovery-v1",
     },
@@ -287,6 +299,7 @@ pub struct ProductDescriptorDto {
     pub local_glob: Option<String>,
     pub local_dir_env: Option<String>,
     pub local_dir_name: Option<String>,
+    pub profile_dir_prefix: Option<String>,
     pub diagnostics_version: String,
     pub sources: Vec<SourceDto>,
 }
@@ -333,6 +346,7 @@ impl From<&ProductDescriptor> for ProductDescriptorDto {
             local_glob: d.local_glob.map(str::to_string),
             local_dir_env: d.local_dir_env.map(str::to_string),
             local_dir_name: d.local_dir_name.map(str::to_string),
+            profile_dir_prefix: d.profile_dir_prefix.map(str::to_string),
             diagnostics_version: d.diagnostics_version.into(),
             sources: d
                 .sources

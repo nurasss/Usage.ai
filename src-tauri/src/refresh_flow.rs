@@ -249,7 +249,8 @@ pub fn attach_usage_and_cost(state: &AppState, provider: &mut ProviderDto) {
     let Ok(storage) = state.storage.lock() else {
         return;
     };
-    let usage = usage_runtime::account_usage_and_cost_today(&storage, account_id, &provider.product_id);
+    let usage =
+        usage_runtime::account_usage_and_cost_today(&storage, account_id, &provider.product_id);
     provider.tokens_today = usage.tokens_today;
     provider.reported_cost_today = usage.reported_cost_today.map(|m| MoneyDto {
         amount: m.amount,
@@ -441,7 +442,9 @@ mod tests {
     #[tokio::test]
     async fn e2e_refresh_flow_refresh_to_storage_to_dto() {
         use std::sync::{Arc, Mutex};
-        use usage_host::{async_trait, HostError, HttpHost, HttpJsonRequest, HttpJsonResponse, Hosts};
+        use usage_host::{
+            async_trait, HostError, Hosts, HttpHost, HttpJsonRequest, HttpJsonResponse,
+        };
         use usage_runtime::{Coordinator, RefreshRequest, Trigger};
         use usage_storage::Storage;
 

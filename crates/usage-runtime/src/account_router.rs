@@ -168,7 +168,11 @@ mod tests {
         );
 
         // Step 2: Configured account A observes Identity B -> Mismatch (rejected, no silent merge)
-        let step2 = route(Some("identity-A"), IdentityConfidence::Weak, Some("identity-B"));
+        let step2 = route(
+            Some("identity-A"),
+            IdentityConfidence::Weak,
+            Some("identity-B"),
+        );
         assert_eq!(
             step2,
             Routing::Mismatch {
@@ -178,7 +182,11 @@ mod tests {
         );
 
         // Step 3: Returns to Identity A -> matched attribution
-        let step3 = route(Some("identity-A"), IdentityConfidence::Weak, Some("identity-A"));
+        let step3 = route(
+            Some("identity-A"),
+            IdentityConfidence::Weak,
+            Some("identity-A"),
+        );
         assert_eq!(
             step3,
             Routing::Attributed {

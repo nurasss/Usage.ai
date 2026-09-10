@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { addAccount, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, testConnection, updateAccount } from './lib/api';
+  import { addAccount, connectCandidate, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, ignoreCandidate, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, scanCandidates, testConnection, updateAccount } from './lib/api';
   import { formatAge, formatCompact, formatCountdown, stateLabel } from './lib/format';
   import { applyTheme, formatAccountLabel, navKey, providerPresentation } from './lib/ui';
-  import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, ProductDescriptor, ProviderSnapshot, Quota, StorageStatus } from './lib/types';
+  import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, ProductDescriptor, ProfileCandidate, ProviderSnapshot, Quota, StorageStatus } from './lib/types';
 
   let snapshot: AppSnapshot | null = null;
   let loadError = '';
@@ -19,6 +19,8 @@
   let accounts: AccountInfo[] = [];
   let budgets: Budget[] = [];
   let descriptors: ProductDescriptor[] = [];
+  let candidates: ProfileCandidate[] = [];
+  let candidateAlias = '';
   let importStats: ImportStats[] = [];
   let storageStatus: StorageStatus | null = null;
   let appInfo: AppInfo = { version: '1.0.0', updatesEnabled: false };
@@ -54,6 +56,7 @@
     loadDescriptors().then((value) => descriptors = value).catch(() => {});
     loadDiagnostics().then((value) => diagnostics = value);
     loadAccounts().then((value) => accounts = value);
+    scanCandidates().then((value) => candidates = value.filter((c) => c.status === 'pending')).catch(() => {});
     loadBudgets().then((value) => budgets = value);
     loadImportStats().then((value) => importStats = value);
     loadStorageStatus().then((value) => storageStatus = value);
@@ -87,6 +90,7 @@
       loadError = '';
       diagnostics = await loadDiagnostics();
       accounts = await loadAccounts();
+      candidates = await scanCandidates().catch(() => candidates);
       budgets = await loadBudgets();
       importStats = await loadImportStats();
       storageStatus = await loadStorageStatus();
@@ -112,8 +116,34 @@
     notice = await removeAccount(id, history);
     accounts = await loadAccounts();
     budgets = await loadBudgets();
+    candidates = await scanCandidates().catch(() => candidates);
     try { snapshot = await loadSnapshot(); } catch { /* keep last good view */ }
     window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function rescanCandidates() {
+    try {
+      candidates = (await scanCandidates()).filter((c) => c.status === 'pending');
+      notice = candidates.length ? `Найдено профилей: ${candidates.length}` : 'Новых профилей нет';
+    } catch { notice = 'Не удалось сканировать профили'; }
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function connectProfile(candidate: ProfileCandidate) {
+    try {
+      await connectCandidate(candidate.rootHash, candidateAlias.trim() || candidate.rootHint);
+      candidateAlias = '';
+      accounts = await loadAccounts();
+      candidates = await scanCandidates().catch(() => candidates);
+      snapshot = await refreshAll();
+      notice = 'Профиль подключён';
+    } catch { notice = 'Не удалось подключить: корень уже привязан или недоступен'; }
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function ignoreProfile(candidate: ProfileCandidate) {
+    await ignoreCandidate(candidate.rootHash);
+    candidates = candidates.filter((c) => c.rootHash !== candidate.rootHash);
   }
 
   function productIdOf(selection: string): [string, string] {
@@ -140,8 +170,7 @@
     catch { notice = 'Не удалось обновить аккаунт'; window.setTimeout(() => notice = '', 2500); }
   }
 
-  async function probeAccount(id: string) {
-    try {
+  async function probeAccount(id: string) {    try {
       const result = await testConnection(id);
       testResult = `${result.product}: ${stateLabel(result.connectionState)}`;
     } catch { testResult = 'Проверка не удалась'; }
@@ -271,6 +300,18 @@
           <label><span>Сумма</span><input class="number-input" type="number" min="1" step="1" aria-label="Сумма бюджета" bind:value={budgetAmount} /></label>
           <label><span>Валюта</span><input class="shortcut-input" aria-label="Валюта бюджета" bind:value={budgetCurrency} /></label>
           <div class="button-row"><button class="secondary" on:click={createBudget}>Сохранить бюджет</button></div>
+        </div>
+        <div class="setting-group">
+          <h2>Обнаруженные профили</h2>
+          <div class="button-row"><button class="secondary" on:click={rescanCandidates}>Сканировать</button></div>
+          {#if !candidates.filter((c) => c.status === 'pending').length}
+            <p class="muted">Новых профилей нет. Сканируются только известные места: стандартный корень, `~/.codex-*` / `~/.claude-*`, добавленные вручную пути.</p>
+          {:else}
+            {#each candidates.filter((c) => c.status === 'pending') as candidate}
+              <label><span>{candidate.rootHint} · {candidate.kind}{candidate.boundAccountId ? ' · уже привязан' : ''}</span></label>
+              <div class="button-row"><input class="shortcut-input" aria-label="Название профиля" bind:value={candidateAlias} placeholder={candidate.rootHint} /><button class="secondary" on:click={() => connectProfile(candidate)} disabled={!!candidate.boundAccountId}>Подключить</button><button class="secondary" on:click={() => ignoreProfile(candidate)}>Игнорировать</button></div>
+            {/each}
+          {/if}
         </div>
         <div class="setting-group">
           <h2>Аккаунты ({accounts.length})</h2>

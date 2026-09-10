@@ -433,3 +433,15 @@ pub fn source_state(state: &usage_providers::strategy::SourceError) -> Connectio
         | usage_providers::strategy::SourceError::Policy => ConnectionState::Unavailable,
     }
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateDto {
+    pub root_hash: String,
+    pub provider_id: String,
+    pub product_id: String,
+    pub root_hint: String,
+    pub kind: String,
+    pub status: String,
+    pub bound_account_id: Option<String>,
+}

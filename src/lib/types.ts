@@ -104,12 +104,18 @@ export interface ProductDescriptor {
   glyph: string; color: string; capabilities: Capability[]; accountModel: AccountModel;
   allowedHosts: string[]; allowCustomPath: boolean; needsSecret: boolean;
   localGlob?: string; localDirEnv?: string; localDirName?: string;
+  profileDirPrefix?: string;
   diagnosticsVersion: string;
 }
 
 export interface ImportStats {
   productId: string; filesDiscovered: number; filesImported: number;
   recordsAccepted: number; malformed: number; checkpointResets: number; warnings: string[];
+}
+
+export interface ProfileCandidate {
+  rootHash: string; providerId: string; productId: string; rootHint: string;
+  kind: string; status: string; boundAccountId?: string;
 }
 
 export interface Budget {

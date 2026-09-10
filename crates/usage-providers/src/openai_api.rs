@@ -441,10 +441,10 @@ pub fn openai_api_schema() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strategy::FetchStrategy;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
-    use crate::strategy::FetchStrategy;
     #[test]
     fn parses_realistic_cost_page() {
         let value = serde_json::json!({
@@ -918,7 +918,9 @@ mod tests {
                 }
 
                 // Verify Bearer secret is forwarded (case-insensitive header)
-                assert!(req_str.to_lowercase().contains("authorization: bearer sk-test-real-host"));
+                assert!(req_str
+                    .to_lowercase()
+                    .contains("authorization: bearer sk-test-real-host"));
 
                 let (body, has_more) = if !req_str.contains("page=page2_cursor") {
                     // Page 1: multi-kilobyte payload (> 2 KiB) with exact decimals
@@ -1089,7 +1091,10 @@ mod tests {
         };
 
         let res = strategy.fetch(&ctx).await;
-        assert!(matches!(res, Err(crate::strategy::SourceError::Cancelled)), "Expected Cancelled, got: {res:?}");
+        assert!(
+            matches!(res, Err(crate::strategy::SourceError::Cancelled)),
+            "Expected Cancelled, got: {res:?}"
+        );
         let _ = server_handle.await;
     }
 }

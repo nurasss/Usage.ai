@@ -296,3 +296,211 @@ pub fn remove_account(
         Ok("Подключение отключено, история сохранена как архив".into())
     }
 }
+
+/// Discover profile roots for local products. Candidates are validated
+/// (marker layout) but never trusted: nothing is created, connected or
+/// imported by a scan. Custom roots come from enabled managed accounts.
+#[tauri::command]
+pub fn scan_candidates(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<crate::dto::CandidateDto>, String> {
+    use usage_host::CancellationToken;
+    use usage_runtime::discovery::{discover_profile_roots, DiscoveredKind};
+
+    let managed: Vec<ManagedAccount> = state
+        .storage
+        .lock()
+        .map_err(|_| "storage_lock")?
+        .list_managed_accounts()
+        .map_err(|_| "accounts_unavailable")?;
+    let mut out = vec![];
+    for descriptor in usage_providers::descriptor::all_descriptors()
+        .iter()
+        .filter(|d| d.account_model == AccountModel::LocalClient)
+    {
+        let custom_roots: Vec<std::path::PathBuf> = managed
+            .iter()
+            .filter(|a| {
+                a.enabled
+                    && a.product_id.as_deref() == Some(descriptor.product_id)
+                    && a.custom_path
+                        .as_deref()
+                        .is_some_and(|p| !p.trim().is_empty())
+            })
+            .filter_map(|a| a.custom_path.clone().map(std::path::PathBuf::from))
+            .collect();
+        for found in discover_profile_roots(
+            &state.hosts,
+            descriptor,
+            &custom_roots,
+            &CancellationToken::new(),
+        ) {
+            if !found.valid {
+                continue;
+            }
+            let kind = match found.kind {
+                DiscoveredKind::Default => "default",
+                DiscoveredKind::Slug => "slug",
+                DiscoveredKind::Custom => "custom",
+            };
+            let (status, bound_account) = match state.storage.lock() {
+                Ok(mut storage) => {
+                    let candidate = storage
+                        .upsert_candidate(
+                            &found.root_hash,
+                            descriptor.provider_id,
+                            descriptor.product_id,
+                            &found.hint,
+                        )
+                        .map_err(|_| "candidate_store_failed")?;
+                    let bound = storage
+                        .connection_for_root(
+                            descriptor.provider_id,
+                            descriptor.product_id,
+                            &found.root_hash,
+                        )
+                        .map_err(|_| "candidate_store_failed")?
+                        .map(|c| c.account_id);
+                    (candidate.status, bound)
+                }
+                Err(_) => continue,
+            };
+            // The default root of a fresh install auto-binds to the
+            // stable default account on first sight; every other root
+            // waits for explicit user connect.
+            out.push(crate::dto::CandidateDto {
+                root_hash: found.root_hash,
+                provider_id: descriptor.provider_id.into(),
+                product_id: descriptor.product_id.into(),
+                root_hint: found.hint,
+                kind: kind.into(),
+                status,
+                bound_account_id: bound_account,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Explicit user connect: bind a discovered root to a fresh managed
+/// account. Fails if the physical root already belongs to another
+/// account — rebinding is never silent.
+#[tauri::command]
+pub fn connect_candidate(
+    root_hash: String,
+    alias: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<AccountDto, String> {
+    use usage_host::CancellationToken;
+    use usage_runtime::discovery::discover_profile_roots;
+
+    let alias = alias.trim();
+    if alias.is_empty() || alias.len() > 64 {
+        return Err("invalid_alias".into());
+    }
+    if root_hash.len() != 64 || !root_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid_root".into());
+    }
+    // Re-resolve the hash to a path with a fresh bounded scan: raw
+    // paths are never persisted, so connect re-derives them.
+    let mut resolved: Option<(String, String, String, std::path::PathBuf)> = None;
+    let managed: Vec<ManagedAccount> = state
+        .storage
+        .lock()
+        .map_err(|_| "storage_lock")?
+        .list_managed_accounts()
+        .map_err(|_| "accounts_unavailable")?;
+    for descriptor in usage_providers::descriptor::all_descriptors()
+        .iter()
+        .filter(|d| d.account_model == AccountModel::LocalClient)
+    {
+        let custom_roots: Vec<std::path::PathBuf> = managed
+            .iter()
+            .filter(|a| a.product_id.as_deref() == Some(descriptor.product_id))
+            .filter_map(|a| a.custom_path.clone().map(std::path::PathBuf::from))
+            .collect();
+        for found in discover_profile_roots(
+            &state.hosts,
+            descriptor,
+            &custom_roots,
+            &CancellationToken::new(),
+        ) {
+            if found.valid && found.root_hash == root_hash {
+                resolved = Some((
+                    descriptor.provider_id.into(),
+                    descriptor.product_id.into(),
+                    found.hint.clone(),
+                    found.path,
+                ));
+                break;
+            }
+        }
+        if resolved.is_some() {
+            break;
+        }
+    }
+    let Some((provider_id, product_id, hint, path)) = resolved else {
+        return Err("candidate_not_found".into());
+    };
+    let _ = hint;
+    let id = Uuid::new_v4();
+    let managed_account = ManagedAccount {
+        id,
+        provider_id: provider_id.clone(),
+        product_id: Some(product_id.clone()),
+        external_identity: None,
+        label: alias.into(),
+        connection_ref: Some(format!("local:{root_hash:.12}")),
+        lifecycle: AccountLifecycle::Active,
+        enabled: true,
+        custom_path: Some(path.to_string_lossy().into_owned()),
+        identity_confidence: usage_core::IdentityConfidence::Unknown,
+    };
+    {
+        let mut storage = state.storage.lock().map_err(|_| "storage_lock")?;
+        storage
+            .create_managed_account(&managed_account)
+            .map_err(|_| "account_create_failed")?;
+        // ensure_connection rejects silently rebinding a root that
+        // another account already owns.
+        let root_hint = managed_account
+            .custom_path
+            .as_deref()
+            .unwrap_or("custom")
+            .rsplit('/')
+            .next()
+            .unwrap_or("custom")
+            .to_string();
+        storage
+            .ensure_connection(
+                id,
+                &provider_id,
+                &product_id,
+                &root_hash,
+                &root_hint,
+                "custom-local",
+            )
+            .map_err(|_| "root_already_bound")?;
+        storage
+            .set_candidate_status(&root_hash, "connected")
+            .map_err(|_| "candidate_store_failed")?;
+    }
+    Ok(managed_account_to_dto(&managed_account))
+}
+
+/// Explicit user ignore: the root stays silent across rescans.
+#[tauri::command]
+pub fn ignore_candidate(
+    root_hash: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    if root_hash.len() != 64 || !root_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid_root".into());
+    }
+    Ok(state
+        .storage
+        .lock()
+        .map_err(|_| "storage_lock")?
+        .set_candidate_status(&root_hash, "ignored")
+        .map_err(|_| "candidate_store_failed")?)
+}

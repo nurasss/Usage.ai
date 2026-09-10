@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { demoSnapshot } from './demo';
-import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, OverviewMap, ProductDescriptor, StorageStatus } from './types';
+import type { AccountInfo, ProfileCandidate, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, OverviewMap, ProductDescriptor, StorageStatus } from './types';
 
 export const inTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -133,3 +133,20 @@ export async function reportOnlineState(online: boolean): Promise<void> {
 export const defaultSettings: AppSettings = { launchAtLogin: false, refreshIntervalMinutes: 5, menuBarMode: 'icon', globalShortcut: 'Ctrl+Alt+U', theme: 'system', retentionDays: 90, quotaWarningPercent: 20, notificationsEnabled: false };
 export async function loadSettings(): Promise<AppSettings> { if (!inTauri()) return defaultSettings; return invoke<AppSettings>('get_settings'); }
 export async function saveSettings(settings: AppSettings): Promise<void> { if (!inTauri()) return; await invoke('save_settings', { settings }); }
+
+export async function scanCandidates(): Promise<ProfileCandidate[]> {
+  if (!inTauri()) return [];
+  try { return await invoke<ProfileCandidate[]>('scan_candidates'); }
+  catch { return []; }
+}
+
+export async function connectCandidate(rootHash: string, alias: string): Promise<AccountInfo> {
+  if (!inTauri()) throw new Error('demo');
+  return invoke<AccountInfo>('connect_candidate', { rootHash, alias });
+}
+
+export async function ignoreCandidate(rootHash: string): Promise<boolean> {
+  if (!inTauri()) return false;
+  try { return await invoke<boolean>('ignore_candidate', { rootHash }); }
+  catch { return false; }
+}

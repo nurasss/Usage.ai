@@ -550,7 +550,10 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(result, Err(HostError::Policy)), "Must reject when streamed chunks exceed max_bytes despite fake Content-Length");
+        assert!(
+            matches!(result, Err(HostError::Policy)),
+            "Must reject when streamed chunks exceed max_bytes despite fake Content-Length"
+        );
         let _ = server.await;
     }
 

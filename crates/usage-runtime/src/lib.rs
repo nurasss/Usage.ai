@@ -1,6 +1,7 @@
 pub mod account_router;
 pub mod aggregation;
 pub mod connection_test;
+pub mod discovery;
 pub mod history_import;
 pub mod notifications;
 pub mod orchestration;

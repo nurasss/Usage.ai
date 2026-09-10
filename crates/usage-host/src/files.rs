@@ -193,6 +193,30 @@ pub trait FileScopeHost: Send + Sync {
     fn env_var(&self, name: &str) -> Option<String> {
         std::env::var(name).ok()
     }
+
+    /// Top-level child directory names of `dir` (names only, no paths,
+    /// no recursion, no content). Used solely for `<prefix>-<slug>`
+    /// profile convention discovery within `$HOME`.
+    fn child_dir_names(&self, dir: &Path) -> Result<Vec<String>, HostError> {
+        if !dir.is_absolute() {
+            return Err(HostError::Policy);
+        }
+        let canonical = dir.canonicalize().map_err(|_| HostError::NotFound)?;
+        if !canonical.is_dir() {
+            return Err(HostError::NotFound);
+        }
+        let mut names = vec![];
+        for entry in std::fs::read_dir(&canonical).map_err(|_| HostError::Unavailable)? {
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -462,7 +486,9 @@ mod tests {
         let f3 = bad.join("rollout-3.jsonl").canonicalize().unwrap();
         let f4 = other.join("rollout-4.jsonl").canonicalize().unwrap();
 
-        let found = host.list_files(&root, pattern, &CancellationToken::new()).unwrap();
+        let found = host
+            .list_files(&root, pattern, &CancellationToken::new())
+            .unwrap();
 
         assert_eq!(found.len(), 2);
         assert!(found.iter().any(|f| f.path == f1));
