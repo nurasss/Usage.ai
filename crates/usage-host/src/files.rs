@@ -69,50 +69,6 @@ impl ScopedFile {
 ///   (file or parent component) is rejected;
 /// - raw paths never leave the host boundary except as hashes.
 pub trait FilesHost: Send + Sync {
-    fn discover(
-        &self,
-        root: &Path,
-        glob_pattern: &str,
-        follow_symlinks: bool,
-    ) -> Result<Vec<ScopedPath>, HostError>;
-    fn identity(&self, path: &Path) -> Result<FileIdentity, HostError>;
-    fn read_range(
-        &self,
-        path: &Path,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<(Vec<u8>, FileIdentity), HostError>;
-    fn read_tail(
-        &self,
-        path: &Path,
-        max_bytes: usize,
-    ) -> Result<(Vec<u8>, FileIdentity), HostError>;
-
-    /// Explicit environment/config context for product root resolution.
-    /// Strategies must not read process env directly.
-    fn home_dir(&self) -> Option<PathBuf> {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-    fn env_var(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
-    }
-
-    /// Validate one product root: absolute, canonicalizable, directory.
-    fn scope_root(
-        &self,
-        root: &Path,
-        _cancel: &CancellationToken,
-    ) -> Result<ScopedRoot, HostError> {
-        if !root.is_absolute() {
-            return Err(HostError::Policy);
-        }
-        let canonical = root.canonicalize().map_err(|_| HostError::NotFound)?;
-        if !canonical.is_dir() {
-            return Err(HostError::NotFound);
-        }
-        Ok(ScopedRoot { root: canonical })
-    }
-
     /// List files matching a relative glob inside a scoped root.
     /// `..` patterns are rejected; escaping entries are skipped.
     fn list_files(
@@ -127,27 +83,35 @@ pub trait FilesHost: Send + Sync {
         if cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
-        let full_pattern = format!("{}/{pattern}", root.root.display());
         let mut out = vec![];
-        let entries = glob::glob(&full_pattern).map_err(|_| HostError::Policy)?;
-        for entry in entries {
-            if cancel.is_cancelled() {
-                return Err(HostError::Cancelled);
-            }
-            let Ok(path) = entry else { continue };
-            let Ok(canonical) = path.canonicalize() else {
-                continue;
-            };
-            if !canonical.starts_with(&root.root) || !canonical.is_file() {
+        for sub_pattern in pattern.split(';') {
+            let sub_pattern = sub_pattern.trim();
+            if sub_pattern.is_empty() {
                 continue;
             }
-            let Ok(identity) = file_identity(&canonical) else {
-                continue;
-            };
-            out.push(ScopedFile {
-                path: canonical,
-                identity,
-            });
+            let full_pattern = format!("{}/{sub_pattern}", root.root.display());
+            let entries = glob::glob(&full_pattern).map_err(|_| HostError::Policy)?;
+            for entry in entries {
+                if cancel.is_cancelled() {
+                    return Err(HostError::Cancelled);
+                }
+                let Ok(path) = entry else { continue };
+                let Ok(canonical) = path.canonicalize() else {
+                    continue;
+                };
+                if !canonical.starts_with(&root.root) || !canonical.is_file() {
+                    continue;
+                }
+                let Ok(identity) = file_identity(&canonical) else {
+                    continue;
+                };
+                if !out.iter().any(|f: &ScopedFile| f.path == canonical) {
+                    out.push(ScopedFile {
+                        path: canonical,
+                        identity,
+                    });
+                }
+            }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(out)
@@ -201,10 +165,41 @@ pub trait FilesHost: Send + Sync {
     }
 }
 
+/// Host-internal root resolution. This raw-path capability is deliberately
+/// kept out of `FilesHost`, which is the only filesystem interface exposed to
+/// provider strategies through `HostFacade`.
+pub trait FileScopeHost: Send + Sync {
+    /// Validate one product root: absolute, canonicalizable, directory.
+    fn scope_root(
+        &self,
+        root: &Path,
+        _cancel: &CancellationToken,
+    ) -> Result<ScopedRoot, HostError> {
+        if !root.is_absolute() {
+            return Err(HostError::Policy);
+        }
+        let canonical = root.canonicalize().map_err(|_| HostError::NotFound)?;
+        if !canonical.is_dir() {
+            return Err(HostError::NotFound);
+        }
+        Ok(ScopedRoot { root: canonical })
+    }
+
+    /// Explicit environment/config context for runtime root resolution.
+    fn home_dir(&self) -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    fn env_var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScopedFiles;
 
-impl FilesHost for ScopedFiles {
+impl ScopedFiles {
+    #[cfg(test)]
     fn discover(
         &self,
         root: &Path,
@@ -230,10 +225,7 @@ impl FilesHost for ScopedFiles {
         Ok(out)
     }
 
-    fn identity(&self, path: &Path) -> Result<FileIdentity, HostError> {
-        file_identity(path)
-    }
-
+    #[cfg(test)]
     fn read_range(
         &self,
         path: &Path,
@@ -259,6 +251,7 @@ impl FilesHost for ScopedFiles {
         Ok((buf, identity))
     }
 
+    #[cfg(test)]
     fn read_tail(
         &self,
         path: &Path,
@@ -270,7 +263,12 @@ impl FilesHost for ScopedFiles {
     }
 }
 
+impl FileScopeHost for ScopedFiles {}
+
+impl FilesHost for ScopedFiles {}
+
 impl ScopedFiles {
+    #[cfg(test)]
     fn scope(
         &self,
         canonical_root: &Path,
@@ -294,6 +292,7 @@ impl ScopedFiles {
     }
 }
 
+#[cfg(test)]
 fn path_contains_symlink(root: &Path, path: &Path) -> bool {
     let mut current = path.to_path_buf();
     loop {
@@ -417,5 +416,58 @@ mod tests {
         assert_eq!(&head, b"hello");
         let (tail, _) = host.read_tail(file.path(), 1024).unwrap();
         assert!(tail.ends_with(b"world\n"));
+    }
+
+    #[test]
+    fn cancelled_scan_stops_before_glob_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("one.txt"), "data").unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let host = ScopedFiles;
+        let root = host
+            .scope_root(dir.path(), &CancellationToken::new())
+            .unwrap();
+        assert!(matches!(
+            host.list_files(&root, "*.txt", &token),
+            Err(HostError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn exact_directories_list_files_prevents_overscan_into_unauthorized_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let archived = dir.path().join("archived_sessions");
+        let bad = dir.path().join("bad_sessions");
+        let other = dir.path().join("random_sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&archived).unwrap();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        std::fs::write(sessions.join("rollout-1.jsonl"), "data1").unwrap();
+        std::fs::write(archived.join("rollout-2.jsonl"), "data2").unwrap();
+        std::fs::write(bad.join("rollout-3.jsonl"), "data3").unwrap();
+        std::fs::write(other.join("rollout-4.jsonl"), "data4").unwrap();
+
+        let host = ScopedFiles;
+        let root = host
+            .scope_root(dir.path(), &CancellationToken::new())
+            .unwrap();
+
+        let pattern = "sessions/**/rollout-*.jsonl;archived_sessions/**/rollout-*.jsonl";
+        let f1 = sessions.join("rollout-1.jsonl").canonicalize().unwrap();
+        let f2 = archived.join("rollout-2.jsonl").canonicalize().unwrap();
+        let f3 = bad.join("rollout-3.jsonl").canonicalize().unwrap();
+        let f4 = other.join("rollout-4.jsonl").canonicalize().unwrap();
+
+        let found = host.list_files(&root, pattern, &CancellationToken::new()).unwrap();
+
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|f| f.path == f1));
+        assert!(found.iter().any(|f| f.path == f2));
+        assert!(!found.iter().any(|f| f.path == f3));
+        assert!(!found.iter().any(|f| f.path == f4));
     }
 }

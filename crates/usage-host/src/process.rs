@@ -222,4 +222,27 @@ mod tests {
             .await;
         assert!(matches!(result, Err(HostError::Cancelled)));
     }
+
+    #[tokio::test]
+    async fn in_flight_cancellation_kills_owned_child() {
+        let host = AllowlistedProcess::with_allowed([PathBuf::from("/bin/sleep")]);
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+        let result = host
+            .spawn(SpawnRequest {
+                executable: Path::new("/bin/sleep"),
+                args: &["30"],
+                timeout: Duration::from_secs(5),
+                stdout_cap: 64,
+                stderr_cap: 64,
+                cancel,
+            })
+            .await;
+        assert!(matches!(result, Err(HostError::Cancelled)));
+        assert_eq!(host.owned_count(), 0);
+    }
 }

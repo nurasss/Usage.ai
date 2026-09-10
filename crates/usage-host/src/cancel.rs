@@ -1,6 +1,6 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, Weak,
 };
 use tokio::sync::Notify;
 
@@ -19,6 +19,7 @@ pub struct CancellationToken {
 struct TokenInner {
     flag: AtomicBool,
     notify: Notify,
+    children: Mutex<Vec<Weak<TokenInner>>>,
 }
 
 impl Default for CancellationToken {
@@ -33,13 +34,57 @@ impl CancellationToken {
             inner: Arc::new(TokenInner {
                 flag: AtomicBool::new(false),
                 notify: Notify::new(),
+                children: Mutex::new(Vec::new()),
             }),
         }
     }
 
+    /// Create a token cancelled by any parent. This keeps account disable,
+    /// account deletion and application shutdown on one host-compatible
+    /// token without spawning a watcher task for every refresh.
+    pub fn linked(parents: impl IntoIterator<Item = CancellationToken>) -> Self {
+        let child = Self::new();
+        for parent in parents {
+            parent.add_child(&child);
+        }
+        child
+    }
+
+    fn add_child(&self, child: &CancellationToken) {
+        if self.is_cancelled() {
+            child.cancel();
+            return;
+        }
+        if let Ok(mut children) = self.inner.children.lock() {
+            children.push(Arc::downgrade(&child.inner));
+        }
+        // Close the small check/register race: a parent cancelled between
+        // the first check and registration still cancels this child.
+        if self.is_cancelled() {
+            child.cancel();
+        }
+    }
+
     pub fn cancel(&self) {
-        self.inner.flag.store(true, Ordering::SeqCst);
+        if self.inner.flag.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.inner.notify.notify_waiters();
+        let children = self
+            .inner
+            .children
+            .lock()
+            .map(|mut children| {
+                children.retain(|child| child.strong_count() > 0);
+                children
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for child in children {
+            CancellationToken { inner: child }.cancel();
+        }
     }
 
     pub fn is_cancelled(&self) -> bool {

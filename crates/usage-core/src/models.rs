@@ -163,9 +163,31 @@ pub enum Coverage {
     Complete,
     Partial,
     LocalClientOnly,
+    /// Source shape is parsed, but real-client semantic evidence is still
+    /// required before totals can be called authoritative.
+    UnverifiedSemantics,
     FromConnectionTime,
     ProviderDelayed,
     Unknown,
+}
+
+impl Coverage {
+    /// Returns true if this coverage represents trustworthy, authoritative data
+    /// eligible for authoritative totals, primary tray percentage, and native alerts.
+    /// UnverifiedSemantics, LocalClientOnly, and Unknown are non-authoritative.
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Coverage::Complete | Coverage::Partial)
+    }
+
+    /// Primary menu-bar / tray metric selection allows only authoritative sources.
+    pub fn allows_tray_metric(&self) -> bool {
+        self.is_authoritative()
+    }
+
+    /// Authoritative quota notifications (threshold, pace, reset) allow only authoritative sources.
+    pub fn allows_quota_notifications(&self) -> bool {
+        self.is_authoritative()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,7 +202,14 @@ pub struct UsageRecord {
     pub model: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    /// Aggregate cache count retained for cross-provider totals and
+    /// backwards-compatible consumers. Claude records additionally retain
+    /// the source's read/create buckets below.
     pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_creation_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
     pub requests: Option<u64>,

@@ -13,11 +13,18 @@ pub struct HostFacade<'a> {
     pub files: Option<&'a dyn FilesHost>,
     pub http: Option<&'a dyn HttpHost>,
     pub keychain: Option<ScopedKeychain<'a, dyn KeychainHost>>,
+    /// The allow-list is descriptor-owned and cannot be selected by a
+    /// provider strategy or by an arbitrary URL supplied at runtime.
+    pub allowed_hosts: &'static [&'static str],
 }
+
+/// Name used at the provider boundary to make the capability cut explicit.
+pub type ProviderHostFacade<'a> = HostFacade<'a>;
 
 pub struct FacadePolicy {
     pub files: bool,
     pub http: bool,
+    pub allowed_hosts: &'static [&'static str],
     /// Fixed Keychain service namespace, or `None` for no access.
     pub keychain_service: Option<&'static str>,
 }
@@ -33,6 +40,7 @@ impl super::Hosts {
             keychain: policy
                 .keychain_service
                 .map(|service| ScopedKeychain::new(self.keychain.as_ref(), service)),
+            allowed_hosts: policy.allowed_hosts,
         }
     }
 }
@@ -43,12 +51,14 @@ mod tests {
     use std::sync::Arc;
 
     fn bundle() -> Hosts {
+        let files = Arc::new(ScopedFiles);
         Hosts {
             clock: Arc::new(SystemClock),
             logger: Arc::new(NullLogger),
             keychain: Arc::new(MemoryKeychain::default()),
             http: Arc::new(ReqwestHttpHost::default()),
-            files: Arc::new(ScopedFiles),
+            files: files.clone(),
+            file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
         }
     }
@@ -59,6 +69,7 @@ mod tests {
         let facade = hosts.facade(&super::FacadePolicy {
             files: true,
             http: false,
+            allowed_hosts: &[],
             keychain_service: None,
         });
         assert!(facade.files.is_some());
@@ -72,6 +83,7 @@ mod tests {
         let facade = hosts.facade(&super::FacadePolicy {
             files: false,
             http: true,
+            allowed_hosts: &["api.openai.com"],
             keychain_service: Some("com.nurasss.usageai"),
         });
         assert!(facade.files.is_none());
@@ -88,6 +100,7 @@ mod tests {
         let facade = hosts.facade(&super::FacadePolicy {
             files: false,
             http: false,
+            allowed_hosts: &[],
             keychain_service: None,
         });
         assert!(facade.files.is_none());

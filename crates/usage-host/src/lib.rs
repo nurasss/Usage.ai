@@ -14,12 +14,15 @@ pub mod pty;
 
 use std::sync::Arc;
 
+pub use async_trait::async_trait;
 pub use cancel::CancellationToken;
 pub use clock::{ClockHost, FixedClock, SystemClock};
 pub use credentials::{fingerprint, SecretString};
 pub use error::{safe_code, HostError};
-pub use facade::HostFacade;
-pub use files::{FileIdentity, FilesHost, ScopedFile, ScopedFiles, ScopedPath, ScopedRoot};
+pub use facade::{HostFacade, ProviderHostFacade};
+pub use files::{
+    FileIdentity, FileScopeHost, FilesHost, ScopedFile, ScopedFiles, ScopedPath, ScopedRoot,
+};
 pub use http::{HttpHost, HttpJsonRequest, HttpJsonResponse, ReqwestHttpHost};
 #[cfg(target_os = "macos")]
 pub use keychain::KeyringHost;
@@ -38,5 +41,23 @@ pub struct Hosts {
     pub keychain: Arc<dyn KeychainHost>,
     pub http: Arc<dyn HttpHost>,
     pub files: Arc<dyn FilesHost>,
+    /// Raw root resolution is runtime-only and is never included in the
+    /// provider `HostFacade`.
+    pub file_scope: Arc<dyn FileScopeHost>,
     pub network: Arc<dyn NetworkHost>,
+}
+
+impl Default for Hosts {
+    fn default() -> Self {
+        let files = Arc::new(ScopedFiles);
+        Self {
+            clock: Arc::new(SystemClock),
+            logger: Arc::new(NullLogger),
+            keychain: Arc::new(MemoryKeychain::default()),
+            http: Arc::new(ReqwestHttpHost::default()),
+            files: files.clone(),
+            file_scope: files,
+            network: Arc::new(ObservedNetwork::default()),
+        }
+    }
 }
