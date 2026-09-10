@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
-use usage_core::ConnectionState;
+use usage_core::{ConnectionState, Coverage};
 
 /// Notification business rules live here; the platform layer only
 /// delivers and persists dedup keys. Every rule fires on committed
@@ -23,6 +23,7 @@ pub struct ProviderNoticeView {
     pub product_name: String,
     pub connection_state: ConnectionState,
     pub fresh: bool,
+    pub coverage: Coverage,
     pub quotas: Vec<QuotaNoticeView>,
 }
 
@@ -90,6 +91,11 @@ impl Planner {
         self.last_state
             .insert(account_key.clone(), view.connection_state.clone());
         if !view.fresh {
+            return out;
+        }
+        // Authoritative quota notifications (resets, pace projections, threshold warnings)
+        // are strictly suppressed for non-authoritative coverage (such as UnverifiedSemantics).
+        if !view.coverage.allows_quota_notifications() {
             return out;
         }
         for quota in &view.quotas {
@@ -207,12 +213,22 @@ mod tests {
         fresh: bool,
         quotas: Vec<QuotaNoticeView>,
     ) -> ProviderNoticeView {
+        view_with_coverage(state, fresh, Coverage::Complete, quotas)
+    }
+
+    fn view_with_coverage(
+        state: ConnectionState,
+        fresh: bool,
+        coverage: Coverage,
+        quotas: Vec<QuotaNoticeView>,
+    ) -> ProviderNoticeView {
         ProviderNoticeView {
             account_id: "a1".into(),
             provider_name: "OpenAI".into(),
             product_name: "Codex".into(),
             connection_state: state,
             fresh,
+            coverage,
             quotas,
         }
     }
@@ -314,5 +330,144 @@ mod tests {
             "2026-09"
         )
         .is_none());
+    }
+
+    #[test]
+    fn unverified_low_quota_and_critical_thresholds_are_suppressed() {
+        let mut planner = Planner::default();
+        // Verified provider with 20% remaining fires threshold notice (100 - 20 = 80% used)
+        let verified_notices = planner.plan_provider(
+            &view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::Complete,
+                vec![quota("p_ver", 20.0, "w1")],
+            ),
+            Utc::now(),
+        );
+        assert!(verified_notices.iter().any(|n| n.threshold == 80));
+
+        // Unverified provider with 20% remaining suppresses all quota notices
+        let mut planner2 = Planner::default();
+        let unverified_notices = planner2.plan_provider(
+            &view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::UnverifiedSemantics,
+                vec![quota("p_unver", 20.0, "w1")],
+            ),
+            Utc::now(),
+        );
+        assert!(
+            unverified_notices.is_empty(),
+            "unverified semantics must emit NO threshold notifications"
+        );
+
+        // Even a critical threshold (1% remaining) must be suppressed for unverified semantics
+        let critical_notices = planner2.plan_provider(
+            &view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::UnverifiedSemantics,
+                vec![quota("p_unver", 1.0, "w1")],
+            ),
+            Utc::now(),
+        );
+        assert!(
+            critical_notices.is_empty(),
+            "unverified semantics must emit NO critical threshold notifications"
+        );
+    }
+
+    #[test]
+    fn unverified_pace_and_reset_are_suppressed() {
+        let mut planner = Planner::default();
+        let now = Utc::now();
+        let q_fixed = QuotaNoticeView {
+            pool_id: "p_fixed".into(),
+            window_id: Some("w1".into()),
+            name: "Rolling limit".into(),
+            remaining: Some(50.0),
+            resets_at: Some(now + chrono::Duration::hours(2)),
+            window_start: Some(now - chrono::Duration::hours(1)),
+            window_kind: "fixed".into(),
+        };
+
+        // First observation
+        let _ = planner.plan_provider(
+            &view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::UnverifiedSemantics,
+                vec![q_fixed.clone()],
+            ),
+            now,
+        );
+
+        // Second observation with rapid exhaustion pace
+        let now2 = now + chrono::Duration::minutes(10);
+        let mut q_fixed2 = q_fixed.clone();
+        q_fixed2.remaining = Some(5.0); // fast usage jump
+        let pace_notices = planner.plan_provider(
+            &view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::UnverifiedSemantics,
+                vec![q_fixed2],
+            ),
+            now2,
+        );
+        assert!(
+            !pace_notices.iter().any(|n| n.metric.starts_with("pace:")),
+            "unverified semantics must not emit pace projection notices"
+        );
+
+        // Reset jump to 95% in new window
+        let mut q_reset = q_fixed.clone();
+        q_reset.window_id = Some("w2".into());
+        q_reset.remaining = Some(95.0);
+        let reset_notices = planner.plan_provider(
+            &view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::UnverifiedSemantics,
+                vec![q_reset],
+            ),
+            now2 + chrono::Duration::minutes(5),
+        );
+        assert!(
+            !reset_notices.iter().any(|n| n.metric.starts_with("quota-reset:")),
+            "unverified semantics must not emit reset notices"
+        );
+    }
+
+    #[test]
+    fn mixed_providers_verified_fires_while_unverified_suppressed() {
+        let mut planner = Planner::default();
+        let now = Utc::now();
+
+        // Provider 1: Verified with 15% remaining -> fires 80% threshold notice
+        let v1 = view_with_coverage(
+            ConnectionState::Connected,
+            true,
+            Coverage::Complete,
+            vec![quota("p_verified", 15.0, "w1")],
+        );
+
+        // Provider 2: Unverified with 5% remaining -> suppressed completely
+        let mut v2 = view_with_coverage(
+            ConnectionState::Connected,
+            true,
+            Coverage::UnverifiedSemantics,
+            vec![quota("p_unverified", 5.0, "w1")],
+        );
+        v2.account_id = "a2".into();
+
+        let n1 = planner.plan_provider(&v1, now);
+        let n2 = planner.plan_provider(&v2, now);
+
+        assert_eq!(n1.len(), 1, "verified provider must emit threshold notice");
+        assert_eq!(n1[0].account_id, "a1");
+        assert!(n2.is_empty(), "unverified provider notices must be completely suppressed");
     }
 }

@@ -12,10 +12,11 @@ use usage_providers::strategy::{
 use usage_storage::Storage;
 use uuid::Uuid;
 
-use crate::registry::{Registry, StrategyKind};
+use crate::registry::{facade_policy_for, Registry, StrategyKind};
+use crate::root_resolver::scoped_product_root;
 use crate::snapshot::stale_view_from_lkg;
 
-type InflightKey = (u64, ScopeKey);
+type InflightKey = ScopeKey;
 type InflightMap = HashMap<InflightKey, watch::Sender<Option<RefreshOutcome>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -94,63 +95,74 @@ pub struct Coordinator {
     storage: Arc<Mutex<Storage>>,
     registry: Registry,
     states: Mutex<HashMap<ScopeKey, RefreshState>>,
+    account_cancellations: Mutex<HashMap<Uuid, usage_host::CancellationToken>>,
     inflight: Mutex<InflightMap>,
     semaphore: Arc<Semaphore>,
-    generation: Mutex<u64>,
+    shutdown: usage_host::CancellationToken,
+    #[cfg(test)]
+    pub pre_commit_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Coordinator {
     pub fn new(hosts: Arc<Hosts>, storage: Arc<Mutex<Storage>>) -> Self {
-        let coordinator = Self {
+        Self {
             hosts,
             storage,
             registry: Registry::production(),
             states: Mutex::new(HashMap::new()),
+            account_cancellations: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(policy::REFRESH_PARALLELISM)),
-            generation: Mutex::new(0),
-        };
-        coordinator.restore_persistent_cooldowns();
-        coordinator
-    }
-
-    fn restore_persistent_cooldowns(&self) {
-        let rows = self
-            .storage
-            .lock()
-            .ok()
-            .and_then(|s| s.load_cooldowns().ok())
-            .unwrap_or_default();
-        if rows.is_empty() {
-            return;
-        }
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        for (account_id, source, until_at) in rows {
-            let (Ok(account), Ok(until)) = (
-                account_id.parse::<Uuid>(),
-                until_at.parse::<DateTime<Utc>>(),
-            ) else {
-                continue;
-            };
-            // A persisted source cooldown applies to every matching scope
-            // of the account until a success clears it.
-            for (scope, state) in states.iter_mut() {
-                if scope.account_id == account && scope_source_id(scope) == source {
-                    state.cooldown_until = Some(until);
-                    state.error_code = Some("rate_limited".into());
-                }
-            }
+            shutdown: usage_host::CancellationToken::new(),
+            #[cfg(test)]
+            pre_commit_hook: Mutex::new(None),
         }
     }
 
-    pub fn bump_generation(&self) -> u64 {
-        self.generation
+    /// Permanent shutdown: in-flight transport and file operations
+    /// observe this token and abort; no new work starts afterwards.
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// Cancel active work for one account. The token is retained while the
+    /// account is disabled, so a late refresh trigger cannot restart the
+    /// source before an explicit re-enable creates a fresh token.
+    pub fn cancel_account(&self, account_id: Uuid) {
+        if let Ok(mut cancellations) = self.account_cancellations.lock() {
+            let token = cancellations
+                .entry(account_id)
+                .or_insert_with(usage_host::CancellationToken::new);
+            token.cancel();
+        }
+    }
+
+    /// Clear a prior account cancellation after the account is enabled again.
+    pub fn reset_account_cancellation(&self, account_id: Uuid) {
+        if let Ok(mut cancellations) = self.account_cancellations.lock() {
+            cancellations.remove(&account_id);
+        }
+    }
+
+    fn account_cancellation(&self, account_id: Uuid) -> usage_host::CancellationToken {
+        self.account_cancellations
             .lock()
-            .map(|mut gen| {
-                *gen += 1;
-                *gen
+            .map(|mut cancellations| {
+                cancellations
+                    .entry(account_id)
+                    .or_insert_with(usage_host::CancellationToken::new)
+                    .clone()
             })
-            .unwrap_or(0)
+            .unwrap_or_else(|_| usage_host::CancellationToken::new())
+    }
+
+    /// Combined lifecycle token for history import and other runtime-owned
+    /// work that is not itself a provider refresh.
+    pub fn cancellation_token_for(&self, account_id: Uuid) -> usage_host::CancellationToken {
+        usage_host::CancellationToken::linked([
+            self.shutdown.clone(),
+            self.account_cancellation(account_id),
+        ])
     }
 
     pub fn states_snapshot(&self) -> HashMap<ScopeKey, RefreshState> {
@@ -165,27 +177,19 @@ impl Coordinator {
     }
 
     /// Refresh many scopes with bounded parallelism. One slow provider
-    /// never serializes the whole chain; a newer generation supersedes
-    /// older in-flight work through cancellation checks.
+    /// never serializes the whole chain. Triggers for one scope share a
+    /// single in-flight execution no matter which trigger started it:
+    /// scheduler, manual, tray and wake calls coalesce by scope, so a
+    /// second `refresh_many` for the same scope awaits the running task
+    /// instead of issuing a duplicate source fetch.
     pub async fn refresh_many(
         self: &Arc<Self>,
         requests: Vec<RefreshRequest>,
     ) -> Vec<RefreshOutcome> {
-        let generation = self.bump_generation();
         let mut join_set = tokio::task::JoinSet::new();
         for request in requests {
             let coordinator = Arc::clone(self);
-            let semaphore = coordinator.semaphore.clone();
-            join_set.spawn(async move {
-                let permit = semaphore.acquire_owned().await;
-                match permit {
-                    Ok(permit) => coordinator.refresh_scope(request, generation, permit).await,
-                    Err(_) => {
-                        let scope = request.scope.clone();
-                        coordinator.stale_outcome(&scope, Some(SourceError::Cancelled), vec![])
-                    }
-                }
-            });
+            join_set.spawn(async move { coordinator.refresh_scope(request).await });
         }
         let mut outcomes = vec![];
         while let Some(joined) = join_set.join_next().await {
@@ -197,16 +201,16 @@ impl Coordinator {
         outcomes
     }
 
-    pub async fn refresh_scope(
-        &self,
-        request: RefreshRequest,
-        generation: u64,
-        _permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> RefreshOutcome {
-        let key = (generation, request.scope.clone());
-        // Coalescing: concurrent triggers for one scope share a single
-        // execution instead of stampeding the source.
-        let waiter = self
+    pub async fn refresh_scope(&self, request: RefreshRequest) -> RefreshOutcome {
+        if self.shutdown.is_cancelled() {
+            return self.stale_outcome(&request.scope, Some(SourceError::Cancelled), vec![]);
+        }
+        let key = request.scope.clone();
+        let cancel = self.cancellation_token_for(key.account_id);
+        // Scope-level coalescing is registered before semaphore admission.
+        // The semaphore bounds physical source work; the inflight map bounds
+        // how many source tasks exist in the first place.
+        let registration = self
             .inflight
             .lock()
             .map(|mut inflight| {
@@ -218,26 +222,64 @@ impl Coordinator {
                     None
                 }
             })
-            .unwrap_or(None);
-        if let Some(mut waiter) = waiter {
-            if waiter.wait_for(|outcome| outcome.is_some()).await.is_ok() {
-                let outcome = waiter.borrow().clone();
-                if let Some(outcome) = outcome {
+            .ok()
+            .flatten();
+        if let Some(mut waiter) = registration {
+            if waiter.changed().await.is_ok() {
+                if let Some(outcome) = waiter.borrow().clone() {
                     return outcome;
                 }
             }
-            // Sharing failed; fall through and run directly.
+            // A leader must always publish a result. A closed channel means
+            // the leader was cancelled or panicked; do not start a duplicate
+            // source task after that failure.
+            return self.stale_outcome(&key, Some(SourceError::Cancelled), vec![]);
         }
-        let outcome = self.execute(request, generation).await;
-        if let Ok(mut inflight) = self.inflight.lock() {
-            if let Some(sender) = inflight.remove(&key) {
-                let _ = sender.send(Some(outcome.clone()));
+
+        struct InflightGuard<'a> {
+            inflight: &'a Mutex<InflightMap>,
+            key: &'a ScopeKey,
+            outcome: Option<RefreshOutcome>,
+        }
+        impl<'a> Drop for InflightGuard<'a> {
+            fn drop(&mut self) {
+                if let Ok(mut inflight) = self.inflight.lock() {
+                    if let Some(sender) = inflight.remove(self.key) {
+                        let _ = sender.send(self.outcome.take());
+                    }
+                }
             }
         }
+        let mut guard = InflightGuard {
+            inflight: &self.inflight,
+            key: &key,
+            outcome: None,
+        };
+
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => self.stale_outcome(&key, Some(SourceError::Cancelled), vec![]),
+            permit = self.semaphore.clone().acquire_owned() => match permit {
+                Ok(_permit) => {
+                    if cancel.is_cancelled() {
+                        self.stale_outcome(&key, Some(SourceError::Cancelled), vec![])
+                    } else {
+                        self.execute(request, cancel.clone()).await
+                    }
+                }
+                Err(_) => self.stale_outcome(&key, Some(SourceError::Cancelled), vec![]),
+            },
+        };
+        guard.outcome = Some(outcome.clone());
+        drop(guard);
         outcome
     }
 
-    async fn execute(&self, request: RefreshRequest, generation: u64) -> RefreshOutcome {
+    async fn execute(
+        &self,
+        request: RefreshRequest,
+        cancel: usage_host::CancellationToken,
+    ) -> RefreshOutcome {
         let scope = request.scope.clone();
         self.hosts.logger.info(
             "refresh_scope_start",
@@ -246,6 +288,21 @@ impl Coordinator {
                 ("product", &scope.product_id),
             ],
         );
+        if cancel.is_cancelled() {
+            return self.stale_outcome(&scope, Some(SourceError::Cancelled), vec![]);
+        }
+        let is_disabled = {
+            let account_id = scope.account_id;
+            self.storage
+                .lock()
+                .ok()
+                .and_then(|s| s.get_account(account_id).ok().flatten())
+                .map(|acc| !acc.enabled || matches!(acc.lifecycle, usage_core::AccountLifecycle::Archived))
+                .unwrap_or(true)
+        };
+        if is_disabled {
+            return self.stale_outcome(&scope, Some(SourceError::Cancelled), vec![]);
+        }
         // Identity routing before any fetch: a mismatched credential
         // never attributes foreign data to this account (no auto-merge).
         if let crate::account_router::Routing::Mismatch { observed, .. } =
@@ -256,6 +313,7 @@ impl Coordinator {
                 "identity-router",
                 AttemptStatus::Error,
                 Some("identity_mismatch"),
+                self.hosts.clock.now(),
             );
             if let Ok(mut states) = self.states.lock() {
                 let state = states.entry(scope.clone()).or_default();
@@ -265,6 +323,10 @@ impl Coordinator {
             }
             return self.stale_outcome(&scope, Some(SourceError::IdentityMismatch), vec![attempt]);
         }
+        // Lazy cooldown restoration: a scope created after coordinator
+        // startup still observes persisted provider cooldowns, so a
+        // restart before expiry never re-hits a rate-limited source.
+        self.restore_scope_cooldown(&scope);
         if let Some(until) = self.cooldown_remaining(&scope) {
             let _ = until;
             // Server cooldowns are never bypassed, including by manual triggers.
@@ -279,7 +341,10 @@ impl Coordinator {
         let mut warnings = vec![];
         let mut last_error: Option<SourceError> = None;
         for kind in kinds {
-            if self.current_generation() != generation {
+            // Cooperative cancellation replaces generation polling:
+            // shutdown, disabled sources and removed accounts surface
+            // here; transport/file boundaries observe the same token.
+            if cancel.is_cancelled() {
                 return self.stale_outcome(&scope, Some(SourceError::Cancelled), attempts);
             }
             let strategy = build_strategy(kind, request.custom_root.clone());
@@ -292,6 +357,7 @@ impl Coordinator {
                     &source_id,
                     AttemptStatus::Skipped,
                     Some("source_disabled"),
+                    self.hosts.clock.now(),
                 ));
                 continue;
             }
@@ -306,18 +372,31 @@ impl Coordinator {
                     &source_id,
                     AttemptStatus::Skipped,
                     Some("offline"),
+                    self.hosts.clock.now(),
                 ));
                 last_error = Some(SourceError::Network);
                 continue;
             }
+            let descriptor =
+                usage_providers::descriptor::find_descriptor(&scope.provider_id, &scope.product_id)
+                    .expect("registry covers refreshed scope");
+            let facade = self
+                .hosts
+                .facade(&facade_policy_for(&scope.provider_id, &scope.product_id));
+            let local_root = scoped_product_root(
+                &self.hosts,
+                descriptor,
+                request.custom_root.as_deref(),
+                &cancel,
+            );
             let ctx = FetchContext {
                 account: &request.account,
-                hosts: &self.hosts,
+                facade,
+                descriptor,
                 timeout: policy::SOURCE_TIMEOUT,
-                custom_root: request.custom_root.clone(),
+                local_root,
                 secret: request.secret.clone(),
-                // C4 threads the generation cancellation token through here.
-                cancel: usage_host::CancellationToken::new(),
+                cancel: cancel.clone(),
             };
             match strategy.availability(&ctx).await {
                 Availability::Ready => {}
@@ -327,6 +406,7 @@ impl Coordinator {
                         &source_id,
                         AttemptStatus::Skipped,
                         Some("not_configured"),
+                        self.hosts.clock.now(),
                     ));
                     last_error = Some(SourceError::Unavailable);
                     continue;
@@ -337,6 +417,7 @@ impl Coordinator {
                         &source_id,
                         AttemptStatus::Skipped,
                         Some("source_disabled"),
+                        self.hosts.clock.now(),
                     ));
                     last_error = Some(SourceError::UserDisabled);
                     break;
@@ -347,6 +428,7 @@ impl Coordinator {
                         &source_id,
                         AttemptStatus::Skipped,
                         Some("unsupported_source"),
+                        self.hosts.clock.now(),
                     ));
                     last_error = Some(SourceError::Unavailable);
                     continue;
@@ -364,12 +446,21 @@ impl Coordinator {
                 (Some(payload), _) => {
                     match self.commit_payload(&scope, &request, &source_id, payload) {
                         Ok(outcome) => {
+                            let partial_error = outcome.error.clone();
                             attempts.push(self.record_attempt(
                                 &scope,
                                 &source_id,
-                                AttemptStatus::Ok,
-                                None,
+                                if partial_error.is_some() {
+                                    AttemptStatus::Error
+                                } else {
+                                    AttemptStatus::Ok
+                                },
+                                partial_error.as_ref().map(SourceError::safe_code),
+                                started,
                             ));
+                            if let Some(error) = partial_error {
+                                self.note_failure(&scope, &source_id, &error, started, finished);
+                            }
                             let mut outcome = outcome;
                             outcome.attempts = attempts;
                             return outcome;
@@ -380,6 +471,7 @@ impl Coordinator {
                                 &source_id,
                                 AttemptStatus::Error,
                                 Some(error.safe_code()),
+                                started,
                             ));
                             self.note_failure(&scope, &source_id, &error, started, finished);
                             warnings.push(error.safe_code().to_string());
@@ -394,6 +486,7 @@ impl Coordinator {
                         &source_id,
                         AttemptStatus::Error,
                         Some(error.safe_code()),
+                        started,
                     ));
                     self.note_failure(&scope, &source_id, &error, started, finished);
                     last_error = Some(error.clone());
@@ -415,6 +508,21 @@ impl Coordinator {
         source_id: &str,
         payload: usage_providers::strategy::FetchPayload,
     ) -> Result<RefreshOutcome, SourceError> {
+        let account_id = scope.account_id;
+        if let Ok(cancellations) = self.account_cancellations.lock() {
+            if let Some(token) = cancellations.get(&account_id) {
+                if token.is_cancelled() {
+                    return Err(SourceError::Cancelled);
+                }
+            }
+        }
+        if let Ok(storage) = self.storage.lock() {
+            if let Ok(Some(acc)) = storage.get_account(account_id) {
+                if !acc.enabled || matches!(acc.lifecycle, usage_core::AccountLifecycle::Archived) {
+                    return Err(SourceError::Cancelled);
+                }
+            }
+        }
         let snapshot = payload
             .snapshot
             .ok_or(SourceError::Parse { schema: "snapshot" })?;
@@ -427,11 +535,17 @@ impl Coordinator {
             .map_err(|_| SourceError::Parse { schema: "snapshot" })?;
         let fetched_at = snapshot.fetched_at;
         let observed_at = snapshot.observed_at;
-        let (usage_imported, costs_imported) = self
+        #[cfg(test)]
+        if let Ok(hook_lock) = self.pre_commit_hook.lock() {
+            if let Some(hook) = hook_lock.as_ref() {
+                hook();
+            }
+        }
+        let commit_res = self
             .storage
             .lock()
             .map_err(|_| SourceError::Unavailable)?
-            .commit_refresh_bundle(&usage_storage::RefreshBundle {
+            .commit_refresh_bundle_if_active(&usage_storage::RefreshBundle {
                 account_id: request.account.id,
                 product_id: &scope.product_id,
                 snapshot_payload_json: &payload_json,
@@ -440,14 +554,27 @@ impl Coordinator {
                 usage: &payload.usage,
                 costs: &payload.costs,
             })
-            .map(|report| (report.usage_accepted, report.costs_accepted))
             .map_err(|_| SourceError::Unavailable)?;
-        self.on_success(scope, source_id, &snapshot, payload.schema_fingerprint);
+
+        let report = match commit_res {
+            usage_storage::CommitBundleResult::Committed(rep) => rep,
+            usage_storage::CommitBundleResult::AccountInactive => {
+                return Err(SourceError::Cancelled);
+            }
+            usage_storage::CommitBundleResult::AccountMissing => {
+                return Err(SourceError::Unavailable);
+            }
+        };
+        let (usage_imported, costs_imported) = (report.usage_accepted, report.costs_accepted);
+        let source_error = payload.source_error.clone();
+        if source_error.is_none() {
+            self.on_success(scope, source_id, &snapshot, payload.schema_fingerprint);
+        }
         Ok(RefreshOutcome {
             scope: scope.clone(),
             snapshot: Some(snapshot),
-            stale: false,
-            error: None,
+            stale: source_error.is_some(),
+            error: source_error,
             attempts: vec![],
             warnings: payload.warnings,
             costs_imported,
@@ -538,6 +665,42 @@ impl Coordinator {
             }
         }
         routing
+    }
+
+    /// Lazy per-scope cooldown restoration (P0-09). Memory is
+    /// authoritative once populated; storage is consulted exactly when
+    /// the scope has no live cooldown, which covers scopes created
+    /// after coordinator startup and post-restart scopes alike.
+    fn restore_scope_cooldown(&self, scope: &ScopeKey) {
+        let live = self
+            .states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(scope).and_then(|s| s.cooldown_until));
+        if live.is_some_and(|until| until > self.hosts.clock.now()) {
+            return;
+        }
+        let persisted = self
+            .storage
+            .lock()
+            .ok()
+            .and_then(|s| s.load_cooldowns().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(account_id, source, until_at)| {
+                let account = account_id.parse::<Uuid>().ok()?;
+                let until = until_at.parse::<DateTime<Utc>>().ok()?;
+                (account == scope.account_id
+                    && scope_source_id(scope) == source
+                    && until > self.hosts.clock.now())
+                .then_some(until)
+            })
+            .max();
+        if let (Some(until), Ok(mut states)) = (persisted, self.states.lock()) {
+            let state = states.entry(scope.clone()).or_default();
+            state.cooldown_until = Some(until);
+            state.error_code = Some("rate_limited".into());
+        }
     }
 
     fn cooldown_remaining(&self, scope: &ScopeKey) -> Option<Duration> {
@@ -631,8 +794,11 @@ impl Coordinator {
         source: &str,
         status: AttemptStatus,
         safe_code: Option<&str>,
+        started: DateTime<Utc>,
     ) -> AttemptRecord {
-        let now = self.hosts.clock.now();
+        // Real measured interval: storage and diagnostics see when the
+        // attempt actually ran instead of a fabricated now/now pair.
+        let finished = self.hosts.clock.now();
         let status_str = match status {
             AttemptStatus::Ok => "ok",
             AttemptStatus::Error => "error",
@@ -645,21 +811,17 @@ impl Coordinator {
                 source,
                 status: status_str,
                 safe_code,
-                started_at: now,
-                finished_at: now,
+                started_at: started,
+                finished_at: finished,
             });
         }
         AttemptRecord {
             source: source.to_string(),
             status,
             safe_code: safe_code.map(|s| s.to_string()),
-            started_at: now,
-            finished_at: now,
+            started_at: started,
+            finished_at: finished,
         }
-    }
-
-    fn current_generation(&self) -> u64 {
-        self.generation.lock().map(|g| *g).unwrap_or(0)
     }
 }
 
@@ -697,9 +859,9 @@ fn build_strategy(kind: StrategyKind, custom_root: Option<PathBuf>) -> Box<dyn F
         StrategyKind::ClaudeJsonl => Box::new(usage_providers::claude::ClaudeJsonlStrategy::new(
             custom_root,
         )),
-        StrategyKind::OpenAiCosts => {
-            Box::new(usage_providers::openai_api::OpenAiCostsStrategy { base_url: None })
-        }
+        StrategyKind::OpenAiCosts => Box::new(usage_providers::openai_api::OpenAiCostsStrategy {
+            base_url: custom_root.as_ref().and_then(|p| p.to_str()).map(str::to_string),
+        }),
     }
 }
 
@@ -730,11 +892,18 @@ mod tests {
     impl usage_host::HttpHost for ScriptHttp {
         async fn get_json(
             &self,
-            _req: HttpJsonRequest<'_>,
+            req: HttpJsonRequest<'_>,
         ) -> Result<HttpJsonResponse, usage_host::HostError> {
             *self.calls.lock().unwrap() += 1;
             if self.delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+                tokio::select! {
+                    biased;
+                    _ = req.cancel.cancelled() => return Err(usage_host::HostError::Cancelled),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)) => {}
+                }
+            }
+            if req.cancel.is_cancelled() {
+                return Err(usage_host::HostError::Cancelled);
             }
             match self.respond.lock().unwrap().clone() {
                 ScriptBehavior::CostPage(body) => Ok(HttpJsonResponse {
@@ -748,12 +917,53 @@ mod tests {
     }
 
     fn test_hosts(http: Arc<ScriptHttp>) -> Arc<Hosts> {
+        let files = Arc::new(ScopedFiles);
         Arc::new(Hosts {
             clock: Arc::new(SystemClock),
             logger: Arc::new(NullLogger),
             keychain: Arc::new(MemoryKeychain::default()),
             http,
-            files: Arc::new(ScopedFiles),
+            files: files.clone(),
+            file_scope: files,
+            network: Arc::new(ObservedNetwork::default()),
+        })
+    }
+
+    struct AdjustableClock {
+        now: Mutex<DateTime<Utc>>,
+    }
+
+    impl AdjustableClock {
+        fn new(now: DateTime<Utc>) -> Arc<Self> {
+            Arc::new(Self {
+                now: Mutex::new(now),
+            })
+        }
+
+        fn advance(&self, duration: chrono::Duration) {
+            let mut now = self.now.lock().unwrap();
+            *now += duration;
+        }
+    }
+
+    impl usage_host::ClockHost for AdjustableClock {
+        fn now(&self) -> DateTime<Utc> {
+            *self.now.lock().unwrap()
+        }
+    }
+
+    fn test_hosts_with_clock(
+        http: Arc<ScriptHttp>,
+        clock: Arc<dyn usage_host::ClockHost>,
+    ) -> Arc<Hosts> {
+        let files = Arc::new(ScopedFiles);
+        Arc::new(Hosts {
+            clock,
+            logger: Arc::new(NullLogger),
+            keychain: Arc::new(MemoryKeychain::default()),
+            http,
+            files: files.clone(),
+            file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
         })
     }
@@ -846,7 +1056,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_triggers_coalesce_into_one_execution() {
+    async fn production_triggers_coalesce_into_one_execution() {
         let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
         let http = Arc::new(ScriptHttp {
             respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
@@ -861,41 +1071,306 @@ mod tests {
             provider_id: "openai".into(),
             product_id: "openai-api".into(),
         };
-        let generation = coordinator.bump_generation();
-        let make = || RefreshRequest {
-            scope: scope.clone(),
-            account: acc.clone(),
-            custom_root: None,
-            secret: Some(b"sk-test".to_vec()),
-            trigger: Trigger::Tray,
+        // Two production triggers (scheduler + manual) start together
+        // for one scope: both await the shared task, the strategy runs
+        // exactly once.
+        let first_requests: Vec<_> = (0..(policy::REFRESH_PARALLELISM + 1))
+            .map(|_| RefreshRequest {
+                scope: scope.clone(),
+                account: acc.clone(),
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Scheduled,
+            })
+            .collect();
+        let first = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move { coordinator.refresh_many(first_requests).await })
         };
-        // First trigger starts and parks inside the fetch; the second
-        // trigger arrives while it is still in flight and must share
-        // the execution instead of starting its own.
-        let coordinator_a = coordinator.clone();
-        let permit_a = coordinator.semaphore.clone().acquire_owned().await.unwrap();
-        let request_a = make();
-        let first = tokio::spawn(async move {
-            coordinator_a
-                .refresh_scope(request_a, generation, permit_a)
-                .await
-        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let coordinator_b = coordinator.clone();
-        let permit_b = coordinator.semaphore.clone().acquire_owned().await.unwrap();
-        let request_b = make();
-        let second = tokio::spawn(async move {
-            coordinator_b
-                .refresh_scope(request_b, generation, permit_b)
-                .await
-        });
+        let second = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .refresh_many(vec![RefreshRequest {
+                        scope,
+                        account: acc,
+                        custom_root: None,
+                        secret: Some(b"sk-test".to_vec()),
+                        trigger: Trigger::Manual,
+                    }])
+                    .await
+            })
+        };
         let (first, second) = tokio::join!(first, second);
         let (first, second) = (first.unwrap(), second.unwrap());
-        assert!(first.snapshot.is_some());
-        assert!(second.snapshot.is_some());
-        // One shared execution: a single logical fetch set.
+        assert_eq!(first.len(), policy::REFRESH_PARALLELISM + 1);
+        assert_eq!(second.len(), 1);
+        assert!(first[0].snapshot.is_some());
+        assert!(second[0].snapshot.is_some());
         assert_eq!(*http.calls.lock().unwrap(), 1);
-        assert_eq!(first.costs_imported, 1);
+        assert_eq!(first[0].costs_imported, 1);
+    }
+
+    #[tokio::test]
+    async fn different_scopes_run_in_parallel() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 200,
+        });
+        // NOTE: ScriptHttp serves the same page list to every scope, so
+        // this test uses two API accounts on the same product scope key
+        // shape but different accounts: both must complete, each with
+        // its own execution.
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let acc_a = account("openai", "A");
+        let acc_b = account("openai", "B");
+        storage.lock().unwrap().upsert_account(&acc_a).unwrap();
+        storage.lock().unwrap().upsert_account(&acc_b).unwrap();
+        let outcomes = coordinator
+            .refresh_many(vec![
+                RefreshRequest {
+                    scope: ScopeKey {
+                        account_id: acc_a.id,
+                        provider_id: "openai".into(),
+                        product_id: "openai-api".into(),
+                    },
+                    account: acc_a,
+                    custom_root: None,
+                    secret: Some(b"sk-test".to_vec()),
+                    trigger: Trigger::Scheduled,
+                },
+                RefreshRequest {
+                    scope: ScopeKey {
+                        account_id: acc_b.id,
+                        provider_id: "openai".into(),
+                        product_id: "openai-api".into(),
+                    },
+                    account: acc_b,
+                    custom_root: None,
+                    secret: Some(b"sk-test".to_vec()),
+                    trigger: Trigger::Manual,
+                },
+            ])
+            .await;
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(*http.calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_refresh() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 500,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        let handle = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .refresh_many(vec![RefreshRequest {
+                        scope,
+                        account: acc,
+                        custom_root: None,
+                        secret: Some(b"sk-test".to_vec()),
+                        trigger: Trigger::Scheduled,
+                    }])
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        coordinator.shutdown();
+        let outcomes = handle.await.unwrap();
+        assert!(outcomes.iter().all(|o| o.stale));
+    }
+
+    #[tokio::test]
+    async fn disabling_account_cancels_in_flight_refresh() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 500,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        let account_id = acc.id;
+        let handle = {
+            let coordinator = coordinator.clone();
+            tokio::spawn(async move {
+                coordinator
+                    .refresh_many(vec![RefreshRequest {
+                        scope,
+                        account: acc,
+                        custom_root: None,
+                        secret: Some(b"sk-test".to_vec()),
+                        trigger: Trigger::Scheduled,
+                    }])
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        coordinator.cancel_account(account_id);
+        let outcomes = handle.await.unwrap();
+        assert!(outcomes.iter().all(|o| o.stale));
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o.error, Some(SourceError::Cancelled))));
+        // Active disable must guarantee no commit
+        assert!(storage.lock().unwrap().last_known_good(account_id, "openai-api").unwrap().is_none());
+        assert_eq!(storage.lock().unwrap().storage_status().unwrap().cost_records, 0);
+    }
+
+    #[tokio::test]
+    async fn toctou_pre_commit_disable_aborts_commit_atomically() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 0,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let account_id = acc.id;
+        let scope = ScopeKey {
+            account_id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        // Install hook that runs exactly at the pre-commit boundary after source fetch finishes
+        {
+            let storage_clone = storage.clone();
+            *coordinator.pre_commit_hook.lock().unwrap() = Some(Arc::new(move || {
+                storage_clone
+                    .lock()
+                    .unwrap()
+                    .update_managed_account(account_id, None, Some(false), None)
+                    .unwrap();
+            }));
+        }
+
+        let outcomes = coordinator
+            .refresh_many(vec![RefreshRequest {
+                scope,
+                account: acc,
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Scheduled,
+            }])
+            .await;
+
+        assert!(outcomes.iter().all(|o| o.stale));
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o.error, Some(SourceError::Cancelled))));
+        // Transaction inside storage aborted atomically: zero snapshots and zero cost records committed
+        assert!(storage.lock().unwrap().last_known_good(account_id, "openai-api").unwrap().is_none());
+        assert_eq!(storage.lock().unwrap().storage_status().unwrap().cost_records, 0);
+        assert_eq!(storage.lock().unwrap().storage_status().unwrap().usage_records, 0);
+    }
+
+    #[tokio::test]
+    async fn toctou_pre_commit_delete_aborts_commit_atomically() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 0,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let account_id = acc.id;
+        let scope = ScopeKey {
+            account_id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        // Install hook that deletes account exactly pre-commit
+        {
+            let storage_clone = storage.clone();
+            *coordinator.pre_commit_hook.lock().unwrap() = Some(Arc::new(move || {
+                storage_clone
+                    .lock()
+                    .unwrap()
+                    .delete_account_and_history(account_id)
+                    .unwrap();
+            }));
+        }
+
+        let outcomes = coordinator
+            .refresh_many(vec![RefreshRequest {
+                scope,
+                account: acc,
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Scheduled,
+            }])
+            .await;
+
+        assert!(outcomes.iter().all(|o| o.stale));
+        assert!(outcomes
+            .iter()
+            .all(|o| matches!(o.error, Some(SourceError::Unavailable))));
+        // Zero snapshots or costs committed
+        assert_eq!(storage.lock().unwrap().storage_status().unwrap().cost_records, 0);
+        assert_eq!(storage.lock().unwrap().storage_status().unwrap().usage_records, 0);
+    }
+
+    #[tokio::test]
+    async fn deleting_account_cancels_refresh_without_execution_or_commit() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 200,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        // Delete account from storage and cancel it
+        storage.lock().unwrap().delete_account_and_history(acc.id).unwrap();
+        coordinator.cancel_account(acc.id);
+
+        let outcome = coordinator
+            .refresh_scope(RefreshRequest {
+                scope,
+                account: acc,
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Manual,
+            })
+            .await;
+
+        assert!(outcome.stale);
+        assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
+        assert_eq!(*http.calls.lock().unwrap(), 0, "Deleted account must never make HTTP calls");
     }
 
     #[tokio::test]
@@ -931,6 +1406,52 @@ mod tests {
             .await;
         assert!(matches!(second[0].error, Some(SourceError::Cooldown)));
         assert_eq!(*http.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_cooldown_survives_coordinator_restart_without_real_sleep() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = script_http(ScriptBehavior::RateLimited);
+        let clock = AdjustableClock::new(Utc::now());
+        let hosts = test_hosts_with_clock(http.clone(), clock.clone());
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        let request = || RefreshRequest {
+            scope: scope.clone(),
+            account: acc.clone(),
+            custom_root: None,
+            secret: Some(b"sk-test".to_vec()),
+            trigger: Trigger::Scheduled,
+        };
+
+        let coordinator = Arc::new(Coordinator::new(hosts.clone(), storage.clone()));
+        let first = coordinator.refresh_many(vec![request()]).await;
+        assert!(matches!(
+            first[0].error,
+            Some(SourceError::RateLimited { .. })
+        ));
+        assert_eq!(*http.calls.lock().unwrap(), 1);
+        drop(coordinator);
+
+        // A fresh coordinator lazily restores the persisted server cooldown.
+        let restarted = Arc::new(Coordinator::new(hosts, storage.clone()));
+        let blocked = restarted.refresh_many(vec![request()]).await;
+        assert!(matches!(blocked[0].error, Some(SourceError::Cooldown)));
+        assert_eq!(*http.calls.lock().unwrap(), 1);
+
+        // Advance the injected clock; no wall-clock sleep is involved.
+        clock.advance(chrono::Duration::seconds(61));
+        let after_expiry = restarted.refresh_many(vec![request()]).await;
+        assert!(matches!(
+            after_expiry[0].error,
+            Some(SourceError::RateLimited { .. })
+        ));
+        assert_eq!(*http.calls.lock().unwrap(), 2);
     }
 
     #[test]
@@ -1066,5 +1587,173 @@ mod tests {
             Some(usage_host::fingerprint("openai-api", b"sk-new").as_str())
         );
         assert_eq!(stored.identity_confidence, IdentityConfidence::Weak);
+    }
+
+    #[tokio::test]
+    async fn leader_drop_cleans_up_inflight_and_allows_subsequent_refresh() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 300,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        let make_request = |scope: ScopeKey, acc: Account| RefreshRequest {
+            scope,
+            account: acc,
+            custom_root: None,
+            secret: Some(b"sk-test".to_vec()),
+            trigger: Trigger::Manual,
+        };
+
+        let c1 = coordinator.clone();
+        let r1 = make_request(scope.clone(), acc.clone());
+        let leader_handle = tokio::spawn(async move { c1.refresh_scope(r1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let c2 = coordinator.clone();
+        let r2 = make_request(scope.clone(), acc.clone());
+        let waiter_handle = tokio::spawn(async move { c2.refresh_scope(r2).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        leader_handle.abort();
+
+        let waiter_res = tokio::time::timeout(std::time::Duration::from_secs(1), waiter_handle)
+            .await
+            .expect("waiter must not hang")
+            .unwrap();
+        assert!(matches!(waiter_res.error, Some(SourceError::Cancelled)));
+
+        let r3 = make_request(scope, acc);
+        let next = coordinator.refresh_scope(r3).await;
+        assert!(next.snapshot.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_account_before_first_refresh_installs_tombstone_and_prevents_fetch() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 0,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        // Cancel the account BEFORE any refresh has run or any token was registered
+        coordinator.cancel_account(acc.id);
+
+        let outcome = coordinator
+            .refresh_scope(RefreshRequest {
+                scope,
+                account: acc,
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Scheduled,
+            })
+            .await;
+
+        assert!(outcome.stale);
+        assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
+        assert_eq!(*http.calls.lock().unwrap(), 0, "No network call must be made for cancelled account");
+    }
+
+    #[tokio::test]
+    async fn queued_refresh_cancelled_before_semaphore_admission_does_not_execute() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 200,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+
+        // Saturate the coordinator's semaphore
+        let mut blocker_permits = Vec::new();
+        for _ in 0..policy::REFRESH_PARALLELISM {
+            blocker_permits.push(coordinator.semaphore.clone().acquire_owned().await.unwrap());
+        }
+
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        // Start refresh in background; it will be queued waiting for a semaphore permit
+        let c_clone = coordinator.clone();
+        let acc_clone = acc.clone();
+        let scope_clone = scope.clone();
+        let refresh_handle = tokio::spawn(async move {
+            c_clone
+                .refresh_scope(RefreshRequest {
+                    scope: scope_clone,
+                    account: acc_clone,
+                    custom_root: None,
+                    secret: Some(b"sk-test".to_vec()),
+                    trigger: Trigger::Scheduled,
+                })
+                .await
+        });
+
+        // Cancel the queued account while it is blocked on semaphore
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        coordinator.cancel_account(acc.id);
+
+        // Now release the semaphore permits
+        drop(blocker_permits);
+
+        let outcome = refresh_handle.await.unwrap();
+        assert!(outcome.stale);
+        assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
+        assert_eq!(*http.calls.lock().unwrap(), 0, "Cancelled queued job must not execute upon acquiring permit");
+    }
+
+    #[tokio::test]
+    async fn disabled_account_in_storage_is_cancelled_without_execution() {
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = Arc::new(ScriptHttp {
+            respond: Mutex::new(ScriptBehavior::CostPage(cost_page())),
+            calls: Mutex::new(0),
+            delay_ms: 0,
+        });
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http.clone()), storage.clone()));
+        let acc = account("openai", "API");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        storage.lock().unwrap().update_managed_account(acc.id, None, Some(false), None).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        let outcome = coordinator
+            .refresh_scope(RefreshRequest {
+                scope,
+                account: acc,
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Manual,
+            })
+            .await;
+
+        assert!(outcome.stale);
+        assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
+        assert_eq!(*http.calls.lock().unwrap(), 0);
     }
 }

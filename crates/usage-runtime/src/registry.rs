@@ -40,11 +40,13 @@ pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::fac
         None => FacadePolicy {
             files: false,
             http: false,
+            allowed_hosts: &[],
             keychain_service: None,
         },
         Some(d) => FacadePolicy {
             files: d.local_glob.is_some(),
             http: !d.allowed_hosts.is_empty(),
+            allowed_hosts: d.allowed_hosts,
             keychain_service: matches!(
                 d.account_model,
                 usage_providers::descriptor::AccountModel::ApiKey
