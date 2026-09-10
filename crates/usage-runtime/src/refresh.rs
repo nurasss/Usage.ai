@@ -349,7 +349,12 @@ impl Coordinator {
             if cancel.is_cancelled() {
                 return self.stale_outcome(&scope, Some(SourceError::Cancelled), attempts);
             }
-            let strategy = build_strategy(kind, request.custom_root.clone());
+            let Some(strategy) = build_strategy(&self.hosts, kind, request.custom_root.clone())
+            else {
+                // Structurally inapplicable here (e.g. the App Server
+                // reflects its own home login, never a custom profile).
+                continue;
+            };
             let source_id = strategy.source_id().0.to_string();
             if self.registry.is_disabled(strategy.kill_switch())
                 && !strategy.kill_switch().is_empty()
@@ -525,6 +530,13 @@ impl Coordinator {
                 }
             }
         }
+        // Post-fetch identity routing: a strategy-observed fingerprint
+        // (e.g. App Server login) that contradicts the stored account
+        // discards the payload before any commit — no cross-account
+        // attribution, ever.
+        if let Some(observed) = payload.observed_identity.as_deref() {
+            self.verify_observed_identity(scope, observed)?;
+        }
         let snapshot = payload
             .snapshot
             .ok_or(SourceError::Parse { schema: "snapshot" })?;
@@ -667,6 +679,44 @@ impl Coordinator {
             }
         }
         routing
+    }
+
+    /// Post-fetch identity verification for sources that observe a
+    /// login (App Server, API credentials). Local file sources yield no
+    /// observed identity and skip this gate (history attribution is
+    /// decided per connection at import time instead).
+    fn verify_observed_identity(
+        &self,
+        scope: &ScopeKey,
+        observed: &str,
+    ) -> Result<(), SourceError> {
+        use crate::account_router::{route, Routing};
+        use usage_core::IdentityConfidence;
+
+        let (stored, confidence) = self
+            .storage
+            .lock()
+            .ok()
+            .and_then(|s| s.get_account(scope.account_id).ok())
+            .flatten()
+            .map(|m| (m.external_identity, m.identity_confidence))
+            .unwrap_or((None, IdentityConfidence::Unknown));
+        match route(stored.as_deref(), confidence, Some(observed)) {
+            Routing::Mismatch { .. } => Err(SourceError::IdentityMismatch),
+            Routing::Attributed {
+                confidence: IdentityConfidence::Weak,
+            } if stored.is_none() => {
+                if let Ok(mut storage) = self.storage.lock() {
+                    let _ = storage.set_account_identity(
+                        scope.account_id,
+                        observed,
+                        IdentityConfidence::Weak,
+                    );
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Lazy per-scope cooldown restoration (P0-09). Memory is
@@ -847,26 +897,43 @@ fn scope_source_id(scope: &ScopeKey) -> String {
 
 fn strategy_source_name(kind: &StrategyKind) -> String {
     match kind {
+        StrategyKind::CodexAppServer => "codex-app-server".into(),
         StrategyKind::CodexJsonl => "codex-local-jsonl".into(),
         StrategyKind::ClaudeJsonl => "claude-local-jsonl".into(),
         StrategyKind::OpenAiCosts => "openai-api-costs".into(),
     }
 }
 
-fn build_strategy(kind: StrategyKind, custom_root: Option<PathBuf>) -> Box<dyn FetchStrategy> {
+fn build_strategy(
+    hosts: &Hosts,
+    kind: StrategyKind,
+    custom_root: Option<PathBuf>,
+) -> Option<Box<dyn FetchStrategy>> {
     match kind {
-        StrategyKind::CodexJsonl => {
-            Box::new(usage_providers::codex::CodexJsonlStrategy::new(custom_root))
-        }
-        StrategyKind::ClaudeJsonl => Box::new(usage_providers::claude::ClaudeJsonlStrategy::new(
-            custom_root,
+        // Anti-contamination: the App Server always reflects its own
+        // home login, so it only serves default (non-custom) scopes.
+        // Custom profiles keep their JSONL observation source.
+        StrategyKind::CodexAppServer if custom_root.is_some() => None,
+        StrategyKind::CodexAppServer => Some(Box::new(
+            usage_providers::codex_appserver::CodexAppServerStrategy {
+                executables: crate::registry::resolve_codex_executables(hosts),
+                stub: None,
+            },
         )),
-        StrategyKind::OpenAiCosts => Box::new(usage_providers::openai_api::OpenAiCostsStrategy {
-            base_url: custom_root
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .map(str::to_string),
-        }),
+        StrategyKind::CodexJsonl => Some(Box::new(
+            usage_providers::codex::CodexJsonlStrategy::new(custom_root),
+        )),
+        StrategyKind::ClaudeJsonl => Some(Box::new(
+            usage_providers::claude::ClaudeJsonlStrategy::new(custom_root),
+        )),
+        StrategyKind::OpenAiCosts => {
+            Some(Box::new(usage_providers::openai_api::OpenAiCostsStrategy {
+                base_url: custom_root
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+                    .map(str::to_string),
+            }))
+        }
     }
 }
 
@@ -931,6 +998,8 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
         })
     }
 
@@ -970,6 +1039,8 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
         })
     }
 
@@ -1830,5 +1901,45 @@ mod tests {
         assert!(outcome.stale);
         assert!(matches!(outcome.error, Some(SourceError::Cancelled)));
         assert_eq!(*http.calls.lock().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod app_server_scope_tests {
+    use super::*;
+    use std::sync::Arc;
+    use usage_host::{
+        AllowlistedProcess, AllowlistedPty, MemoryKeychain, NullLogger, ObservedNetwork,
+        ReqwestHttpHost, ScopedFiles, SystemClock,
+    };
+
+    fn bare_hosts() -> Hosts {
+        let files = Arc::new(ScopedFiles);
+        Hosts {
+            clock: Arc::new(SystemClock),
+            logger: Arc::new(NullLogger),
+            keychain: Arc::new(MemoryKeychain::default()),
+            http: Arc::new(ReqwestHttpHost::default()),
+            files: files.clone(),
+            file_scope: files,
+            network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(AllowlistedProcess::default()),
+            pty: Arc::new(AllowlistedPty::default()),
+        }
+    }
+
+    #[test]
+    fn app_server_serves_default_scopes_only() {
+        let hosts = bare_hosts();
+        let strategy = build_strategy(&hosts, StrategyKind::CodexAppServer, None);
+        assert!(strategy.is_some());
+        // A custom profile root must never receive the home login's
+        // quota: the strategy is structurally inapplicable there.
+        let custom = build_strategy(
+            &hosts,
+            StrategyKind::CodexAppServer,
+            Some(PathBuf::from("/tmp/custom-home")),
+        );
+        assert!(custom.is_none());
     }
 }

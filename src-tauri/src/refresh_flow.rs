@@ -231,6 +231,12 @@ fn outcome_to_dto(
         dto.last_successful_refresh = runtime_state.last_success.map(|d| d.to_rfc3339());
         dto.last_refresh_attempt = runtime_state.last_attempt.map(|d| d.to_rfc3339());
     }
+    // Fallback labeling (§9.3.3): codex quotas that did not come from
+    // the verified App Server source are locally observed observations,
+    // never authoritative values.
+    dto.quota_fallback = outcome.scope.product_id == "codex"
+        && !dto.quotas.is_empty()
+        && outcome.selected_source.as_deref() != Some("codex-app-server");
     dto
 }
 
@@ -596,6 +602,7 @@ mod tests {
             current_error: None,
             last_successful_refresh: None,
             last_refresh_attempt: None,
+            quota_fallback: false,
         }
     }
 

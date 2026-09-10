@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod codex_appserver;
 pub mod descriptor;
 pub mod discovery;
 pub mod openai_api;

@@ -48,7 +48,6 @@ pub fn route(
     }
 }
 
-/// Local-history attribution verdict for one source connection.
 /// `observed` is the source-observed identity fingerprint, if the
 /// source provides any. Local JSONL sources currently do not, so they
 /// route purely on the connection's stored confidence.
@@ -123,6 +122,27 @@ mod tests {
             route(Some("fp"), IdentityConfidence::Verified, Some("fp")),
             Routing::Attributed {
                 confidence: IdentityConfidence::Verified
+            }
+        );
+    }
+    #[test]
+    fn post_fetch_mismatch_discards_and_first_seen_persists_weak() {
+        // A contradicted fingerprint must discard, never merge.
+        assert!(matches!(
+            route(Some("fp-a"), IdentityConfidence::Weak, Some("fp-b")),
+            Routing::Mismatch { .. }
+        ));
+        // First sight attributes Weak; a match keeps its confidence.
+        assert_eq!(
+            route(None, IdentityConfidence::Unknown, Some("fp-new")),
+            Routing::Attributed {
+                confidence: IdentityConfidence::Weak
+            }
+        );
+        assert_eq!(
+            route(Some("fp"), IdentityConfidence::Weak, Some("fp")),
+            Routing::Attributed {
+                confidence: IdentityConfidence::Weak
             }
         );
     }

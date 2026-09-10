@@ -465,6 +465,11 @@ async fn test_local_connection(
 
 fn build_strategy(kind: StrategyKind, custom_root: Option<PathBuf>) -> Box<dyn FetchStrategy> {
     match kind {
+        StrategyKind::CodexAppServer => {
+            // Test connections exercise the JSONL observation source;
+            // the App Server is covered by provider-level stub tests.
+            Box::new(usage_providers::codex::CodexJsonlStrategy::new(custom_root))
+        }
         StrategyKind::CodexJsonl => {
             Box::new(usage_providers::codex::CodexJsonlStrategy::new(custom_root))
         }
@@ -502,6 +507,8 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
         }
     }
 

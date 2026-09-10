@@ -430,6 +430,7 @@ impl crate::strategy::FetchStrategy for OpenAiCostsStrategy {
             },
             observed_at,
             source_error,
+            observed_identity: None,
         })
     }
 }
@@ -535,6 +536,8 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(usage_host::ObservedNetwork::default()),
+            process: std::sync::Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: std::sync::Arc::new(usage_host::AllowlistedPty::default()),
         };
         (hosts, http)
     }
@@ -596,6 +599,7 @@ mod tests {
                 http: true,
                 allowed_hosts: OPENAI_API_HOSTS,
                 keychain_service: Some("com.nurasss.usageai"),
+                process: false,
             }),
             timeout: Duration::from_secs(5),
             local_root: None,
@@ -982,12 +986,15 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(usage_host::ObservedNetwork::default()),
+            process: std::sync::Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: std::sync::Arc::new(usage_host::AllowlistedPty::default()),
         };
         let facade = hosts.facade(&usage_host::facade::FacadePolicy {
             files: false,
             http: true,
             allowed_hosts: &["127.0.0.1"],
             keychain_service: Some("com.nurasss.usageai"),
+            process: false,
         });
         let account = test_account();
         let descriptor = crate::descriptor::find_descriptor("openai", "openai-api").unwrap();
@@ -1067,12 +1074,15 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(usage_host::ObservedNetwork::default()),
+            process: std::sync::Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: std::sync::Arc::new(usage_host::AllowlistedPty::default()),
         };
         let facade = hosts.facade(&usage_host::facade::FacadePolicy {
             files: false,
             http: true,
             allowed_hosts: &["127.0.0.1"],
             keychain_service: Some("com.nurasss.usageai"),
+            process: false,
         });
         let account = test_account();
         let descriptor = crate::descriptor::find_descriptor("openai", "openai-api").unwrap();

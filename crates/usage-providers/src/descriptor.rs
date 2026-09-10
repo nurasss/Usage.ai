@@ -48,6 +48,9 @@ pub struct ProductDescriptor {
     /// matches `~/.codex-work`. `None` disables slug discovery.
     pub profile_dir_prefix: Option<&'static str>,
     pub allow_custom_path: bool,
+    /// Product strategies may spawn an allowlisted local executable
+    /// through ProcessHost (e.g. Codex App Server over stdio).
+    pub requires_process: bool,
     pub diagnostics_version: &'static str,
 }
 
@@ -75,12 +78,20 @@ pub const OPENAI_API_CAPS: &[Capability] = &[
 
 pub const NO_CAPS: &[Capability] = &[];
 
-pub const CODEX_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
-    id: "codex-local-jsonl",
-    classification: crate::strategy::SourceClassification::LocalStructuredData,
-    kill_switch: "",
-    version: "v1",
-}];
+pub const CODEX_SOURCES: &[SourceDescriptor] = &[
+    SourceDescriptor {
+        id: "codex-app-server",
+        classification: crate::strategy::SourceClassification::SupportedClientApi,
+        kill_switch: "codex-app-server",
+        version: "v1",
+    },
+    SourceDescriptor {
+        id: "codex-local-jsonl",
+        classification: crate::strategy::SourceClassification::LocalStructuredData,
+        kill_switch: "",
+        version: "v1",
+    },
+];
 
 pub const CLAUDE_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     id: "claude-local-jsonl",
@@ -115,6 +126,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: Some(".codex"),
         profile_dir_prefix: Some(".codex-"),
         allow_custom_path: true,
+        requires_process: true,
         diagnostics_version: "codex-local-v1",
     },
     ProductDescriptor {
@@ -133,6 +145,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: Some(".claude"),
         profile_dir_prefix: Some(".claude-"),
         allow_custom_path: true,
+        requires_process: false,
         diagnostics_version: "claude-local-v1",
     },
     ProductDescriptor {
@@ -151,6 +164,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "openai-api-v1",
     },
     ProductDescriptor {
@@ -169,6 +183,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -187,6 +202,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -205,6 +221,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -223,6 +240,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -241,6 +259,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -259,6 +278,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: None,
         profile_dir_prefix: None,
         allow_custom_path: false,
+        requires_process: false,
         diagnostics_version: "discovery-v1",
     },
 ];
@@ -296,6 +316,7 @@ pub struct ProductDescriptorDto {
     pub allowed_hosts: Vec<String>,
     pub allow_custom_path: bool,
     pub needs_secret: bool,
+    pub requires_process: bool,
     pub local_glob: Option<String>,
     pub local_dir_env: Option<String>,
     pub local_dir_name: Option<String>,
@@ -343,6 +364,7 @@ impl From<&ProductDescriptor> for ProductDescriptorDto {
             allowed_hosts: d.allowed_hosts.iter().map(|h| h.to_string()).collect(),
             allow_custom_path: d.allow_custom_path,
             needs_secret: d.account_model == AccountModel::ApiKey,
+            requires_process: d.requires_process,
             local_glob: d.local_glob.map(str::to_string),
             local_dir_env: d.local_dir_env.map(str::to_string),
             local_dir_name: d.local_dir_name.map(str::to_string),
@@ -417,6 +439,8 @@ mod tests {
         );
         assert_eq!(codex.local_dir_env.as_deref(), Some("CODEX_HOME"));
         assert_eq!(codex.diagnostics_version, "codex-local-v1");
-        assert_eq!(codex.sources[0].id, "codex-local-jsonl");
+        assert_eq!(codex.sources[0].id, "codex-app-server");
+        assert_eq!(codex.sources[1].id, "codex-local-jsonl");
+        assert_eq!(codex.sources[0].kill_switch, "codex-app-server");
     }
 }

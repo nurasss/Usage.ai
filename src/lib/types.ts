@@ -46,6 +46,7 @@ export interface ProviderSnapshot {
   currentError?: string;
   lastSuccessfulRefresh?: string;
   lastRefreshAttempt?: string;
+  quotaFallback?: boolean;
 }
 
 export interface OverviewSegment { label: string; value: number; color: string; }
@@ -103,6 +104,7 @@ export interface ProductDescriptor {
   providerId: string; productId: string; providerName: string; productName: string;
   glyph: string; color: string; capabilities: Capability[]; accountModel: AccountModel;
   allowedHosts: string[]; allowCustomPath: boolean; needsSecret: boolean;
+  requiresProcess?: boolean;
   localGlob?: string; localDirEnv?: string; localDirName?: string;
   profileDirPrefix?: string;
   diagnosticsVersion: string;

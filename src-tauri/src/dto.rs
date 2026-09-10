@@ -106,6 +106,11 @@ pub struct ProviderDto {
     pub last_successful_refresh: Option<String>,
     #[serde(default)]
     pub last_refresh_attempt: Option<String>,
+    /// Quota meters come from the local JSONL observation fallback
+    /// rather than the verified provider source. The UI must label
+    /// them as locally observed, never as authoritative.
+    #[serde(default)]
+    pub quota_fallback: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -288,6 +293,7 @@ pub fn from_snapshot(
         current_error: None,
         last_successful_refresh: None,
         last_refresh_attempt: None,
+        quota_fallback: false,
     }
 }
 
@@ -328,6 +334,7 @@ pub fn unavailable(
         current_error: None,
         last_successful_refresh: None,
         last_refresh_attempt: None,
+        quota_fallback: false,
     }
 }
 
@@ -410,6 +417,9 @@ pub fn source_state(state: &usage_providers::strategy::SourceError) -> Connectio
     match state {
         usage_providers::strategy::SourceError::AuthenticationRequired => {
             ConnectionState::AuthenticationRequired
+        }
+        usage_providers::strategy::SourceError::CredentialExpired => {
+            ConnectionState::SessionExpired
         }
         usage_providers::strategy::SourceError::InsufficientScope => {
             ConnectionState::InsufficientScope

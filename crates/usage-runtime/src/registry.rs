@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Mutex;
+use usage_host::Hosts;
 use usage_providers::descriptor::{all_descriptors, find_descriptor, ProductDescriptorDto};
 
 /// Which strategy implementations serve a product. The ORDER comes
@@ -7,6 +9,7 @@ use usage_providers::descriptor::{all_descriptors, find_descriptor, ProductDescr
 /// a declared source id to its constructor — there is no second list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrategyKind {
+    CodexAppServer,
     CodexJsonl,
     ClaudeJsonl,
     OpenAiCosts,
@@ -14,6 +17,7 @@ pub enum StrategyKind {
 
 pub fn strategy_kind(source_id: &str) -> Option<StrategyKind> {
     match source_id {
+        "codex-app-server" => Some(StrategyKind::CodexAppServer),
         "codex-local-jsonl" => Some(StrategyKind::CodexJsonl),
         "claude-local-jsonl" => Some(StrategyKind::ClaudeJsonl),
         "openai-api-costs" => Some(StrategyKind::OpenAiCosts),
@@ -32,6 +36,47 @@ pub fn strategies_for(provider_id: &str, product_id: &str) -> Vec<StrategyKind> 
         .unwrap_or_default()
 }
 
+/// Resolve the Codex CLI executables through scoped hosts only: static
+/// candidate locations under well-known prefixes plus the user's home.
+/// No PATH lookup, no shell. Returns EVERY candidate proven to exist
+/// as a file inside its scoped parent directory, in static order —
+/// existence is not health, so the App Server strategy health-gates
+/// (`initialize` handshake) and serves the first HEALTHY one. A stale
+/// system shim must never shadow a working user install.
+pub fn resolve_codex_executables(hosts: &Hosts) -> Vec<PathBuf> {
+    use usage_host::CancellationToken;
+    let Some(home) = hosts.file_scope.home_dir() else {
+        return vec![];
+    };
+    let cancel = CancellationToken::new();
+    let mut found_all = vec![];
+    for candidate in usage_providers::codex_appserver::codex_executable_candidates(&home) {
+        let Some(parent) = candidate.parent() else {
+            continue;
+        };
+        let Ok(root) = hosts.file_scope.scope_root(parent, &cancel) else {
+            continue;
+        };
+        let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let found = hosts
+            .files
+            .list_files(&root, name, &cancel)
+            .unwrap_or_default();
+        if !found.is_empty() {
+            found_all.push(candidate);
+        }
+    }
+    found_all
+}
+
+/// First existing candidate, for display/diagnostics only. Never use
+/// for serving: serve via the strategy's health-gated selection.
+pub fn resolve_codex_executable(hosts: &Hosts) -> Option<PathBuf> {
+    resolve_codex_executables(hosts).into_iter().next()
+}
+
 /// Host facade policy derived from exactly one descriptor: a strategy
 /// physically cannot reach hosts its product was not granted.
 pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::facade::FacadePolicy {
@@ -40,12 +85,14 @@ pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::fac
         None => FacadePolicy {
             files: false,
             http: false,
+            process: false,
             allowed_hosts: &[],
             keychain_service: None,
         },
         Some(d) => FacadePolicy {
             files: d.local_glob.is_some(),
             http: !d.allowed_hosts.is_empty(),
+            process: d.requires_process,
             allowed_hosts: d.allowed_hosts,
             keychain_service: matches!(
                 d.account_model,
@@ -165,11 +212,22 @@ mod tests {
         assert_eq!(from_descriptor, strategies_for("openai", "codex"));
     }
     #[test]
+    fn codex_app_server_leads_with_jsonl_fallback() {
+        // Verified provider source first, local observation fallback
+        // second. The runtime walks this order; the fallback never
+        // promotes itself to authoritative.
+        assert_eq!(
+            strategies_for("openai", "codex"),
+            vec![StrategyKind::CodexAppServer, StrategyKind::CodexJsonl]
+        );
+    }
+    #[test]
     fn facade_policy_matches_descriptor_model() {
         let codex = facade_policy_for("openai", "codex");
         assert!(codex.files && !codex.http && codex.keychain_service.is_none());
+        assert!(codex.process);
         let api = facade_policy_for("openai", "openai-api");
-        assert!(!api.files && api.http);
+        assert!(!api.files && api.http && !api.process);
         assert_eq!(api.keychain_service, Some("com.nurasss.usageai"));
         let blocked = facade_policy_for("google", "antigravity");
         assert!(!blocked.files && !blocked.http && blocked.keychain_service.is_none());
@@ -187,5 +245,72 @@ mod tests {
         assert!(registry.is_disabled("x"));
         registry.enable_source("x");
         assert!(!registry.is_disabled("x"));
+    }
+}
+
+#[cfg(test)]
+mod executable_resolution_tests {
+    use super::*;
+    use std::sync::Arc;
+    use usage_host::{
+        FileScopeHost, FilesHost, MemoryKeychain, NullLogger, ObservedNetwork, ReqwestHttpHost,
+        SystemClock,
+    };
+
+    struct SandboxFiles {
+        home: PathBuf,
+    }
+
+    impl FilesHost for SandboxFiles {}
+    impl FileScopeHost for SandboxFiles {
+        fn home_dir(&self) -> Option<PathBuf> {
+            Some(self.home.clone())
+        }
+        fn env_var(&self, _name: &str) -> Option<String> {
+            None
+        }
+    }
+
+    fn sandbox_hosts(home: PathBuf) -> Hosts {
+        let files: Arc<SandboxFiles> = Arc::new(SandboxFiles { home });
+        Hosts {
+            clock: Arc::new(SystemClock),
+            logger: Arc::new(NullLogger),
+            keychain: Arc::new(MemoryKeychain::default()),
+            http: Arc::new(ReqwestHttpHost::default()),
+            files: files.clone(),
+            file_scope: files,
+            network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
+        }
+    }
+
+    #[test]
+    fn resolves_real_binary_through_scoped_hosts() {
+        // Uses the real HOME: on a machine with the Codex CLI installed
+        // in a standard location this finds it; elsewhere it is None.
+        // No PATH lookup, no shell, no execution.
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let hosts = sandbox_hosts(home);
+        let _ = resolve_codex_executable(&hosts);
+    }
+
+    #[test]
+    fn missing_binaries_resolve_to_none() {
+        let home = tempfile::tempdir().unwrap();
+        let hosts = sandbox_hosts(home.path().to_path_buf());
+        assert!(resolve_codex_executable(&hosts).is_none());
+    }
+
+    #[test]
+    fn sandbox_binary_resolves_when_present() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".npm-global").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("codex"), "#!/bin/sh\nexit 0\n").unwrap();
+        let hosts = sandbox_hosts(home.path().to_path_buf());
+        let found = resolve_codex_executable(&hosts).expect("sandbox binary");
+        assert!(found.ends_with(".npm-global/bin/codex"));
     }
 }

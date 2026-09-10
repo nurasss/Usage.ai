@@ -2,6 +2,12 @@
 
 Status: **Partial / UnverifiedSemantics** — parser strategy `codex-local-jsonl` (`LocalStructuredData`) is implemented for the observed `token_count` shape; authoritative request/delta semantics still require a redacted corpus reconciliation.
 
+0. Source order (v1.3): `codex-app-server` (`SupportedClientApi`, kill switch `codex-app-server`) first, `codex-local-jsonl` fallback second. The App Server reflects its own home login and only serves default scopes; custom profiles keep JSONL observation. Fallback quotas render with an explicit locally-observed banner and never become authoritative.
+
+0.0. Executable selection is health-gated, not first-exists-wins: a stale system shim can exist as a file yet never answer RPC (observed: root-owned `/usr/local/bin/codex` with a broken vendor payload EOFs the handshake). Candidates are tried in static order; the first to answer a bounded `initialize` handshake serves. Positive results are cached per process; negatives are never cached so a cold/flaky first launch recovers next refresh. No healthy candidate ⇒ source skipped ⇒ JSONL fallback with banner. Verified live 2026-09-10 against codex-cli 0.144.5 (broken system shim auto-skipped, `~/.npm-global` install served).
+
+0.1. App Server protocol (verified live against codex-cli 0.144.5, read-only): stdio JSON-RPC `initialize` → `account/read` (`refreshToken: false`, never refresh) → `account/rateLimits/read`. Response carries `account{type,planType}` (email never used/stored) and `rateLimits{limitId,primary,secondary,credits,planType}` + `rateLimitsByLimitId` multi-bucket view. Windows carry integer `usedPercent`, `windowDurationMins`, `resetsAt` and are `Fixed` by construction. Exactly one owned child process per logical fetch, killed on timeout/cancel/drop; executable from a static allowlist, no PATH/shell.
+
 0. Current policy: a source `requestId` is used when present, then observed event `ordinal`, then stable `path:offset`; only the first two provide a source identity and neither proves repeated-request semantics. `Coverage::UnverifiedSemantics` is retained until reconciliation. Quota is scanned across all session tails (never newest-file-only); `window_kind` stays `Unknown` until window semantics are proven; `CODEX_HOME` is shared by refresh and import; custom roots are product-scoped.
 
 1. Data: last request tokens, dynamic quota windows, reset timestamp, plan label; credits remain unexposed pending semantics.

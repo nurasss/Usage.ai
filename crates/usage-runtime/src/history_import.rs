@@ -214,6 +214,8 @@ mod connection_tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
         }
     }
 

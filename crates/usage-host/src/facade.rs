@@ -1,5 +1,6 @@
 use super::{
-    ClockHost, FilesHost, HttpHost, KeychainHost, LoggerHost, NetworkHost, ScopedKeychain,
+    ClockHost, FilesHost, HttpHost, KeychainHost, LoggerHost, NetworkHost, ProcessHost,
+    ScopedKeychain,
 };
 
 /// Per-provider host facade. The runtime builds exactly one facade per
@@ -12,6 +13,7 @@ pub struct HostFacade<'a> {
     pub network: &'a dyn NetworkHost,
     pub files: Option<&'a dyn FilesHost>,
     pub http: Option<&'a dyn HttpHost>,
+    pub process: Option<&'a dyn ProcessHost>,
     pub keychain: Option<ScopedKeychain<'a, dyn KeychainHost>>,
     /// The allow-list is descriptor-owned and cannot be selected by a
     /// provider strategy or by an arbitrary URL supplied at runtime.
@@ -24,6 +26,7 @@ pub type ProviderHostFacade<'a> = HostFacade<'a>;
 pub struct FacadePolicy {
     pub files: bool,
     pub http: bool,
+    pub process: bool,
     pub allowed_hosts: &'static [&'static str],
     /// Fixed Keychain service namespace, or `None` for no access.
     pub keychain_service: Option<&'static str>,
@@ -37,6 +40,7 @@ impl super::Hosts {
             network: self.network.as_ref(),
             files: policy.files.then_some(self.files.as_ref()),
             http: policy.http.then_some(self.http.as_ref()),
+            process: policy.process.then_some(self.process.as_ref()),
             keychain: policy
                 .keychain_service
                 .map(|service| ScopedKeychain::new(self.keychain.as_ref(), service)),
@@ -60,6 +64,8 @@ mod tests {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(AllowlistedProcess::default()),
+            pty: Arc::new(AllowlistedPty::default()),
         }
     }
 
@@ -69,6 +75,7 @@ mod tests {
         let facade = hosts.facade(&super::FacadePolicy {
             files: true,
             http: false,
+            process: false,
             allowed_hosts: &[],
             keychain_service: None,
         });
@@ -83,6 +90,7 @@ mod tests {
         let facade = hosts.facade(&super::FacadePolicy {
             files: false,
             http: true,
+            process: false,
             allowed_hosts: &["api.openai.com"],
             keychain_service: Some("com.nurasss.usageai"),
         });
@@ -100,9 +108,27 @@ mod tests {
         let facade = hosts.facade(&super::FacadePolicy {
             files: false,
             http: false,
+            process: false,
             allowed_hosts: &[],
             keychain_service: None,
         });
+        assert!(facade.files.is_none());
+        assert!(facade.http.is_none());
+        assert!(facade.keychain.is_none());
+        assert!(facade.process.is_none());
+    }
+
+    #[test]
+    fn cli_product_gets_process_only() {
+        let hosts = bundle();
+        let facade = hosts.facade(&super::FacadePolicy {
+            files: false,
+            http: false,
+            process: true,
+            allowed_hosts: &[],
+            keychain_service: None,
+        });
+        assert!(facade.process.is_some());
         assert!(facade.files.is_none());
         assert!(facade.http.is_none());
         assert!(facade.keychain.is_none());

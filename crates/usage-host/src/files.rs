@@ -163,6 +163,45 @@ pub trait FilesHost: Send + Sync {
         let start = file.identity.size.saturating_sub(max_bytes as u64);
         self.read_scoped_range(file, start, max_bytes, cancel)
     }
+
+    /// Read one named file under a scoped root (e.g. `auth.json`).
+    /// The relative path must be a single normal segment: no `..`,
+    /// no absolute paths, no separators. The resolved file must
+    /// canonicalize strictly inside the root.
+    fn read_scoped_file(
+        &self,
+        root: &ScopedRoot,
+        name: &str,
+        max_bytes: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<u8>, HostError> {
+        if cancel.is_cancelled() {
+            return Err(HostError::Cancelled);
+        }
+        if name.is_empty()
+            || name.contains("..")
+            || name.contains('/')
+            || name.contains('\\')
+            || std::path::Path::new(name).is_absolute()
+        {
+            return Err(HostError::Policy);
+        }
+        let candidate = root.root.join(name);
+        let canonical = candidate.canonicalize().map_err(|_| HostError::NotFound)?;
+        if !canonical.starts_with(&root.root) || !canonical.is_file() {
+            return Err(HostError::Policy);
+        }
+        let identity = file_identity(&canonical)?;
+        self.read_scoped_range(
+            &ScopedFile {
+                path: canonical,
+                identity,
+            },
+            0,
+            max_bytes,
+            cancel,
+        )
+    }
 }
 
 /// Host-internal root resolution. This raw-path capability is deliberately
@@ -495,5 +534,31 @@ mod tests {
         assert!(found.iter().any(|f| f.path == f2));
         assert!(!found.iter().any(|f| f.path == f3));
         assert!(!found.iter().any(|f| f.path == f4));
+    }
+}
+
+#[cfg(test)]
+mod scoped_file_tests {
+    use super::*;
+    #[test]
+    fn traversal_and_absolute_names_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = ScopedFiles;
+        let root = host
+            .scope_root(dir.path(), &CancellationToken::new())
+            .unwrap();
+        // NOTE: scope_root lives on FileScopeHost; ScopedFiles implements it.
+        for bad in ["../x", "..", "/etc/passwd", "", "a/b", "a\\b"] {
+            assert!(
+                host.read_scoped_file(&root, bad, 64, &CancellationToken::new())
+                    .is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
+        let bytes = host
+            .read_scoped_file(&root, "auth.json", 64, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(bytes, b"{}");
     }
 }

@@ -46,6 +46,7 @@ pub enum Availability {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
     AuthenticationRequired,
+    CredentialExpired,
     InsufficientScope,
     PermissionDenied,
     IdentityMismatch,
@@ -70,6 +71,7 @@ impl SourceError {
                 | SourceError::UserDisabled
                 | SourceError::Cooldown
                 | SourceError::AuthenticationRequired
+                | SourceError::CredentialExpired
                 | SourceError::InsufficientScope
                 | SourceError::Cancelled
         )
@@ -78,6 +80,7 @@ impl SourceError {
     pub fn safe_code(&self) -> &'static str {
         match self {
             SourceError::AuthenticationRequired => "authentication_required",
+            SourceError::CredentialExpired => "credential_expired",
             SourceError::InsufficientScope => "insufficient_scope",
             SourceError::PermissionDenied => "permission_denied",
             SourceError::IdentityMismatch => "identity_mismatch",
@@ -111,6 +114,10 @@ pub struct FetchPayload {
     pub schema_fingerprint: &'static str,
     pub coverage: usage_core::Coverage,
     pub observed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Source-observed account identity fingerprint, when the source
+    /// proves one (never an email, token, or display name). The runtime
+    /// routes on it: mismatch discards the payload without commit.
+    pub observed_identity: Option<String>,
     /// A source may commit a valid partial result while reporting the
     /// failure that stopped pagination. This is intentionally separate from
     /// `Result::Err`: page 1 data must not be discarded when page 2 fails.

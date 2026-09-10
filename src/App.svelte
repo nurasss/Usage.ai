@@ -408,6 +408,7 @@
               </div>
             {/if}
             {#if hasCapability(provider, 'subscriptionQuota') && provider.quotas.length}
+              {#if provider.quotaFallback}<div class="offline-banner" role="note">⚠ Online quota недоступна — показаны локально наблюдаемые значения</div>{/if}
               {#each provider.quotas as quota}
                 <div class="quota">
                   <div class="quota-top"><span>{quota.name}</span><strong>{quota.remainingPercent === undefined ? 'Нет данных' : `Осталось ${quota.remainingPercent}%`}</strong></div>

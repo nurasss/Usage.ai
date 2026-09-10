@@ -414,6 +414,7 @@ impl crate::strategy::FetchStrategy for CodexJsonlStrategy {
             coverage,
             observed_at: observed,
             source_error: None,
+            observed_identity: None,
         })
     }
 }
@@ -636,6 +637,8 @@ mod tests {
             },
             file_scope: Arc::new(usage_host::ScopedFiles),
             network: Arc::new(usage_host::ObservedNetwork::default()),
+            process: std::sync::Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: std::sync::Arc::new(usage_host::AllowlistedPty::default()),
         });
         let account = account();
         let descriptor =
@@ -652,6 +655,7 @@ mod tests {
                 http: false,
                 allowed_hosts: &[],
                 keychain_service: None,
+                process: false,
             }),
             descriptor,
             timeout: std::time::Duration::from_secs(5),
@@ -676,6 +680,7 @@ mod tests {
                 http: false,
                 allowed_hosts: &[],
                 keychain_service: None,
+                process: false,
             }),
             descriptor,
             timeout: std::time::Duration::from_secs(5),

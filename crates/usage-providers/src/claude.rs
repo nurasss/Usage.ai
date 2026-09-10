@@ -319,6 +319,7 @@ impl crate::strategy::FetchStrategy for ClaudeJsonlStrategy {
             coverage: Coverage::UnverifiedSemantics,
             observed_at: None,
             source_error: None,
+            observed_identity: None,
         })
     }
 }

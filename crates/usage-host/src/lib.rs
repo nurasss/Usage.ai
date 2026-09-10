@@ -29,7 +29,10 @@ pub use keychain::KeyringHost;
 pub use keychain::{KeychainHost, MemoryKeychain, ScopedKeychain};
 pub use logger::{LoggerHost, NullLogger, TracingLogger};
 pub use network::{NetworkHost, ObservedNetwork, OnlineState};
-pub use process::{AllowlistedProcess, ProcessHost, SpawnOutput, SpawnRequest};
+pub use process::{
+    AllowlistedProcess, InteractiveChild, InteractiveRequest, ProcessHost, SpawnOutput,
+    SpawnRequest,
+};
 pub use pty::{AllowlistedPty, PTYHost, PtyInput, PtyRequest};
 
 /// Scoped OS access bundle handed to provider strategies.
@@ -45,6 +48,8 @@ pub struct Hosts {
     /// provider `HostFacade`.
     pub file_scope: Arc<dyn FileScopeHost>,
     pub network: Arc<dyn NetworkHost>,
+    pub process: Arc<dyn ProcessHost>,
+    pub pty: Arc<dyn PTYHost>,
 }
 
 impl Default for Hosts {
@@ -58,6 +63,8 @@ impl Default for Hosts {
             files: files.clone(),
             file_scope: files,
             network: Arc::new(ObservedNetwork::default()),
+            process: Arc::new(AllowlistedProcess::default()),
+            pty: Arc::new(AllowlistedPty::default()),
         }
     }
 }
