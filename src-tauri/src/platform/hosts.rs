@@ -10,12 +10,14 @@ pub const KEYCHAIN_SERVICE: &str = "com.nurasss.usageai";
 /// macOS host bundle: native Keychain, scoped files, allow-listed
 /// HTTPS, observed network state, system clock, redacting logger.
 pub fn macos_hosts(network: &ObservedNetwork) -> Arc<Hosts> {
+    let files = Arc::new(ScopedFiles);
     Arc::new(Hosts {
         clock: Arc::new(SystemClock),
         logger: Arc::new(usage_host::TracingLogger),
         keychain: macos_keychain(),
         http: Arc::new(ReqwestHttpHost::default()),
-        files: Arc::new(ScopedFiles),
+        files: files.clone(),
+        file_scope: files,
         network: Arc::new(network.clone()),
     })
 }

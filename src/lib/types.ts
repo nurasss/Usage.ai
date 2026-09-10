@@ -5,7 +5,7 @@ export type ConnectionState =
   | 'UnsupportedSource' | 'ParseError' | 'NetworkError' | 'Offline' | 'UnknownError';
 
 export type Freshness = { kind: 'Fresh' } | { kind: 'Stale'; ageSeconds: number } | { kind: 'Unknown' };
-export type Coverage = 'Complete' | 'Partial' | 'LocalClientOnly' | 'FromConnectionTime' | 'ProviderDelayed' | 'Unknown';
+export type Coverage = 'Complete' | 'Partial' | 'LocalClientOnly' | 'UnverifiedSemantics' | 'FromConnectionTime' | 'ProviderDelayed' | 'Unknown';
 export type Capability = 'subscriptionQuota' | 'quotaResetTime' | 'apiTokens' | 'apiRequests' | 'apiCostReported' | 'apiCostEstimated' | 'balance' | 'credits' | 'modelBreakdown' | 'projectBreakdown' | 'historyRemote' | 'historyLocal' | 'localSessions' | 'multiAccount';
 
 export interface Quota {
@@ -28,6 +28,8 @@ export interface ProviderSnapshot {
   productId: string;
   providerName: string;
   productName: string;
+  glyph?: string;
+  color?: string;
   alias: string;
   planLabel?: string;
   connectionState: ConnectionState;
@@ -41,6 +43,9 @@ export interface ProviderSnapshot {
   reportedCostToday?: { amount: string; currency: string };
   estimatedCostToday?: { amount: string; currency: string };
   balances?: Money[];
+  currentError?: string;
+  lastSuccessfulRefresh?: string;
+  lastRefreshAttempt?: string;
 }
 
 export interface OverviewSegment { label: string; value: number; color: string; }
@@ -60,6 +65,8 @@ export interface AppSnapshot {
   accountBreakdown?: OverviewMap;
   projectBreakdown?: OverviewMap;
   costsByPeriod?: Record<string, ProviderCost[]>;
+  unverifiedOverview?: OverviewMap;
+  excludedUnverifiedCount?: Record<string, number>;
   nextRefreshAt: string;
 }
 
@@ -94,8 +101,10 @@ export type AccountModel = 'localClient' | 'apiKey' | 'discoveryOnly';
 
 export interface ProductDescriptor {
   providerId: string; productId: string; providerName: string; productName: string;
-  glyph: string; capabilities: Capability[]; accountModel: AccountModel;
+  glyph: string; color: string; capabilities: Capability[]; accountModel: AccountModel;
   allowedHosts: string[]; allowCustomPath: boolean; needsSecret: boolean;
+  localGlob?: string; localDirEnv?: string; localDirName?: string;
+  diagnosticsVersion: string;
 }
 
 export interface ImportStats {

@@ -1,15 +1,18 @@
 {
   "name": "usage-ai",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "engines": { "node": ">=20" },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check": "svelte-check --tsconfig ./tsconfig.json && npm run check:version",
+    "check:version": "node scripts/check-version.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "redact:codex": "node scripts/redact-codex.mjs",
+    "redact:claude": "node scripts/redact-claude.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

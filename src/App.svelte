@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { addAccount, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, testConnection, updateAccount } from './lib/api';
   import { formatAge, formatCompact, formatCountdown, stateLabel } from './lib/format';
-  import { applyTheme, navKey } from './lib/ui';
+  import { applyTheme, formatAccountLabel, navKey, providerPresentation } from './lib/ui';
   import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, ProductDescriptor, ProviderSnapshot, Quota, StorageStatus } from './lib/types';
 
   let snapshot: AppSnapshot | null = null;
@@ -21,7 +21,7 @@
   let descriptors: ProductDescriptor[] = [];
   let importStats: ImportStats[] = [];
   let storageStatus: StorageStatus | null = null;
-  let appInfo: AppInfo = { version: '0.1.0', updatesEnabled: false };
+  let appInfo: AppInfo = { version: '1.0.0', updatesEnabled: false };
   let online = typeof navigator === 'undefined' ? true : navigator.onLine;
   let providerFilter = '';
   let newAlias = '';
@@ -37,7 +37,11 @@
   }
 
   function glyphFor(provider: ProviderSnapshot): string {
-    return descriptorFor(provider.providerId, provider.productId)?.glyph ?? providerIcon(provider);
+    return provider.glyph ?? descriptorFor(provider.providerId, provider.productId)?.glyph ?? '•';
+  }
+
+  function colorFor(provider: ProviderSnapshot): string {
+    return provider.color ?? descriptorFor(provider.providerId, provider.productId)?.color ?? '#292929';
   }
 
   function hasCapability(provider: ProviderSnapshot, capability: string): boolean {
@@ -115,13 +119,15 @@
   function productIdOf(selection: string): [string, string] {
     const found = descriptors.find((d) => d.productId === selection);
     if (found) return [found.providerId, found.productId];
-    return newProduct === 'openai-api' ? ['openai', 'openai-api'] : newProduct === 'codex' ? ['openai', 'codex'] : newProduct === 'claude-code' ? ['anthropic', 'claude-code'] : newProduct === 'antigravity' ? ['google', 'antigravity'] : newProduct === 'glm-coding' ? ['zai', 'glm-coding'] : ['opencode', 'zen'];
+    return ['', selection];
   }
 
   async function createAccount() {
     try {
       const [providerId, productId] = productIdOf(newProduct);
-      await addAccount(providerId, productId, newAlias || 'Аккаунт', newSecret || undefined);
+      const descriptor = descriptorFor(providerId, productId);
+      const defaultAlias = descriptor?.accountModel === 'localClient' ? 'Локальная история' : 'Основной';
+      await addAccount(providerId, productId, newAlias || defaultAlias, newSecret || undefined);
       newAlias = ''; newSecret = '';
       accounts = await loadAccounts();
       notice = 'Аккаунт добавлен';
@@ -178,10 +184,6 @@
     return 'normal';
   }
 
-  function providerIcon(provider: ProviderSnapshot): string {
-    return ({ openai: '✣', anthropic: 'A', google: 'G', zai: 'Z', opencode: '◈' } as Record<string, string>)[provider.providerId] ?? '•';
-  }
-
   function modelLabel(value: string | undefined): string {
     return value && value.trim() ? value : 'Модель не определена';
   }
@@ -198,6 +200,7 @@
   $: visibleProviders = snapshot ? snapshot.providers.filter((p) => !providerFilter.trim() || `${p.providerName} ${p.productName} ${p.alias}`.toLowerCase().includes(providerFilter.trim().toLowerCase())) : [];
   $: connectableDescriptors = descriptors.filter((d) => d.accountModel !== 'discoveryOnly');
   $: blockedDescriptors = descriptors.filter((d) => d.accountModel === 'discoveryOnly');
+  $: selectedDescriptor = descriptors.find((d) => d.productId === newProduct);
 </script>
 
 <svelte:head><title>Usage.ai</title></svelte:head>
@@ -264,7 +267,7 @@
               <label><span>{budget.productId} · {budget.amount} {budget.currency}</span><button class="secondary" on:click={() => removeBudget(budget)}>Удалить</button></label>
             {/each}
           {/if}
-          <label><span>Аккаунт</span><select aria-label="Аккаунт бюджета" bind:value={budgetAccount}>{#each accounts as account}<option value={account.id}>{account.label} · {account.productId ?? account.providerId}</option>{/each}</select></label>
+          <label><span>Аккаунт</span><select aria-label="Аккаунт бюджета" bind:value={budgetAccount}>{#each accounts as account}<option value={account.id}>{formatAccountLabel(account.label, account.identityConfidence)} · {account.productId ?? account.providerId}</option>{/each}</select></label>
           <label><span>Сумма</span><input class="number-input" type="number" min="1" step="1" aria-label="Сумма бюджета" bind:value={budgetAmount} /></label>
           <label><span>Валюта</span><input class="shortcut-input" aria-label="Валюта бюджета" bind:value={budgetCurrency} /></label>
           <div class="button-row"><button class="secondary" on:click={createBudget}>Сохранить бюджет</button></div>
@@ -272,8 +275,8 @@
         <div class="setting-group">
           <h2>Аккаунты ({accounts.length})</h2>
           <label><span>Название</span><input class="shortcut-input" aria-label="Название аккаунта" bind:value={newAlias} placeholder="Личный" /></label>
-          <label><span>Продукт</span><select aria-label="Продукт аккаунта" bind:value={newProduct}>{#each connectableDescriptors as option}<option value={option.productId}>{option.providerName} {option.productName}{option.needsSecret ? ' (ключ)' : ' (локально)'}</option>{/each}{#if !connectableDescriptors.length}<option value="openai-api">OpenAI API (ключ)</option><option value="codex">Codex (локально)</option><option value="claude-code">Claude Code (локально)</option>{/if}</select></label>
-          {#if newProduct === 'openai-api'}<label><span>API-ключ</span><input class="shortcut-input" type="password" aria-label="API-ключ" bind:value={newSecret} placeholder="sk-…" /></label>{/if}
+          <label><span>Продукт</span><select aria-label="Продукт аккаунта" bind:value={newProduct}>{#each connectableDescriptors as option}<option value={option.productId}>{option.providerName} {option.productName}{option.needsSecret ? ' (ключ)' : ' (локально)'}</option>{/each}{#if !connectableDescriptors.length}<option value="" disabled>Каталог продуктов недоступен</option>{/if}</select></label>
+          {#if selectedDescriptor?.needsSecret}<label><span>API-ключ</span><input class="shortcut-input" type="password" aria-label="API-ключ" bind:value={newSecret} placeholder="sk-…" /></label>{/if}
           <div class="button-row"><button class="secondary" on:click={createAccount}>Добавить</button></div>
           {#if blockedDescriptors.length}<p class="muted">Discovery: {blockedDescriptors.map((d) => `${d.providerName} ${d.productName}`).join(', ')} — источник не подтверждён, подключение недоступно.</p>{/if}
           {#if testResult}<p class="muted">{testResult}</p>{/if}
@@ -281,7 +284,7 @@
             <p class="muted">Подключённые аккаунты появятся здесь после первого обновления.</p>
           {:else}
             {#each accounts as account}
-              <div class="account-line"><span>{account.label} · {account.productId ?? account.providerId} · {account.enabled ? account.lifecycle : 'выключен'}{account.identityConfidence ? ` · ${account.identityConfidence}` : ''}</span></div>
+              <div class="account-line"><span>{formatAccountLabel(account.label, account.identityConfidence)} · {account.productId ?? account.providerId} · {account.enabled ? account.lifecycle : 'выключен'}{account.identityConfidence ? ` · ${account.identityConfidence}` : ''}</span></div>
               <div class="button-row"><button class="secondary" on:click={() => toggleAccount(account)}>{account.enabled ? 'Выключить' : 'Включить'}</button><button class="secondary" on:click={() => probeAccount(account.id)}>Проверить</button><button class="secondary" on:click={() => dropAccount(account.id, false)}>Архив</button><button class="secondary" on:click={() => dropAccount(account.id, true)}>Удалить</button></div>
             {/each}
           {/if}
@@ -333,6 +336,11 @@
               {#each row.estimated as money}<div class="cost-row"><span>Оценка · {row.label}</span><strong>{money.currency} {money.amount}</strong></div>{/each}
             {/each}
           {/if}
+          {#if (snapshot?.excludedUnverifiedCount?.[period] ?? 0) > 0}
+            <div class="unverified-overview-note" role="note">
+              <span>⚠ Неподтверждённые источники ({snapshot?.excludedUnverifiedCount?.[period] ?? 0}) исключены из авторитарного итога</span>
+            </div>
+          {/if}
         </section>
 
         <div class="section-label">ПРОДУКТЫ</div>
@@ -340,10 +348,24 @@
         {#each visibleProviders as provider (providerKey(provider))}
           <section class="provider-card" id={providerKey(provider)}>
             <div class="provider-head">
-              <div class={`brand ${provider.providerId}`}>{glyphFor(provider)}</div>
-              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{provider.alias} · <i class={`dot ${provider.connectionState}`}></i>{stateLabel(provider.connectionState)}</p></div>
+              <div class="brand" style={`background:${colorFor(provider)}`}>{glyphFor(provider)}</div>
+              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{formatAccountLabel(provider.alias)} · <i class={`dot ${provider.coverage === 'UnverifiedSemantics' ? 'unverified' : provider.connectionState}`}></i>{provider.coverage === 'UnverifiedSemantics' ? 'Семантика не подтверждена' : stateLabel(provider.connectionState)}</p></div>
               {#if provider.planLabel}<span class="plan">{provider.planLabel}</span>{/if}
             </div>
+            {#if provider.coverage === 'UnverifiedSemantics'}
+              <div class="unverified-banner" data-testid="unverified-banner">
+                <strong>⚠ Неподтверждённые данные</strong>
+                <span>Семантика этого источника не подтверждена официальным API/документацией. Данные исключены из сводных итогов.</span>
+              </div>
+            {/if}
+            {#if providerPresentation(provider).stale || providerPresentation(provider).hasCurrentError}
+              <div class="stale-state" role="status">
+                <strong>{providerPresentation(provider).stale ? 'Данные устарели' : 'Источник требует внимания'}</strong>
+                {#if provider.currentError}<span>⚠ {stateLabel(provider.connectionState)}</span>{/if}
+                {#if provider.lastSuccessfulRefresh}<span>Последний успех: {formatAge(provider.lastSuccessfulRefresh, now)}</span>{/if}
+                {#if provider.lastRefreshAttempt}<span>Последняя попытка: {formatAge(provider.lastRefreshAttempt, now)}</span>{/if}
+              </div>
+            {/if}
             {#if hasCapability(provider, 'subscriptionQuota') && provider.quotas.length}
               {#each provider.quotas as quota}
                 <div class="quota">
@@ -357,7 +379,7 @@
             {:else}
               <div class="unavailable"><strong>{stateLabel(provider.connectionState)}</strong><span>Источник не предоставляет подтверждённые quota‑метрики. Нулевое значение не подставлено.</span></div>
             {/if}
-            {#if provider.tokensToday}<div class="cost-row"><span>Токены сегодня</span><strong>{provider.tokensToday.toLocaleString('ru-RU')}</strong></div>{/if}
+            {#if provider.tokensToday}<div class="cost-row"><span>{provider.coverage === 'UnverifiedSemantics' ? 'Токены сегодня (неподтверждённые)' : 'Токены сегодня'}</span><strong>{provider.tokensToday.toLocaleString('ru-RU')}</strong></div>{/if}
             {#if provider.reportedCostToday}<div class="cost-row"><span>Фактические расходы сегодня</span><strong>{provider.reportedCostToday.currency} {provider.reportedCostToday.amount}</strong></div>{/if}
             {#if provider.estimatedCostToday}<div class="cost-row"><span>Оценка расходов сегодня</span><strong>{provider.estimatedCostToday.currency} {provider.estimatedCostToday.amount}</strong></div>{/if}
             {#if provider.balances && provider.balances.length}

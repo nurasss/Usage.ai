@@ -39,6 +39,20 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry, ()>::new("usage-lifecycle")
+                .on_event(|app_handle, event| {
+                    if matches!(
+                        event,
+                        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+                    ) {
+                        if let Some(state) = app_handle.try_state::<AppState>() {
+                            state.coordinator.shutdown();
+                        }
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

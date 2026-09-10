@@ -74,6 +74,7 @@ pub async fn remove_connection_secret(
         .keychain
         .delete(KEYCHAIN_SERVICE, &account_id)
         .await;
+    state.coordinator.cancel_account(id);
     let mut storage = state
         .storage
         .lock()
@@ -128,7 +129,7 @@ pub fn add_account(
     let id = Uuid::new_v4();
     let external_identity = if needs_secret {
         Some(usage_host::fingerprint(
-            "openai-api",
+            descriptor.product_id,
             secret.as_deref().unwrap_or_default().trim().as_bytes(),
         ))
     } else {
@@ -136,12 +137,11 @@ pub fn add_account(
     };
     let connection_ref = if needs_secret {
         Some("keychain:com.nurasss.usageai".into())
-    } else if product_id == "codex" {
-        Some("codex-local".into())
-    } else if product_id == "claude-code" {
-        Some("claude-local".into())
     } else {
-        None
+        descriptor
+            .local_glob
+            .is_some()
+            .then(|| format!("{}-local", descriptor.product_id))
     };
     let managed = ManagedAccount {
         id,
@@ -215,11 +215,20 @@ pub fn update_account(
             custom.as_ref().map(|o| o.as_deref()),
         )
         .map_err(|_| "account_update_failed")?;
-    storage
+    let updated = storage
         .get_account(id)
         .map_err(|_| "accounts_unavailable")?
         .map(|a| managed_account_to_dto(&a))
-        .ok_or_else(|| "account_not_found".into())
+        .ok_or_else(|| "account_not_found".into());
+    drop(storage);
+    if let Some(enabled) = enabled {
+        if enabled {
+            state.coordinator.reset_account_cancellation(id);
+        } else {
+            state.coordinator.cancel_account(id);
+        }
+    }
+    updated
 }
 
 #[tauri::command]
@@ -227,117 +236,33 @@ pub async fn test_connection(
     account_id: String,
     state: tauri::State<'_, AppState>,
 ) -> Result<DiagnosticsDto, String> {
-    use usage_core::{Account, ConnectionState, Coverage, Freshness};
-    use usage_providers::strategy::{Availability, FetchContext};
-
     let id: Uuid = account_id
         .parse()
         .map_err(|_| "invalid_account_id".to_string())?;
-    let managed = state
-        .storage
-        .lock()
-        .map_err(|_| "storage_lock".to_string())?
-        .get_account(id)
-        .map_err(|_| "accounts_unavailable".to_string())?
-        .ok_or_else(|| "account_not_found".to_string())?;
-    let product = managed.product_id.clone().unwrap_or_default();
-    // Required permissions, capabilities, scope and identity preview
-    // are reported before activation (§19.4).
-    let Some(descriptor) = find_descriptor(&managed.provider_id, &product) else {
-        return Err("unsupported_source".into());
-    };
-    if product == "openai-api" {
-        let secret = state
-            .hosts
-            .keychain
-            .read(KEYCHAIN_SERVICE, &managed.id.to_string())
-            .await
-            .map_err(|_| "authentication_required".to_string())?;
-        let probe = Account {
-            id: managed.id,
-            provider_id: managed.provider_id.clone(),
-            external_identity: managed.external_identity.clone(),
-            label: managed.label.clone(),
-            connection_ref: managed.connection_ref.clone(),
-            lifecycle: managed.lifecycle,
-        };
-        let strategy = usage_providers::openai_api::OpenAiCostsStrategy { base_url: None };
-        let ctx = FetchContext {
-            account: &probe,
-            hosts: &state.hosts,
-            timeout: usage_host::policy::SOURCE_TIMEOUT,
-            custom_root: None,
-            secret: Some(secret.expose().to_vec()),
-            cancel: usage_host::CancellationToken::new(),
-        };
-        use usage_providers::strategy::FetchStrategy;
-        let now = chrono::Utc::now();
-        let availability = strategy.availability(&ctx).await;
-        if availability != Availability::Ready {
-            return Err("authentication_required".into());
-        }
-        return match tokio::time::timeout(usage_host::policy::SOURCE_TIMEOUT, strategy.fetch(&ctx))
-            .await
-        {
-            Ok(Ok(payload)) => Ok(DiagnosticsDto {
-                provider: managed.provider_id,
-                product,
-                account_alias: managed.label,
-                selected_source: Some("openai-api-costs".into()),
-                connection_state: ConnectionState::Connected,
-                last_refresh_attempt: Some(now.to_rfc3339()),
-                last_successful_refresh: None,
-                last_data_observed_at: None,
-                freshness: Freshness::Unknown,
-                coverage: payload.coverage,
-                status_class: Some("ok".into()),
-                connector_version: usage_providers::openai_api::OPENAI_API_CONNECTOR_VERSION.into(),
-                parser_version: usage_providers::openai_api::OPENAI_COSTS_PARSER_VERSION.into(),
-                schema_fingerprint: Some(payload.schema_fingerprint.into()),
-                capabilities_detected: descriptor
-                    .capabilities
-                    .iter()
-                    .copied()
-                    .map(crate::dto::capability_name)
-                    .collect(),
-                cooldown_until: None,
-                last_safe_error_code: None,
-                warnings: payload.warnings,
-                recent_attempts: vec![],
-            }),
-            Ok(Err(error)) => Err(error.safe_code().into()),
-            Err(_) => Err("source_timeout".into()),
-        };
-    }
-    if product == "codex" || product == "claude-code" {
-        return Ok(DiagnosticsDto {
-            provider: managed.provider_id,
-            product: product.clone(),
-            account_alias: managed.label,
-            selected_source: Some(format!("{product}-local-jsonl")),
-            connection_state: ConnectionState::Connected,
-            last_refresh_attempt: Some(chrono::Utc::now().to_rfc3339()),
-            last_successful_refresh: None,
-            last_data_observed_at: None,
-            freshness: Freshness::Unknown,
-            coverage: Coverage::LocalClientOnly,
-            status_class: Some("ok".into()),
-            connector_version: format!("{product}-local-v1"),
-            parser_version: format!("{product}-local-v1"),
-            schema_fingerprint: Some(format!("{product}-jsonl-v1")),
-            capabilities_detected: descriptor
-                .capabilities
-                .iter()
-                .copied()
-                .map(crate::dto::capability_name)
-                .collect(),
-            cooldown_until: None,
-            last_safe_error_code: None,
-            warnings: vec![],
-            recent_attempts: vec![],
-        });
-    }
-    Err("unsupported_source".into())
+
+    let diag = usage_runtime::test_connection(&state.hosts, &state.storage, id).await?;
+
+    Ok(DiagnosticsDto {
+        provider: diag.provider,
+        product: diag.product,
+        account_alias: diag.account_alias,
+        selected_source: diag.selected_source,
+        connection_state: diag.connection_state,
+        last_refresh_attempt: diag.last_refresh_attempt,
+        last_successful_refresh: diag.last_successful_refresh,
+        last_data_observed_at: diag.last_data_observed_at,
+        freshness: diag.freshness,
+        coverage: diag.coverage,
+        status_class: diag.status_class,
+        connector_version: diag.connector_version,
+        parser_version: diag.parser_version,
+        schema_fingerprint: diag.schema_fingerprint,
+        capabilities_detected: diag.capabilities_detected,
+        cooldown_until: diag.cooldown_until,
+        last_safe_error_code: diag.last_safe_error_code,
+        warnings: diag.warnings,
+        recent_attempts: vec![],
+    })
 }
 
 #[tauri::command]
@@ -347,6 +272,7 @@ pub fn remove_account(
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let id: Uuid = account_id.parse().map_err(|_| "invalid_account_id")?;
+    state.coordinator.cancel_account(id);
     // Own Keychain secret is removed in both cases; the provider-side
     // account and foreign client credentials are never touched.
     let hosts = state.hosts.clone();

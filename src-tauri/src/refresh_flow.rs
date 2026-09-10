@@ -1,12 +1,10 @@
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{Duration, Local, Utc};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::AppHandle;
-use usage_core::{Account, AccountLifecycle, CostKind};
 use usage_host::NetworkHost;
 use usage_providers::descriptor::{find_descriptor, AccountModel};
-use usage_runtime::{Coordinator, RefreshOutcome, RefreshRequest, ScopeKey, Trigger};
+use usage_runtime::{AccountMeta, Coordinator, RefreshOutcome, RefreshRequest, ScopeKey, Trigger};
 use uuid::Uuid;
 
 use crate::appstate::AppState;
@@ -15,208 +13,25 @@ use crate::dto::{
     ProviderDto,
 };
 
-/// Stable local account ids (v1 compatible, never auto-merged).
-pub fn stable_local_account(namespace: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("usage.ai/local/{namespace}").as_bytes(),
-    )
-}
-
-fn descriptor_default_root(
-    local_dir_env: Option<&str>,
-    local_dir_name: Option<&str>,
-) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let base = match local_dir_env.and_then(std::env::var_os) {
-        Some(custom) => PathBuf::from(custom),
-        None => home.join(local_dir_name?),
-    };
-    Some(base)
-}
-
-/// Product home root for local discovery: explicit custom path wins,
-/// otherwise env override, otherwise `$HOME/<dot-dir>`.
-pub fn product_roots(
-    local_dir_env: Option<&str>,
-    local_dir_name: Option<&str>,
-    custom_path: Option<&str>,
-) -> Vec<PathBuf> {
-    let mut roots = vec![];
-    if let Some(custom) = custom_path.filter(|p| !p.trim().is_empty()) {
-        roots.push(PathBuf::from(custom));
-    }
-    if let Some(default) = descriptor_default_root(local_dir_env, local_dir_name) {
-        if !roots.contains(&default) {
-            roots.push(default);
-        }
-    }
-    roots
-}
-
-pub fn ensure_local_accounts(state: &AppState) {
-    let accounts = [
-        Account {
-            id: stable_local_account("codex"),
-            provider_id: "openai".into(),
-            external_identity: None,
-            label: "Аккаунт 1".into(),
-            connection_ref: Some("codex-local".into()),
-            lifecycle: AccountLifecycle::Active,
-        },
-        Account {
-            id: stable_local_account("claude-code"),
-            provider_id: "anthropic".into(),
-            external_identity: None,
-            label: "Аккаунт 1".into(),
-            connection_ref: Some("claude-local".into()),
-            lifecycle: AccountLifecycle::Active,
-        },
-    ];
-    if let Ok(mut storage) = state.storage.lock() {
-        for account in &accounts {
-            let _ = storage.upsert_account(account);
-        }
-    }
-}
-
-/// Build one refresh request per enabled account/product scope:
-/// stable local scopes, managed local scopes (custom roots), and
-/// managed API scopes (Keychain secret supplied per call only).
+/// Tauri wiring only: provider/account orchestration is owned by
+/// `usage-runtime`, while this module adapts its results to app DTOs.
 pub async fn collect_requests(state: &AppState) -> Vec<(RefreshRequest, AccountMeta)> {
-    ensure_local_accounts(state);
-    let mut out = vec![];
-    out.push((
-        RefreshRequest {
-            scope: ScopeKey {
-                account_id: stable_local_account("codex"),
-                provider_id: "openai".into(),
-                product_id: "codex".into(),
-            },
-            account: Account {
-                id: stable_local_account("codex"),
-                provider_id: "openai".into(),
-                external_identity: None,
-                label: "Аккаунт 1".into(),
-                connection_ref: Some("codex-local".into()),
-                lifecycle: AccountLifecycle::Active,
-            },
-            custom_root: None,
-            secret: None,
-            trigger: Trigger::Scheduled,
-        },
-        AccountMeta {
-            alias: "Аккаунт 1".into(),
-        },
-    ));
-    out.push((
-        RefreshRequest {
-            scope: ScopeKey {
-                account_id: stable_local_account("claude-code"),
-                provider_id: "anthropic".into(),
-                product_id: "claude-code".into(),
-            },
-            account: Account {
-                id: stable_local_account("claude-code"),
-                provider_id: "anthropic".into(),
-                external_identity: None,
-                label: "Аккаунт 1".into(),
-                connection_ref: Some("claude-local".into()),
-                lifecycle: AccountLifecycle::Active,
-            },
-            custom_root: None,
-            secret: None,
-            trigger: Trigger::Scheduled,
-        },
-        AccountMeta {
-            alias: "Аккаунт 1".into(),
-        },
-    ));
-    let managed: Vec<usage_storage::ManagedAccount> = state
-        .storage
-        .lock()
-        .ok()
-        .and_then(|s| s.list_managed_accounts().ok())
-        .unwrap_or_default();
-    for account in managed {
-        if !account.enabled || matches!(account.lifecycle, AccountLifecycle::Archived) {
-            continue;
-        }
-        let product = account.product_id.clone().unwrap_or_default();
-        // Stable local scopes above already cover default roots.
-        if product == "codex" || product == "claude-code" {
-            let custom = account.custom_path.clone().filter(|p| !p.trim().is_empty());
-            if custom.is_none() {
-                continue;
-            }
-            out.push((
-                RefreshRequest {
-                    scope: ScopeKey {
-                        account_id: account.id,
-                        provider_id: account.provider_id.clone(),
-                        product_id: product.clone(),
-                    },
-                    account: Account {
-                        id: account.id,
-                        provider_id: account.provider_id.clone(),
-                        external_identity: account.external_identity.clone(),
-                        label: account.label.clone(),
-                        connection_ref: account.connection_ref.clone(),
-                        lifecycle: account.lifecycle,
-                    },
-                    custom_root: custom.map(PathBuf::from),
-                    secret: None,
-                    trigger: Trigger::Scheduled,
-                },
-                AccountMeta {
-                    alias: account.label.clone(),
-                },
-            ));
-            continue;
-        }
-        if product == "openai-api" {
-            let secret = state
-                .hosts
-                .keychain
-                .read(
-                    crate::platform::hosts::KEYCHAIN_SERVICE,
-                    &account.id.to_string(),
-                )
-                .await
-                .ok()
-                .map(|s| s.expose().to_vec())
-                .filter(|s| !s.is_empty());
-            out.push((
-                RefreshRequest {
-                    scope: ScopeKey {
-                        account_id: account.id,
-                        provider_id: account.provider_id.clone(),
-                        product_id: product.clone(),
-                    },
-                    account: Account {
-                        id: account.id,
-                        provider_id: account.provider_id.clone(),
-                        external_identity: account.external_identity.clone(),
-                        label: account.label.clone(),
-                        connection_ref: account.connection_ref.clone(),
-                        lifecycle: account.lifecycle,
-                    },
-                    custom_root: None,
-                    secret,
-                    trigger: Trigger::Scheduled,
-                },
-                AccountMeta {
-                    alias: account.label.clone(),
-                },
-            ));
-        }
-    }
-    out
+    usage_runtime::collect_requests(state.hosts.as_ref(), state.storage.as_ref()).await
 }
 
-#[derive(Clone)]
-pub struct AccountMeta {
-    pub alias: String,
+/// Tauri wiring only: runtime returns safe import counters; the shell keeps
+/// them in the diagnostics state for the UI.
+pub async fn import_all_history(state: &AppState) {
+    let reports = usage_runtime::import_all_history(
+        &state.hosts,
+        &state.storage,
+        state.coordinator.as_ref(),
+        read_retention_days(state),
+    )
+    .await;
+    if let Ok(mut stats) = state.import_stats.lock() {
+        *stats = reports;
+    }
 }
 
 /// Full refresh: history import, coordinated refresh, snapshot
@@ -255,9 +70,10 @@ pub fn assemble_snapshot(
     outcomes: &[RefreshOutcome],
     metas: &HashMap<ScopeKey, AccountMeta>,
 ) -> AppSnapshot {
+    let states = state.coordinator.states_snapshot();
     let mut providers: Vec<ProviderDto> = outcomes
         .iter()
-        .map(|outcome| outcome_to_dto(outcome, metas))
+        .map(|outcome| outcome_to_dto(outcome, metas, &states))
         .collect();
     // Discovery-only products stay visible as honest blockers, driven
     // by descriptors rather than a hard-coded list.
@@ -281,8 +97,24 @@ pub fn assemble_snapshot(
         attach_usage_and_cost(state, provider);
         attach_balances(state, provider);
     }
-    let (overview, model_breakdown, account_breakdown, project_breakdown) = build_overview(state);
-    let costs_by_period = build_costs_by_period(state, &providers);
+    let aggregate_inputs = providers
+        .iter()
+        .filter_map(|provider| {
+            provider.account_id.parse::<Uuid>().ok().map(|account_id| {
+                usage_runtime::ProviderCostInput {
+                    account_id,
+                    product_id: provider.product_id.clone(),
+                    provider_name: provider.provider_name.clone(),
+                    alias: provider.alias.clone(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let aggregates = state
+        .storage
+        .lock()
+        .map(|storage| usage_runtime::build_aggregates(&storage, &aggregate_inputs))
+        .unwrap_or_default();
     // Local-only sources work without internet; the flag reflects the
     // observed network state, never a hard-coded constant.
     let offline = matches!(state.network.state(), usage_host::OnlineState::Offline);
@@ -290,16 +122,74 @@ pub fn assemble_snapshot(
         mode: "live".into(),
         offline,
         providers,
-        overview,
-        model_breakdown,
-        account_breakdown,
-        project_breakdown,
-        costs_by_period,
+        overview: adapt_segments(aggregates.overview),
+        model_breakdown: adapt_segments(aggregates.model_breakdown),
+        account_breakdown: adapt_segments(aggregates.account_breakdown),
+        project_breakdown: adapt_segments(aggregates.project_breakdown),
+        costs_by_period: aggregates
+            .costs_by_period
+            .into_iter()
+            .map(|(period, rows)| {
+                (
+                    period,
+                    rows.into_iter()
+                        .map(|row| ProviderCostDto {
+                            account_id: row.account_id,
+                            product_id: row.product_id,
+                            label: row.label,
+                            reported: row
+                                .reported
+                                .into_iter()
+                                .map(|money| MoneyDto {
+                                    amount: money.amount,
+                                    currency: money.currency,
+                                })
+                                .collect(),
+                            estimated: row
+                                .estimated
+                                .into_iter()
+                                .map(|money| MoneyDto {
+                                    amount: money.amount,
+                                    currency: money.currency,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+        unverified_overview: adapt_segments(aggregates.unverified_overview),
+        excluded_unverified_count: aggregates.excluded_unverified_count,
         next_refresh_at: (Utc::now() + Duration::minutes(5)).to_rfc3339(),
     }
 }
 
-fn outcome_to_dto(outcome: &RefreshOutcome, metas: &HashMap<ScopeKey, AccountMeta>) -> ProviderDto {
+fn adapt_segments(
+    values: HashMap<String, Vec<usage_runtime::Segment>>,
+) -> HashMap<String, Vec<OverviewSegment>> {
+    values
+        .into_iter()
+        .map(|(period, segments)| {
+            (
+                period,
+                segments
+                    .into_iter()
+                    .map(|segment| OverviewSegment {
+                        label: segment.label,
+                        value: segment.value,
+                        color: segment.color,
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn outcome_to_dto(
+    outcome: &RefreshOutcome,
+    metas: &HashMap<ScopeKey, AccountMeta>,
+    states: &HashMap<ScopeKey, usage_runtime::RefreshState>,
+) -> ProviderDto {
     let descriptor = find_descriptor(&outcome.scope.provider_id, &outcome.scope.product_id);
     let (provider_name, product_name) = descriptor
         .map(|d| (d.provider_name, d.product_name))
@@ -307,8 +197,8 @@ fn outcome_to_dto(outcome: &RefreshOutcome, metas: &HashMap<ScopeKey, AccountMet
     let alias = metas
         .get(&outcome.scope)
         .map(|m| m.alias.as_str())
-        .unwrap_or("Аккаунт 1");
-    match &outcome.snapshot {
+        .unwrap_or("Локальная история");
+    let mut dto = match &outcome.snapshot {
         Some(snapshot) => from_snapshot(snapshot.clone(), provider_name, product_name, alias),
         None => {
             let state = outcome
@@ -327,7 +217,21 @@ fn outcome_to_dto(outcome: &RefreshOutcome, metas: &HashMap<ScopeKey, AccountMet
             dto.alias = alias.into();
             dto
         }
+    };
+    // The snapshot remains the last-known-good payload, while the current
+    // failed attempt is exposed independently and prevents a healthy label.
+    if let Some(error) = &outcome.error {
+        dto.connection_state = crate::dto::source_state(error);
+        dto.current_error = Some(error.safe_code().into());
     }
+    if outcome.stale && !matches!(dto.freshness, usage_core::Freshness::Stale(_)) {
+        dto.freshness = usage_core::Freshness::Stale(0);
+    }
+    if let Some(runtime_state) = states.get(&outcome.scope) {
+        dto.last_successful_refresh = runtime_state.last_success.map(|d| d.to_rfc3339());
+        dto.last_refresh_attempt = runtime_state.last_attempt.map(|d| d.to_rfc3339());
+    }
+    dto
 }
 
 pub fn cache_snapshot(state: &AppState, value: &AppSnapshot) {
@@ -342,57 +246,19 @@ pub fn attach_usage_and_cost(state: &AppState, provider: &mut ProviderDto) {
     let Ok(account_id) = provider.account_id.parse::<Uuid>() else {
         return;
     };
-    let today = Local::now().date_naive();
-    let start_local = local_midnight(today);
-    let end_local = local_midnight(today.succ_opt().unwrap_or(today));
-    let (start, end) = (
-        start_local.with_timezone(&Utc),
-        end_local.with_timezone(&Utc),
-    );
     let Ok(storage) = state.storage.lock() else {
         return;
     };
-    if let Ok(tokens) =
-        storage.tokens_for_account_between(account_id, &provider.product_id, start, end)
-    {
-        if tokens > 0 {
-            provider.tokens_today = Some(tokens);
-        }
-    }
-    if let Ok(costs) = storage.cost_records_between(start, end) {
-        let mut reported: HashMap<String, rust_decimal::Decimal> = HashMap::new();
-        let mut estimated: HashMap<String, rust_decimal::Decimal> = HashMap::new();
-        for record in costs
-            .iter()
-            .filter(|r| r.account_id == account_id && r.product_id == provider.product_id)
-        {
-            let target = if record.kind == CostKind::Reported {
-                &mut reported
-            } else {
-                &mut estimated
-            };
-            *target
-                .entry(record.currency.clone())
-                .or_insert(rust_decimal::Decimal::ZERO) += record.amount_decimal;
-        }
-        for currency in reported.keys().cloned().collect::<Vec<_>>() {
-            estimated.remove(&currency);
-        }
-        if reported.len() == 1 {
-            let (currency, amount) = reported.into_iter().next().unwrap();
-            provider.reported_cost_today = Some(MoneyDto {
-                amount: amount.to_string(),
-                currency,
-            });
-        }
-        if estimated.len() == 1 {
-            let (currency, amount) = estimated.into_iter().next().unwrap();
-            provider.estimated_cost_today = Some(MoneyDto {
-                amount: amount.to_string(),
-                currency,
-            });
-        }
-    }
+    let usage = usage_runtime::account_usage_and_cost_today(&storage, account_id, &provider.product_id);
+    provider.tokens_today = usage.tokens_today;
+    provider.reported_cost_today = usage.reported_cost_today.map(|m| MoneyDto {
+        amount: m.amount,
+        currency: m.currency,
+    });
+    provider.estimated_cost_today = usage.estimated_cost_today.map(|m| MoneyDto {
+        amount: m.amount,
+        currency: m.currency,
+    });
 }
 
 pub fn attach_balances(state: &AppState, provider: &mut ProviderDto) {
@@ -419,289 +285,19 @@ pub fn local_midnight(date: chrono::NaiveDate) -> chrono::DateTime<Local> {
         .unwrap_or_else(Local::now)
 }
 
-pub fn period_ranges() -> Vec<(&'static str, DateTime<Utc>, DateTime<Utc>)> {
-    let today_date = Local::now().date_naive();
-    let today = local_midnight(today_date);
-    let tomorrow = local_midnight(today_date.succ_opt().unwrap_or(today_date));
-    let yesterday = local_midnight(today_date.pred_opt().unwrap_or(today_date));
-    let week = local_midnight(
-        today_date
-            .checked_sub_signed(Duration::days(6))
-            .unwrap_or(today_date),
-    );
-    let month = local_midnight(
-        today_date
-            .checked_sub_signed(Duration::days(29))
-            .unwrap_or(today_date),
-    );
-    vec![
-        (
-            "today",
-            today.with_timezone(&Utc),
-            tomorrow.with_timezone(&Utc),
-        ),
-        (
-            "yesterday",
-            yesterday.with_timezone(&Utc),
-            today.with_timezone(&Utc),
-        ),
-        (
-            "7days",
-            week.with_timezone(&Utc),
-            tomorrow.with_timezone(&Utc),
-        ),
-        (
-            "30days",
-            month.with_timezone(&Utc),
-            tomorrow.with_timezone(&Utc),
-        ),
-    ]
-}
-
-#[allow(clippy::type_complexity)]
-pub fn build_overview(
-    state: &AppState,
-) -> (
-    HashMap<String, Vec<OverviewSegment>>,
-    HashMap<String, Vec<OverviewSegment>>,
-    HashMap<String, Vec<OverviewSegment>>,
-    HashMap<String, Vec<OverviewSegment>>,
-) {
-    let mut result = HashMap::new();
-    let mut models: HashMap<String, Vec<OverviewSegment>> = HashMap::new();
-    let mut accounts: HashMap<String, Vec<OverviewSegment>> = HashMap::new();
-    let mut projects: HashMap<String, Vec<OverviewSegment>> = HashMap::new();
-    if let Ok(storage) = state.storage.lock() {
-        for (key, start, end) in period_ranges() {
-            let rows = storage.token_totals_between(start, end).unwrap_or_default();
-            result.insert(
-                key.to_string(),
-                rows.into_iter()
-                    .map(|(product, value)| OverviewSegment {
-                        label: match product.as_str() {
-                            "codex" => "Codex".into(),
-                            "claude-code" => "Claude Code".into(),
-                            other => other.into(),
-                        },
-                        value,
-                        color: match product.as_str() {
-                            "codex" => "#ff7a5c",
-                            "claude-code" => "#b895ff",
-                            _ => "#46c9a7",
-                        }
-                        .into(),
-                    })
-                    .collect(),
-            );
-            let model_rows = storage.model_totals_between(start, end).unwrap_or_default();
-            models.insert(
-                key.to_string(),
-                model_rows
-                    .into_iter()
-                    .map(|(model, value)| OverviewSegment {
-                        label: model
-                            .filter(|m| !m.trim().is_empty())
-                            .unwrap_or_else(|| "Модель не определена".into()),
-                        value,
-                        color: "#8ea2ff".into(),
-                    })
-                    .collect(),
-            );
-            let account_rows = storage
-                .account_product_totals_between(start, end)
-                .unwrap_or_default();
-            accounts.insert(
-                key.to_string(),
-                account_rows
-                    .into_iter()
-                    .map(|(alias, _id, product, value)| OverviewSegment {
-                        label: format!("{alias} · {product}"),
-                        value,
-                        color: "#e0a44f".into(),
-                    })
-                    .collect(),
-            );
-            let project_rows = storage
-                .project_totals_between(start, end)
-                .unwrap_or_default();
-            projects.insert(
-                key.to_string(),
-                project_rows
-                    .into_iter()
-                    .map(|(scope, value)| OverviewSegment {
-                        label: scope
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or_else(|| "Без проекта".into()),
-                        value,
-                        color: "#5fb3a1".into(),
-                    })
-                    .collect(),
-            );
-        }
-    }
-    (result, models, accounts, projects)
-}
-
-/// Per-period reported/estimated cost summaries. The period selector
-/// drives these backend queries — the UI never relabels one range as
-/// another.
-pub fn build_costs_by_period(
-    state: &AppState,
-    providers: &[ProviderDto],
-) -> HashMap<String, Vec<ProviderCostDto>> {
-    let mut out: HashMap<String, Vec<ProviderCostDto>> = HashMap::new();
-    let Ok(storage) = state.storage.lock() else {
-        return out;
-    };
-    for (key, start, end) in period_ranges() {
-        let costs = storage.cost_records_between(start, end).unwrap_or_default();
-        let mut rows = vec![];
-        for provider in providers {
-            let Ok(account_id) = provider.account_id.parse::<Uuid>() else {
-                continue;
-            };
-            let mut reported: HashMap<String, rust_decimal::Decimal> = HashMap::new();
-            let mut estimated: HashMap<String, rust_decimal::Decimal> = HashMap::new();
-            for record in costs
-                .iter()
-                .filter(|r| r.account_id == account_id && r.product_id == provider.product_id)
-            {
-                let target = if record.kind == CostKind::Reported {
-                    &mut reported
-                } else {
-                    &mut estimated
-                };
-                *target
-                    .entry(record.currency.clone())
-                    .or_insert(rust_decimal::Decimal::ZERO) += record.amount_decimal;
-            }
-            for currency in reported.keys().cloned().collect::<Vec<_>>() {
-                estimated.remove(&currency);
-            }
-            if reported.is_empty() && estimated.is_empty() {
-                continue;
-            }
-            let mut reported_list: Vec<MoneyDto> = reported
-                .into_iter()
-                .map(|(currency, amount)| MoneyDto {
-                    amount: amount.to_string(),
-                    currency,
-                })
-                .collect();
-            reported_list.sort_by(|a, b| a.currency.cmp(&b.currency));
-            let mut estimated_list: Vec<MoneyDto> = estimated
-                .into_iter()
-                .map(|(currency, amount)| MoneyDto {
-                    amount: amount.to_string(),
-                    currency,
-                })
-                .collect();
-            estimated_list.sort_by(|a, b| a.currency.cmp(&b.currency));
-            rows.push(ProviderCostDto {
-                account_id: provider.account_id.clone(),
-                product_id: provider.product_id.clone(),
-                label: format!("{} · {}", provider.provider_name, provider.alias),
-                reported: reported_list,
-                estimated: estimated_list,
-            });
-        }
-        out.insert(key.to_string(), rows);
-    }
-    out
-}
-
-/// Scoped history import across descriptor roots plus user custom
-/// paths. Warnings and counters feed import diagnostics.
-pub async fn import_all_history(state: &AppState) {
-    use usage_providers::{claude::ClaudeLocalAdapter, codex::CodexLocalAdapter};
-
-    let managed: Vec<usage_storage::ManagedAccount> = state
-        .storage
-        .lock()
-        .ok()
-        .and_then(|s| s.list_managed_accounts().ok())
-        .unwrap_or_default();
-    for descriptor in usage_providers::descriptor::all_descriptors()
-        .iter()
-        .filter(|d| d.account_model == AccountModel::LocalClient)
-    {
-        let mut roots = product_roots(descriptor.local_dir_env, descriptor.local_dir_name, None);
-        for account in managed.iter().filter(|a| {
-            a.enabled
-                && a.product_id.as_deref() == Some(descriptor.product_id)
-                && a.custom_path
-                    .as_deref()
-                    .is_some_and(|p| !p.trim().is_empty())
-        }) {
-            if let Some(custom) = account.custom_path.clone() {
-                let path = PathBuf::from(&custom);
-                if !roots.contains(&path) {
-                    roots.push(path);
-                }
-            }
-        }
-        let Some(glob_pattern) = descriptor.local_glob else {
-            continue;
-        };
-        // Stable local account attribution for default roots; custom
-        // roots attribute to their managed account histories below.
-        let (adapter, account): (Box<dyn usage_core::ProviderAdapter>, Account) =
-            match descriptor.product_id {
-                "codex" => (
-                    Box::new(CodexLocalAdapter::default()),
-                    Account {
-                        id: stable_local_account("codex"),
-                        provider_id: "openai".into(),
-                        external_identity: None,
-                        label: "Аккаунт 1".into(),
-                        connection_ref: Some("codex-local".into()),
-                        lifecycle: AccountLifecycle::Active,
-                    },
-                ),
-                _ => (
-                    Box::new(ClaudeLocalAdapter::default()),
-                    Account {
-                        id: stable_local_account("claude-code"),
-                        provider_id: "anthropic".into(),
-                        external_identity: None,
-                        label: "Аккаунт 1".into(),
-                        connection_ref: Some("claude-local".into()),
-                        lifecycle: AccountLifecycle::Active,
-                    },
-                ),
-            };
-        let report = usage_runtime::import_product(
-            &state.hosts,
-            &state.storage,
-            adapter.as_ref(),
-            &account,
-            roots,
-            glob_pattern,
-            1,
-        )
-        .await;
-        if let Ok(mut stats) = state.import_stats.lock() {
-            stats.insert(descriptor.product_id.to_string(), report);
-        }
-    }
-    // Retention covers every category; active checkpoints are kept.
-    if let Ok(mut storage) = state.storage.lock() {
-        let days = read_retention_days(state);
-        let _ = storage.prune_retention(Utc::now() - Duration::days(days));
-    }
-}
-
 fn read_retention_days(state: &AppState) -> i64 {
     crate::commands::settings::read_settings(state)
         .retention_days
         .max(30) as i64
 }
 
-/// Primary tray metric: minimum remaining percent across fresh quotas.
+/// Primary tray metric: minimum remaining percent across fresh, authoritative quotas.
+/// Providers with UnverifiedSemantics or other non-authoritative coverage are excluded
+/// so they never render as an authoritative menu-bar metric.
 pub fn primary_remaining(providers: &[ProviderDto]) -> Option<f64> {
     providers
         .iter()
-        .filter(|p| p.freshness == usage_core::Freshness::Fresh)
+        .filter(|p| p.freshness == usage_core::Freshness::Fresh && p.coverage.allows_tray_metric())
         .flat_map(|p| p.quotas.iter())
         .filter_map(|q| q.remaining_percent)
         .fold(None, |min: Option<f64>, value| {
@@ -711,4 +307,366 @@ pub fn primary_remaining(providers: &[ProviderDto]) -> Option<f64> {
 
 pub fn coordinator_of(state: &AppState) -> Arc<Coordinator> {
     Arc::clone(&state.coordinator)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use usage_core::{
+        Capability, ConnectionState, Coverage, Freshness, MetricUnit, Quota, Snapshot, WindowKind,
+    };
+    use usage_providers::strategy::SourceError;
+    use usage_runtime::{RefreshOutcome, RefreshState, ScopeKey};
+    use uuid::Uuid;
+
+    #[test]
+    fn swr_outcome_to_dto_preserves_lkg_with_stale_and_current_error() {
+        // Step 1: Initial successful refresh -> LKG snapshot created
+        let scope = ScopeKey {
+            account_id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+        };
+        let mut metas = HashMap::new();
+        metas.insert(
+            scope.clone(),
+            AccountMeta {
+                alias: "Локальная история".into(),
+            },
+        );
+
+        let quota = Quota {
+            pool_id: "codex-weekly".into(),
+            window_id: None,
+            name: "Weekly".into(),
+            used_percent: Some(rust_decimal::Decimal::new(28, 0)),
+            remaining_percent: Some(rust_decimal::Decimal::new(72, 0)),
+            used: Some(28),
+            limit: Some(100),
+            unit: MetricUnit::Percent,
+            resets_at: Some(Utc::now() + Duration::days(3)),
+            window_start: None,
+            window_kind: WindowKind::Rolling,
+            source: "Codex local".into(),
+        };
+
+        let initial_snapshot = Snapshot {
+            account_id: scope.account_id,
+            provider_id: scope.provider_id.clone(),
+            product_id: scope.product_id.clone(),
+            plan_label: Some("Plus".into()),
+            capabilities: [Capability::SubscriptionQuota].into_iter().collect(),
+            quotas: vec![quota],
+            balances: vec![],
+            observed_at: Some(Utc::now() - Duration::minutes(18)),
+            fetched_at: Utc::now() - Duration::minutes(18),
+            connection_state: ConnectionState::Connected,
+            freshness: Freshness::Fresh,
+            coverage: Coverage::UnverifiedSemantics,
+        };
+
+        let success_outcome = RefreshOutcome {
+            scope: scope.clone(),
+            snapshot: Some(initial_snapshot.clone()),
+            stale: false,
+            error: None,
+            attempts: vec![],
+            warnings: vec![],
+            costs_imported: 0,
+            usage_imported: 0,
+            selected_source: Some("codex-local-jsonl".into()),
+            schema_fingerprint: Some("v1".into()),
+        };
+
+        let mut states = HashMap::new();
+        states.insert(
+            scope.clone(),
+            RefreshState {
+                last_success: Some(Utc::now() - Duration::minutes(18)),
+                last_attempt: Some(Utc::now() - Duration::minutes(18)),
+                ..Default::default()
+            },
+        );
+
+        let dto_initial = outcome_to_dto(&success_outcome, &metas, &states);
+        assert_eq!(dto_initial.connection_state, ConnectionState::Connected);
+        assert_eq!(dto_initial.freshness, Freshness::Fresh);
+        assert!(dto_initial.current_error.is_none());
+        assert_eq!(dto_initial.quotas.len(), 1);
+        assert_eq!(dto_initial.quotas[0].remaining_percent, Some(72.0));
+
+        // Step 2 & 3: Next refresh fails with NetworkError -> serves stale LKG
+        let mut stale_lkg = initial_snapshot;
+        stale_lkg.freshness = Freshness::Stale(1080);
+
+        let failed_outcome = RefreshOutcome {
+            scope: scope.clone(),
+            snapshot: Some(stale_lkg),
+            stale: true,
+            error: Some(SourceError::Network),
+            attempts: vec![],
+            warnings: vec![],
+            costs_imported: 0,
+            usage_imported: 0,
+            selected_source: None,
+            schema_fingerprint: None,
+        };
+
+        states.insert(
+            scope.clone(),
+            RefreshState {
+                last_success: Some(Utc::now() - Duration::minutes(18)),
+                last_attempt: Some(Utc::now()),
+                error_code: Some("network_error".into()),
+                ..Default::default()
+            },
+        );
+
+        let dto_stale = outcome_to_dto(&failed_outcome, &metas, &states);
+
+        // Step 4: returned DTO contains old metric values
+        assert_eq!(dto_stale.quotas.len(), 1);
+        assert_eq!(dto_stale.quotas[0].remaining_percent, Some(72.0));
+
+        // Step 5: stale == true
+        assert!(matches!(dto_stale.freshness, Freshness::Stale(_)));
+
+        // Step 6: current error present
+        assert_eq!(dto_stale.current_error, Some("network_error".into()));
+        assert_eq!(dto_stale.connection_state, ConnectionState::NetworkError);
+        assert!(dto_stale.last_successful_refresh.is_some());
+        assert!(dto_stale.last_refresh_attempt.is_some());
+    }
+
+    #[tokio::test]
+    async fn e2e_refresh_flow_refresh_to_storage_to_dto() {
+        use std::sync::{Arc, Mutex};
+        use usage_host::{async_trait, HostError, HttpHost, HttpJsonRequest, HttpJsonResponse, Hosts};
+        use usage_runtime::{Coordinator, RefreshRequest, Trigger};
+        use usage_storage::Storage;
+
+        struct TestHttp {
+            body: String,
+        }
+
+        #[async_trait]
+        impl HttpHost for TestHttp {
+            async fn get_json(
+                &self,
+                _req: HttpJsonRequest<'_>,
+            ) -> Result<HttpJsonResponse, HostError> {
+                Ok(HttpJsonResponse {
+                    status: 200,
+                    retry_after_secs: None,
+                    body: Some(serde_json::from_str(&self.body).unwrap()),
+                })
+            }
+        }
+
+        let now = chrono::Utc::now();
+        let start_time = (now - chrono::Duration::hours(2)).timestamp();
+        let end_time = now.timestamp();
+        let body = format!(
+            r#"{{
+            "object": "page",
+            "has_more": false,
+            "next_page": null,
+            "data": [{{
+                "object": "bucket",
+                "start_time": {start_time},
+                "end_time": {end_time},
+                "results": [{{
+                    "object": "organization.costs.result",
+                    "amount": {{"value": 12.34, "currency": "usd"}},
+                    "line_item": "gpt-4o",
+                    "project_id": "proj_123"
+                }}]
+            }}]
+        }}"#
+        );
+
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let hosts = Hosts {
+            http: Arc::new(TestHttp { body }),
+            ..Default::default()
+        };
+        let coordinator = Arc::new(Coordinator::new(Arc::new(hosts), storage.clone()));
+
+        let secret = b"sk-test-secret-12345".to_vec();
+        let fp = usage_host::fingerprint("openai-api", &secret);
+        let account = usage_core::Account {
+            id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            external_identity: Some(fp),
+            label: "Production API".into(),
+            connection_ref: Some("keychain:openai:test".into()),
+            lifecycle: usage_core::AccountLifecycle::Active,
+        };
+        storage.lock().unwrap().upsert_account(&account).unwrap();
+
+        let scope = ScopeKey {
+            account_id: account.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+
+        let request = RefreshRequest {
+            scope: scope.clone(),
+            account: account.clone(),
+            custom_root: None,
+            secret: Some(secret),
+            trigger: Trigger::Manual,
+        };
+
+        let outcome = coordinator.refresh_scope(request).await;
+
+        // Verify outcome was successful and not stale
+        assert_eq!(outcome.error, None);
+        assert!(!outcome.stale, "outcome was stale: {:?}", outcome);
+        assert_eq!(outcome.costs_imported, 1);
+
+        // Verify SQLite storage has the exact decimal money record
+        let costs = storage
+            .lock()
+            .unwrap()
+            .cost_records_between(
+                chrono::Utc::now() - chrono::Duration::days(30),
+                chrono::Utc::now() + chrono::Duration::days(1),
+            )
+            .unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(
+            costs[0].amount_decimal,
+            rust_decimal::Decimal::from_str_exact("12.34").unwrap()
+        );
+        assert_eq!(costs[0].currency, "USD");
+
+        // Verify DTO adaptation
+        let mut metas = HashMap::new();
+        metas.insert(
+            scope.clone(),
+            AccountMeta {
+                alias: "Production API".into(),
+            },
+        );
+        let states = coordinator.states_snapshot();
+        let dto = outcome_to_dto(&outcome, &metas, &states);
+        assert_eq!(dto.connection_state, ConnectionState::Connected);
+        assert_eq!(dto.freshness, Freshness::Fresh);
+        assert!(dto.current_error.is_none());
+    }
+
+    fn sample_provider(coverage: Coverage, remaining: f64) -> ProviderDto {
+        ProviderDto {
+            account_id: Uuid::new_v4().to_string(),
+            provider_id: "test".into(),
+            product_id: "test-prod".into(),
+            provider_name: "Test".into(),
+            product_name: "TestProd".into(),
+            glyph: "T".into(),
+            color: "#fff".into(),
+            alias: "Test".into(),
+            plan_label: None,
+            connection_state: ConnectionState::Connected,
+            freshness: Freshness::Fresh,
+            coverage,
+            fetched_at: "2026-09-09T00:00:00Z".into(),
+            observed_at: None,
+            capabilities: vec![],
+            quotas: vec![crate::dto::QuotaDto {
+                pool_id: "default".into(),
+                window_id: Some("w1".into()),
+                name: "Quota".into(),
+                remaining_percent: Some(remaining),
+                used: Some((100.0 - remaining) as u64),
+                limit: Some(100),
+                unit: "percent".into(),
+                resets_at: None,
+                window_start: None,
+                window_kind: "rolling".into(),
+                source: "test".into(),
+            }],
+            tokens_today: None,
+            reported_cost_today: None,
+            estimated_cost_today: None,
+            balances: vec![],
+            current_error: None,
+            last_successful_refresh: None,
+            last_refresh_attempt: None,
+        }
+    }
+
+    #[test]
+    fn tray_metric_selection_cases_a_b_c_d() {
+        // Case A — verified source (Coverage::Complete) with remaining 20%
+        let p_verified = sample_provider(Coverage::Complete, 20.0);
+        assert_eq!(
+            primary_remaining(std::slice::from_ref(&p_verified)),
+            Some(20.0),
+            "Case A: verified provider must be eligible for tray metric"
+        );
+
+        // Case B — unverified source (Coverage::UnverifiedSemantics) with remaining 20%
+        let p_unverified = sample_provider(Coverage::UnverifiedSemantics, 20.0);
+        assert_eq!(
+            primary_remaining(std::slice::from_ref(&p_unverified)),
+            None,
+            "Case B: unverified provider must NOT be eligible for ordinary tray metric"
+        );
+
+        // Case C — mixed: verified = 63%, unverified = 20%
+        let p_ver_63 = sample_provider(Coverage::Complete, 63.0);
+        let p_unver_20 = sample_provider(Coverage::UnverifiedSemantics, 20.0);
+        assert_eq!(
+            primary_remaining(&[p_ver_63, p_unver_20]),
+            Some(63.0),
+            "Case C: verified provider (63%) must be chosen; unverified (20%) must not override"
+        );
+
+        // Case D — only unverified quota available
+        let p_unver_only = sample_provider(Coverage::UnverifiedSemantics, 15.0);
+        assert_eq!(
+            primary_remaining(&[p_unver_only]),
+            None,
+            "Case D: only unverified quota available must yield None (no numeric metric in tray)"
+        );
+    }
+
+    #[test]
+    fn full_side_effect_regression_unverified_semantics_produces_no_authoritative_side_effects() {
+        // Input snapshot: Fresh + Connected + UnverifiedSemantics + 20% remaining
+        let p = sample_provider(Coverage::UnverifiedSemantics, 20.0);
+
+        // 1. Tray check: DOES NOT show normal 20%
+        let tray = primary_remaining(std::slice::from_ref(&p));
+        assert!(
+            tray.is_none(),
+            "tray must NOT show normal 20% for unverified source"
+        );
+
+        // 2. Notification evaluator check: emits none
+        let notice_view = usage_runtime::ProviderNoticeView {
+            account_id: p.account_id.clone(),
+            provider_name: p.provider_name.clone(),
+            product_name: p.product_name.clone(),
+            connection_state: p.connection_state.clone(),
+            fresh: true,
+            coverage: p.coverage,
+            quotas: vec![usage_runtime::QuotaNoticeView {
+                pool_id: "default".into(),
+                window_id: Some("w1".into()),
+                name: "Quota".into(),
+                remaining: Some(20.0),
+                resets_at: None,
+                window_start: None,
+                window_kind: "rolling".into(),
+            }],
+        };
+        let mut planner = usage_runtime::Planner::default();
+        let notices = planner.plan_provider(&notice_view, chrono::Utc::now());
+        assert!(
+            notices.is_empty(),
+            "notifications must emit NONE for unverified provider"
+        );
+    }
 }

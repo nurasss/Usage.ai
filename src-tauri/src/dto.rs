@@ -57,6 +57,10 @@ pub struct AppSnapshot {
     pub project_breakdown: HashMap<String, Vec<OverviewSegment>>,
     #[serde(default)]
     pub costs_by_period: HashMap<String, Vec<ProviderCostDto>>,
+    #[serde(default)]
+    pub unverified_overview: HashMap<String, Vec<OverviewSegment>>,
+    #[serde(default)]
+    pub excluded_unverified_count: HashMap<String, u64>,
     pub next_refresh_at: String,
 }
 
@@ -78,6 +82,8 @@ pub struct ProviderDto {
     pub product_id: String,
     pub provider_name: String,
     pub product_name: String,
+    pub glyph: String,
+    pub color: String,
     pub alias: String,
     pub plan_label: Option<String>,
     pub connection_state: ConnectionState,
@@ -92,6 +98,14 @@ pub struct ProviderDto {
     pub estimated_cost_today: Option<MoneyDto>,
     #[serde(default)]
     pub balances: Vec<MoneyDto>,
+    /// Refresh metadata is independent from the snapshot payload. This
+    /// lets SWR expose a current failure alongside last-known-good data.
+    #[serde(default)]
+    pub current_error: Option<String>,
+    #[serde(default)]
+    pub last_successful_refresh: Option<String>,
+    #[serde(default)]
+    pub last_refresh_attempt: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -222,12 +236,19 @@ pub fn from_snapshot(
     product_name: &str,
     alias: &str,
 ) -> ProviderDto {
+    let descriptor = usage_providers::descriptor::find_descriptor(&s.provider_id, &s.product_id);
+    let glyph = descriptor.map(|descriptor| descriptor.glyph).unwrap_or("•");
+    let color = descriptor
+        .map(|descriptor| descriptor.color)
+        .unwrap_or("#8ea2ff");
     ProviderDto {
         account_id: s.account_id.to_string(),
         provider_id: s.provider_id,
         product_id: s.product_id,
         provider_name: provider_name.into(),
         product_name: product_name.into(),
+        glyph: glyph.into(),
+        color: color.into(),
         alias: alias.into(),
         plan_label: s.plan_label,
         connection_state: s.connection_state,
@@ -264,6 +285,9 @@ pub fn from_snapshot(
                 currency: b.currency,
             })
             .collect(),
+        current_error: None,
+        last_successful_refresh: None,
+        last_refresh_attempt: None,
     }
 }
 
@@ -280,6 +304,14 @@ pub fn unavailable(
         product_id: product_id.into(),
         provider_name: provider_name.into(),
         product_name: product_name.into(),
+        glyph: usage_providers::descriptor::find_descriptor(provider_id, product_id)
+            .map(|descriptor| descriptor.glyph)
+            .unwrap_or("•")
+            .into(),
+        color: usage_providers::descriptor::find_descriptor(provider_id, product_id)
+            .map(|descriptor| descriptor.color)
+            .unwrap_or("#8ea2ff")
+            .into(),
         alias: "Не подключено".into(),
         plan_label: None,
         connection_state: state,
@@ -293,6 +325,9 @@ pub fn unavailable(
         reported_cost_today: None,
         estimated_cost_today: None,
         balances: vec![],
+        current_error: None,
+        last_successful_refresh: None,
+        last_refresh_attempt: None,
     }
 }
 

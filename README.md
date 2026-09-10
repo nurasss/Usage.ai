@@ -28,8 +28,8 @@ file target/x86_64-apple-darwin/release/bundle/macos/Usage.ai.app/Contents/MacOS
 
 ## Текущий статус интеграций (v1.1)
 
-- Codex: стратегия `codex-local-jsonl` — квоты из всех session-хвостов и история токенов как request-delta.
-- Claude Code: стратегия `claude-local-jsonl` — история с дедупом `message.id + requestId`; квоты подписки заблокированы (нет подтверждённого источника).
+- Codex: стратегия `codex-local-jsonl` — квоты из всех session-хвостов и история токенов как request-delta; реальная форма `token_count` проверяется opt-in probe, семантика delta/request остаётся `UnverifiedSemantics` до redacted corpus reconciliation.
+- Claude Code: стратегия `claude-local-jsonl` — история с reducer по `message.id + requestId`/UUID и раздельными cache read/creation buckets; квоты подписки заблокированы (нет подтверждённого источника).
 - OpenAI API: один fetch на refresh (snapshot + costs в одной транзакции), bounded-пагинация; активируется типизированной Admin-конфигурацией, иначе честный `NotConfigured`.
 - Остальные продукты: `DiscoveryOnly`, метрики не выдумываются (Gate A: новых private-источников до закрытия P0 нет).
 - Архитектура: `usage-runtime` (коалесцинг, bounded-параллелизм, отмена, SWR last-known-good, персистентные кулдауны), `usage-host` (scoped доступ к ОС), дескрипторы как единый источник UI.

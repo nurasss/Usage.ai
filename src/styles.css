@@ -20,6 +20,8 @@ h1 { margin: 3px 0 0; font-size: 23px; letter-spacing: -.03em; } h2 { margin: 0;
 .refresh { border: 1px solid var(--line); background: var(--card); width: 34px; height: 34px; border-radius: 12px; cursor: pointer; font-size: 17px; }
 .spinning { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 .demo-banner, .offline-banner { font-size: 10px; line-height: 1.4; color: #725c2c; background: #fff6d9; border: 1px solid #efdda4; border-radius: 9px; padding: 7px 9px; margin-bottom: 11px; }
+.stale-state { display: flex; flex-wrap: wrap; gap: 4px 8px; margin: 10px 0 2px; padding: 8px 9px; border: 1px solid #efc6a3; border-radius: 9px; background: #fff5ec; color: #8a4a25; font-size: 9px; line-height: 1.35; }
+.stale-state strong { width: 100%; }
 .demo-banner span { font-size: 8px; font-weight: 800; color: white; background: #d59b21; border-radius: 4px; padding: 2px 4px; margin-right: 4px; }
 .offline-banner { color: #5c6270; background: #eef0f4; border-color: #d9dde5; }
 .overview-card, .provider-card, .setting-group { background: var(--card); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 2px 12px rgba(55,45,35,.045); }
@@ -34,9 +36,12 @@ h1 { margin: 3px 0 0; font-size: 23px; letter-spacing: -.03em; } h2 { margin: 0;
 .empty-metric { min-height: 94px; display: flex; flex-direction: column; justify-content: center; gap: 4px; }.empty-metric span { color: var(--muted); font-size: 10px; }
 .section-label { margin: 18px 4px 8px; color: #96918a; font-size: 9px; font-weight: 800; letter-spacing: .14em; }
 .provider-card { padding: 14px; margin-bottom: 10px; scroll-margin-top: 14px; }.provider-head { display: flex; align-items: center; gap: 9px; }
-.brand { width: 31px; height: 31px; flex: 0 0 auto; border-radius: 10px; display: grid; place-items: center; color: white; font-weight: 800; background: #292929; }.brand.anthropic { background: #b87858; }.brand.google { background: #4c82ee; }.brand.zai { background: #694bd7; }.brand.opencode { background: #2f9277; }
+.brand { width: 31px; height: 31px; flex: 0 0 auto; border-radius: 10px; display: grid; place-items: center; color: white; font-weight: 800; background: #292929; }
 .provider-name { min-width: 0; }.provider-name h2 span { font-weight: 450; color: #77726d; }.provider-name p { margin: 3px 0 0; color: var(--muted); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin: 0 3px 0 2px; background: #909090; }.dot.Connected { background: #34ad7c; }.dot.InsufficientScope, .dot.PermissionDenied { background: #e3a62b; }.dot.NetworkError, .dot.AuthenticationRequired, .dot.SessionExpired { background: #e45c55; }
+.dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin: 0 3px 0 2px; background: #909090; }.dot.Connected { background: #34ad7c; }.dot.InsufficientScope, .dot.PermissionDenied { background: #e3a62b; }.dot.NetworkError, .dot.AuthenticationRequired, .dot.SessionExpired { background: #e45c55; }.dot.unverified { background: #e3a62b; }
+.unverified-banner { display: flex; flex-direction: column; gap: 3px; margin: 10px 0 4px; padding: 8px 10px; border: 1px solid #e3a62b; border-radius: 9px; background: #fffaf0; color: #8a5a00; font-size: 9px; line-height: 1.35; }
+.unverified-banner strong { font-weight: 700; }
+.unverified-overview-note { font-size: 9px; color: #8a5a00; background: #fffaf0; border: 1px solid #f0dfb8; border-radius: 7px; padding: 6px 9px; margin-top: 10px; line-height: 1.35; }
 .plan { margin-left: auto; align-self: flex-start; font-size: 8px; font-weight: 700; background: #f2f0ec; color: #6f6a64; padding: 4px 7px; border-radius: 99px; }
 .quota { margin-top: 14px; }.quota + .quota { padding-top: 12px; border-top: 1px solid #f1eee9; }.quota-top { display: flex; justify-content: space-between; font-size: 10px; }.quota-top strong { font-weight: 700; }
 .progress { position: relative; height: 7px; background: #eceae6; border-radius: 99px; margin-top: 8px; }.progress > div { height: 100%; border-radius: inherit; background: #39b985; }.progress.warning > div { background: #e7ad31; }.progress.critical > div, .progress.exhausted > div { background: #e35f58; }.progress.neutral > div { background: #aaa; }

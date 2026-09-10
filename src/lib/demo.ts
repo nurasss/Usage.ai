@@ -36,7 +36,7 @@ export const demoSnapshot: AppSnapshot = {
   },
   providers: [
     {
-      accountId: 'demo-codex', providerId: 'openai', productId: 'codex', providerName: 'OpenAI', productName: 'Codex', alias: 'Аккаунт 1', planLabel: 'Plus',
+      accountId: 'demo-codex', providerId: 'openai', productId: 'codex', providerName: 'OpenAI', productName: 'Codex', alias: 'Локальная история', planLabel: 'Plus',
       connectionState: 'Connected', freshness: { kind: 'Fresh' }, coverage: 'LocalClientOnly', fetchedAt: new Date(now - 55_000).toISOString(),
       capabilities: ['subscriptionQuota', 'quotaResetTime', 'apiTokens', 'historyLocal', 'localSessions'], tokensToday: 184_200,
       quotas: [
@@ -58,4 +58,3 @@ export const demoSnapshot: AppSnapshot = {
     }
   ]
 };
-

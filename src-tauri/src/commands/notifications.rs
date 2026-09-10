@@ -25,6 +25,7 @@ pub fn deliver(app: &AppHandle, state: &AppState, snapshot: &AppSnapshot) {
             product_name: p.product_name.clone(),
             connection_state: p.connection_state.clone(),
             fresh: p.freshness == usage_core::Freshness::Fresh,
+            coverage: p.coverage,
             quotas: p
                 .quotas
                 .iter()
@@ -111,6 +112,7 @@ fn deliver_budget_notices(app: &AppHandle, state: &AppState) {
                                 && r.product_id == budget.product_id
                                 && r.currency == budget.currency
                                 && r.kind == CostKind::Reported
+                                && r.coverage.is_authoritative()
                         })
                         .map(|r| r.amount_decimal)
                         .sum()
