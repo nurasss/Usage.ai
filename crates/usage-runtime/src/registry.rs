@@ -203,6 +203,9 @@ impl Registry {
                 .unwrap_or(false)
     }
 
+    // collect() over cloned() is intentional here: HashSet has no
+    // to_vec with the Vec target type.
+    #[allow(clippy::iter_cloned_collect)]
     pub fn disabled_sources(&self) -> Vec<String> {
         self.disabled_switches
             .lock()

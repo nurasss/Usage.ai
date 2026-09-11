@@ -892,6 +892,9 @@ mod tests {
         }
     }
 
+    // collect() over cloned() is intentional here: slices of tuples
+    // collect into a HashMap, not a Vec.
+    #[allow(clippy::iter_cloned_collect)]
     fn script(responses: &[(u64, serde_json::Value)]) -> ScriptServer {
         ScriptServer {
             responses: Mutex::new(responses.iter().cloned().collect()),

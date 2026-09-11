@@ -2329,9 +2329,7 @@ mod quota_tests {
                 &self,
                 req: usage_host::SpawnRequest<'_>,
             ) -> Result<usage_host::SpawnOutput, usage_host::HostError> {
-                self.seen_remove.lock().unwrap().push(
-                    req.env_remove.iter().cloned().collect(),
-                );
+                self.seen_remove.lock().unwrap().push(req.env_remove.to_vec());
                 Ok(usage_host::SpawnOutput {
                     status_code: Some(0),
                     stdout: br#"{"loggedIn":true,"authMethod":"oauth"}"#.to_vec(),
