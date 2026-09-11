@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { addAccount, connectCandidate, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, ignoreCandidate, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, scanCandidates, testConnection, updateAccount } from './lib/api';
+  import { addAccount, connectCandidate, copyDiagnostics, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, ignoreCandidate, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, scanCandidates, testConnection, updateAccount } from './lib/api';
   import { formatAge, formatCompact, formatCountdown, stateLabel } from './lib/format';
   import { applyTheme, formatAccountLabel, navKey, providerPresentation } from './lib/ui';
   import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, ProductDescriptor, ProfileCandidate, ProviderSnapshot, Quota, StorageStatus } from './lib/types';
@@ -109,6 +109,16 @@
   async function exportDiag() {
     try { notice = await exportDiagnostics(); }
     catch { notice = 'Экспорт отменён'; }
+    window.setTimeout(() => notice = '', 3000);
+  }
+
+  async function copyDiag(accountId: string) {
+    try {
+      const text = await copyDiagnostics(accountId);
+      await navigator.clipboard.writeText(text);
+      notice = 'Диагностика скопирована (секреты вырезаны)';
+    }
+    catch { notice = 'Копирование отменено'; }
     window.setTimeout(() => notice = '', 3000);
   }
 
@@ -336,7 +346,7 @@
             <p class="muted">Нет данных. Обновите панель, затем вернитесь сюда.</p>
           {:else}
             {#each diagnostics as item}
-              <details><summary>{item.provider} / {item.product} · {stateLabel(item.connectionState)}</summary><dl><div><dt>Аккаунт</dt><dd>{item.accountAlias}</dd></div><div><dt>Источник</dt><dd>{item.selectedSource ?? '—'}</dd></div><div><dt>Покрытие</dt><dd>{item.coverage}</dd></div><div><dt>Схема</dt><dd>{item.schemaFingerprint ?? '—'}</dd></div><div><dt>Коннектор</dt><dd>{item.connectorVersion} · {item.parserVersion}</dd></div><div><dt>Ошибка</dt><dd>{item.lastSafeErrorCode ?? '—'}</dd></div><div><dt>Кулдаун</dt><dd>{item.cooldownUntil ?? '—'}</dd></div>{#if item.warnings?.length}<div><dt>Предупреждения</dt><dd>{item.warnings.join('; ')}</dd></div>{/if}{#if item.recentAttempts?.length}<div><dt>Попытки</dt><dd>{item.recentAttempts.map((a) => `${a.source}:${a.status}`).join(', ')}</dd></div>{/if}</dl></details>
+              <details><summary>{item.provider} / {item.product} · {stateLabel(item.connectionState)}</summary><dl><div><dt>Аккаунт</dt><dd>{item.accountAlias}</dd></div><div><dt>Источник</dt><dd>{item.selectedSource ?? '—'}</dd></div><div><dt>Покрытие</dt><dd>{item.coverage}</dd></div><div><dt>Схема</dt><dd>{item.schemaFingerprint ?? '—'}</dd></div><div><dt>Коннектор</dt><dd>{item.connectorVersion} · {item.parserVersion}</dd></div><div><dt>Ошибка</dt><dd>{item.lastSafeErrorCode ?? '—'}</dd></div><div><dt>Кулдаун</dt><dd>{item.cooldownUntil ?? '—'}</dd></div>{#if item.warnings?.length}<div><dt>Предупреждения</dt><dd>{item.warnings.join('; ')}</dd></div>{/if}{#if item.recentAttempts?.length}<div><dt>Попытки</dt><dd>{item.recentAttempts.map((a) => `${a.source}:${a.status}${a.latencyMs !== undefined ? ` ${a.latencyMs}ms` : ''}`).join(', ')}</dd></div>{/if}</dl></details>
             {/each}
           {/if}
         </div>
@@ -390,7 +400,7 @@
           <section class="provider-card" id={providerKey(provider)}>
             <div class="provider-head">
               <div class="brand" style={`background:${colorFor(provider)}`}>{glyphFor(provider)}</div>
-              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{formatAccountLabel(provider.alias)} · <i class={`dot ${provider.coverage === 'UnverifiedSemantics' ? 'unverified' : provider.connectionState}`}></i>{provider.coverage === 'UnverifiedSemantics' ? 'Семантика не подтверждена' : stateLabel(provider.connectionState)}</p></div>
+              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{formatAccountLabel(provider.alias, provider.identityConfidence)} · <i class={`dot ${provider.coverage === 'UnverifiedSemantics' ? 'unverified' : provider.connectionState}`}></i>{provider.coverage === 'UnverifiedSemantics' ? 'Семантика не подтверждена' : stateLabel(provider.connectionState)}</p></div>
               {#if provider.planLabel}<span class="plan">{provider.planLabel}</span>{/if}
             </div>
             {#if provider.coverage === 'UnverifiedSemantics'}
@@ -408,7 +418,7 @@
               </div>
             {/if}
             {#if hasCapability(provider, 'subscriptionQuota') && provider.quotas.length}
-              {#if provider.quotaFallback}<div class="offline-banner" role="note">⚠ Online quota недоступна — показаны локально наблюдаемые значения</div>{/if}
+              {#if provider.quotaFallback}<div class="offline-banner" role="note">⚠ Online quota недоступна — показаны локально наблюдаемые значения{#if provider.fallbackReason} · {provider.fallbackReason}{/if}</div>{/if}
               {#each provider.quotas as quota}
                 <div class="quota">
                   <div class="quota-top"><span>{quota.name}</span><strong>{quota.remainingPercent === undefined ? 'Нет данных' : `Осталось ${quota.remainingPercent}%`}</strong></div>
@@ -429,7 +439,7 @@
                 <div class="cost-row"><span>Баланс</span><strong>{balance.currency} {balance.amount}</strong></div>
               {/each}
             {/if}
-            <details><summary>Источник и диагностика</summary><dl><div><dt>Покрытие</dt><dd>{provider.coverage}</dd></div><div><dt>Состояние</dt><dd>{provider.connectionState}</dd></div><div><dt>Возможности</dt><dd>{provider.capabilities.join(', ') || 'не определены'}</dd></div><div><dt>Наблюдение</dt><dd>{provider.observedAt ?? 'неизвестно'}</dd></div></dl></details>
+            <details><summary>Источник и диагностика</summary><dl><div><dt>Покрытие</dt><dd>{provider.coverage}</dd></div><div><dt>Состояние</dt><dd>{provider.connectionState}</dd></div><div><dt>Возможности</dt><dd>{provider.capabilities.join(', ') || 'не определены'}</dd></div><div><dt>Наблюдение</dt><dd>{provider.observedAt ?? 'неизвестно'}</dd></div>{#if provider.identityConfidence}<div><dt>Идентичность</dt><dd>{provider.identityConfidence}</dd></div>{/if}{#if provider.fallbackReason}<div><dt>Причина fallback</dt><dd>{provider.fallbackReason}</dd></div>{/if}</dl><button type="button" on:click={() => copyDiag(provider.accountId)}>Скопировать диагностику</button></details>
           </section>
         {/each}
       </div>

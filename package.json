@@ -9,6 +9,7 @@
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json && npm run check:version",
     "check:version": "node scripts/check-version.mjs",
+    "check:pii": "node scripts/check-pii.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "redact:codex": "node scripts/redact-codex.mjs",

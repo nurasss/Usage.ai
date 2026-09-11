@@ -111,6 +111,16 @@ pub struct ProviderDto {
     /// them as locally observed, never as authoritative.
     #[serde(default)]
     pub quota_fallback: bool,
+    /// Why the primary source did not serve (e.g.
+    /// `codex-app-server:authentication_required`): the first
+    /// non-Ok attempt of the winning refresh, or None when the
+    /// primary served. Rendered under the fallback banner.
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+    /// Stored account identity confidence (Verified/Weak/Unknown),
+    /// so each card answers "whose data is this" (§12.1).
+    #[serde(default)]
+    pub identity_confidence: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -148,6 +158,10 @@ pub struct DiagnosticsDto {
     pub provider: String,
     pub product: String,
     pub account_alias: String,
+    /// Owning account id: lets the copy action and the UI address one
+    /// card without alias matching (aliases are not unique).
+    #[serde(default)]
+    pub account_id: String,
     pub selected_source: Option<String>,
     pub connection_state: ConnectionState,
     pub last_refresh_attempt: Option<String>,
@@ -175,6 +189,10 @@ pub struct AttemptDto {
     pub status: String,
     pub safe_code: Option<String>,
     pub finished_at: String,
+    /// Attempt latency in milliseconds (finished - started), when both
+    /// timestamps parse. None when the clock data is missing.
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -294,6 +312,8 @@ pub fn from_snapshot(
         last_successful_refresh: None,
         last_refresh_attempt: None,
         quota_fallback: false,
+        fallback_reason: None,
+        identity_confidence: None,
     }
 }
 
@@ -335,6 +355,8 @@ pub fn unavailable(
         last_successful_refresh: None,
         last_refresh_attempt: None,
         quota_fallback: false,
+        fallback_reason: None,
+        identity_confidence: None,
     }
 }
 

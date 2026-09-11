@@ -125,6 +125,11 @@ export async function loadImportStats(): Promise<ImportStats[]> {
   catch { return []; }
 }
 
+export async function copyDiagnostics(accountId: string): Promise<string> {
+  if (!inTauri()) return '';
+  return invoke<string>('copy_diagnostics_text', { accountId });
+}
+
 export async function reportOnlineState(online: boolean): Promise<void> {
   if (!inTauri()) return;
   try { await invoke('report_online_state', { online }); } catch { /* observed state only */ }

@@ -47,6 +47,8 @@ export interface ProviderSnapshot {
   lastSuccessfulRefresh?: string;
   lastRefreshAttempt?: string;
   quotaFallback?: boolean;
+  fallbackReason?: string;
+  identityConfidence?: string;
 }
 
 export interface OverviewSegment { label: string; value: number; color: string; }
@@ -79,11 +81,11 @@ export interface AppSettings {
 }
 
 export interface AttemptInfo {
-  source: string; status: string; safeCode?: string; finishedAt: string;
+  source: string; status: string; safeCode?: string; finishedAt: string; latencyMs?: number;
 }
 
 export interface Diagnostics {
-  provider: string; product: string; accountAlias: string;
+  provider: string; product: string; accountAlias: string; accountId?: string;
   selectedSource?: string;
   connectionState: ConnectionState; lastRefreshAttempt?: string;
   lastSuccessfulRefresh?: string; lastDataObservedAt?: string;

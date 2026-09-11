@@ -246,6 +246,7 @@ pub async fn test_connection(
         provider: diag.provider,
         product: diag.product,
         account_alias: diag.account_alias,
+        account_id: id.to_string(),
         selected_source: diag.selected_source,
         connection_state: diag.connection_state,
         last_refresh_attempt: diag.last_refresh_attempt,

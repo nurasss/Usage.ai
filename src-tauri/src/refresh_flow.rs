@@ -73,7 +73,18 @@ pub fn assemble_snapshot(
     let states = state.coordinator.states_snapshot();
     let mut providers: Vec<ProviderDto> = outcomes
         .iter()
-        .map(|outcome| outcome_to_dto(outcome, metas, &states))
+        .map(|outcome| {
+            // Stored account confidence answers "whose data is this"
+            // per card (§12.1); a missing account leaves it unset.
+            let identity = state
+                .storage
+                .lock()
+                .ok()
+                .and_then(|storage| storage.get_account(outcome.scope.account_id).ok())
+                .flatten()
+                .map(|account| format!("{:?}", account.identity_confidence));
+            outcome_to_dto(outcome, metas, &states, identity)
+        })
         .collect();
     // Discovery-only products stay visible as honest blockers, driven
     // by descriptors rather than a hard-coded list.
@@ -189,6 +200,7 @@ fn outcome_to_dto(
     outcome: &RefreshOutcome,
     metas: &HashMap<ScopeKey, AccountMeta>,
     states: &HashMap<ScopeKey, usage_runtime::RefreshState>,
+    identity_confidence: Option<String>,
 ) -> ProviderDto {
     let descriptor = find_descriptor(&outcome.scope.provider_id, &outcome.scope.product_id);
     let (provider_name, product_name) = descriptor
@@ -242,6 +254,23 @@ fn outcome_to_dto(
             "claude-code" => outcome.selected_source.as_deref() != Some("claude-pty-usage"),
             _ => false,
         };
+    // Fallback reason: the first non-Ok attempt of this refresh
+    // (e.g. `codex-app-server:authentication_required`), so the
+    // banner can answer "why not the primary". None when every
+    // attempted source succeeded or none was attempted.
+    dto.fallback_reason = outcome
+        .attempts
+        .iter()
+        .find(|attempt| !matches!(attempt.status, usage_runtime::AttemptStatus::Ok))
+        .map(|attempt| {
+            let code = attempt.safe_code.as_deref().unwrap_or(match attempt.status {
+                usage_runtime::AttemptStatus::Error => "error",
+                usage_runtime::AttemptStatus::Skipped => "skipped",
+                usage_runtime::AttemptStatus::Ok => "ok",
+            });
+            format!("{}:{code}", attempt.source)
+        });
+    dto.identity_confidence = identity_confidence;
     dto
 }
 
@@ -400,7 +429,7 @@ mod tests {
             },
         );
 
-        let dto_initial = outcome_to_dto(&success_outcome, &metas, &states);
+        let dto_initial = outcome_to_dto(&success_outcome, &metas, &states, None);
         assert_eq!(dto_initial.connection_state, ConnectionState::Connected);
         assert_eq!(dto_initial.freshness, Freshness::Fresh);
         assert!(dto_initial.current_error.is_none());
@@ -434,7 +463,7 @@ mod tests {
             },
         );
 
-        let dto_stale = outcome_to_dto(&failed_outcome, &metas, &states);
+        let dto_stale = outcome_to_dto(&failed_outcome, &metas, &states, None);
 
         // Step 4: returned DTO contains old metric values
         assert_eq!(dto_stale.quotas.len(), 1);
@@ -564,7 +593,7 @@ mod tests {
             },
         );
         let states = coordinator.states_snapshot();
-        let dto = outcome_to_dto(&outcome, &metas, &states);
+        let dto = outcome_to_dto(&outcome, &metas, &states, None);
         assert_eq!(dto.connection_state, ConnectionState::Connected);
         assert_eq!(dto.freshness, Freshness::Fresh);
         assert!(dto.current_error.is_none());
@@ -608,6 +637,8 @@ mod tests {
             last_successful_refresh: None,
             last_refresh_attempt: None,
             quota_fallback: false,
+            fallback_reason: None,
+            identity_confidence: None,
         }
     }
 
@@ -745,14 +776,18 @@ mod tests {
             &claude_outcome(Some("claude-pty-usage"), true),
             &metas,
             &states,
+            Some("Verified".into()),
         );
         assert!(!dto.quota_fallback);
         assert_eq!(dto.quotas.len(), 1);
+        assert_eq!(dto.identity_confidence.as_deref(), Some("Verified"));
+        assert!(dto.fallback_reason.is_none());
         // OAuth fallback end: explicit banner.
         let dto = outcome_to_dto(
             &claude_outcome(Some("claude-oauth-usage"), true),
             &metas,
             &states,
+            None,
         );
         assert!(dto.quota_fallback);
         // History end with no quotas: nothing shown, no banner.
@@ -760,8 +795,40 @@ mod tests {
             &claude_outcome(Some("claude-local-jsonl"), false),
             &metas,
             &states,
+            None,
         );
         assert!(!dto.quota_fallback);
         assert!(dto.quotas.is_empty());
+    }
+
+    #[test]
+    fn fallback_reason_names_first_failed_attempt() {
+        use usage_runtime::{AttemptRecord, AttemptStatus};
+        let metas = HashMap::new();
+        let states = HashMap::new();
+        let mut outcome = claude_outcome(Some("claude-oauth-usage"), true);
+        let now = Utc::now();
+        outcome.attempts = vec![
+            AttemptRecord {
+                source: "claude-pty-usage".into(),
+                status: AttemptStatus::Error,
+                safe_code: Some("authentication_required".into()),
+                started_at: now,
+                finished_at: now,
+            },
+            AttemptRecord {
+                source: "claude-oauth-usage".into(),
+                status: AttemptStatus::Ok,
+                safe_code: None,
+                started_at: now,
+                finished_at: now,
+            },
+        ];
+        let dto = outcome_to_dto(&outcome, &metas, &states, None);
+        assert!(dto.quota_fallback);
+        assert_eq!(
+            dto.fallback_reason.as_deref(),
+            Some("claude-pty-usage:authentication_required")
+        );
     }
 }

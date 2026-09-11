@@ -76,6 +76,7 @@ pub fn run() {
             crate::commands::export::export_diagnostics,
             crate::commands::diagnostics::get_diagnostics,
             crate::commands::diagnostics::get_import_stats,
+            crate::commands::diagnostics::copy_diagnostics_text,
             crate::commands::accounts::list_accounts,
             crate::commands::accounts::add_account,
             crate::commands::accounts::update_account,
