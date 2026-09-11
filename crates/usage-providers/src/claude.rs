@@ -375,8 +375,7 @@ const AUTH_STATUS_CAP: usize = 8 * 1024;
 /// proceed anyway), command render, post-/exit drain. The render
 /// stage scales with the caller budget instead of a second hardcoded
 /// constant; the coordinator caps the total at SOURCE_TIMEOUT.
-const BOOT_WAIT: Duration = Duration::from_secs(4);
-const RENDER_CAP: Duration = Duration::from_secs(20);
+const RENDER_CAP: Duration = Duration::from_secs(25);
 const SHUTDOWN_RESERVE: Duration = Duration::from_secs(5);
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
 const SCREEN_CAP: usize = 256 * 1024;
@@ -521,43 +520,62 @@ impl ClaudeUsageDriver for HostClaudeDriver<'_> {
             .await
             .map_err(|_| ProviderError::Unavailable("claude_pty_spawn".into()))?;
         let mut raw = Vec::new();
-        // Stage 1 — first paint: never type into a session that has
-        // not drawn yet. Silence alone never fails (the app may paint
-        // slowly); the scan below only gates foreign prompts.
-        let boot_until = started + BOOT_WAIT;
-        while raw.is_empty() {
+        // Single caller-bounded deadline for boot + render: a slow
+        // paint steals render budget, but the total never exceeds
+        // what the caller allowed (minus shutdown reserve).
+        let deadline = started
+            + timeout
+                .min(RENDER_CAP)
+                .saturating_sub(SHUTDOWN_RESERVE)
+                .max(Duration::from_secs(2));
+        // Stage 1 — first paint. Nothing is ever typed into a
+        // session that has not demonstrably painted: no output by the
+        // deadline is a timeout, a foreign prompt aborts, and an
+        // empty (EOF, dead binary) boot is Unavailable — never Parse.
+        loop {
             if cancel.is_cancelled() {
                 let _ = child.kill().await;
                 return Err(ProviderError::Network("claude_pty_cancelled".into()));
             }
-            let remaining = boot_until.saturating_duration_since(tokio::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                break;
+                let _ = child.kill().await;
+                return Err(ProviderError::Network("claude_pty_timeout".into()));
             }
             match tokio::time::timeout(remaining, child.read_chunk(32 * 1024)).await {
-                Ok(Ok(Some(bytes))) if !bytes.is_empty() => raw.extend_from_slice(&bytes),
-                _ => break,
+                Ok(Ok(Some(bytes))) if !bytes.is_empty() => {
+                    raw.extend_from_slice(&bytes);
+                    if !strip_ansi(&raw).trim().is_empty() {
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => break,
+                Ok(Err(_)) => {
+                    let _ = child.kill().await;
+                    return Err(ProviderError::Unavailable("claude_pty_io".into()));
+                }
+                Err(_) => {
+                    let _ = child.kill().await;
+                    return Err(ProviderError::Network("claude_pty_timeout".into()));
+                }
             }
         }
-        if has_trust_markers(&strip_ansi(&raw)) {
+        let painted = strip_ansi(&raw);
+        if has_trust_markers(&painted) {
             let _ = child.kill().await;
-            return Err(ProviderError::Unavailable(
-                "claude_pty_untrusted_prompt".into(),
-            ));
+            return Err(ProviderError::Unavailable("claude_pty_untrusted_prompt".into()));
+        }
+        if painted.trim().is_empty() {
+            let _ = child.kill().await;
+            return Err(ProviderError::Unavailable("claude_pty_no_boot".into()));
         }
         child
             .write_all(b"/usage\r")
             .await
             .map_err(|_| ProviderError::Unavailable("claude_pty_io".into()))?;
-        // Stage 2 — render within the caller-blessed budget minus a
-        // shutdown reserve (drain + kill). Production keeps its ~10s;
-        // explicitly longer caller timeouts (live probes) buy patience
-        // instead of hitting a second hardcoded wall.
-        let render_budget = timeout
-            .min(RENDER_CAP)
-            .saturating_sub(SHUTDOWN_RESERVE)
-            .max(Duration::from_secs(2));
-        let deadline = started + BOOT_WAIT + render_budget;
+        // Stage 2 — render within the same caller deadline. Boot time
+        // already spent comes out of this budget: the total stays
+        // caller-bounded no matter how slow the paint was.
         let mut usage_timed_out = false;
 
         loop {
@@ -2054,14 +2072,8 @@ mod quota_tests {
             executables: vec![script.clone()],
             env: vec![],
         };
-        // Login gate through the real process backend first.
-        assert_eq!(
-            driver
-                .login_gate(&usage_host::CancellationToken::new())
-                .await,
-            LoginGate::LoggedIn(script.clone())
-        );
-        // Then the interactive drive through the real forkpty backend.
+        // Drive directly (the gate has its own unit + live tests):
+        // fewer spawns, same real backends, same proof.
         let text = driver
             .usage_screen(
                 &script,
@@ -2148,25 +2160,31 @@ mod quota_tests {
     #[tokio::test]
     async fn hanging_drive_is_bounded_network_error() {
         let temp = tempfile::tempdir().unwrap();
+        // No auth branch, no output: drive the sleeping child
+        // directly (the gate has its own tests).
         let script = write_script(
             temp.path(),
             "hang-claude.sh",
-            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  printf '%s\\n' '{\"loggedIn\":true}'\n  exit 0\nfi\nprintf '%s\\n' 'booting, please wait'\nsleep 30\n",
+            "#!/bin/sh\nprintf '%s\\n' 'booting, please wait'\nsleep 30\n",
         );
-        let hosts = hosts(
-            Arc::new(usage_host::AllowlistedProcess::with_allowed([
-                script.clone()
-            ])),
-            Arc::new(usage_host::AllowlistedPty::with_allowed([script.clone()])),
-            Arc::new(usage_host::ReqwestHttpHost::default()),
-        );
-        let account = account();
-        let strategy = ClaudePtyUsageStrategy::new(vec![script]);
-        let ctx = test_ctx(&hosts, &account, true, true, false, None, 2);
+        let pty = usage_host::AllowlistedPty::with_allowed([script.clone()]);
+        let process = usage_host::AllowlistedProcess::with_allowed([script.clone()]);
+        let driver = HostClaudeDriver {
+            process: &process,
+            pty: &pty,
+            executables: vec![script.clone()],
+            env: vec![],
+        };
         let started = std::time::Instant::now();
-        let result = strategy.fetch(&ctx).await;
+        let result = driver
+            .usage_screen(
+                &script,
+                Duration::from_secs(2),
+                &usage_host::CancellationToken::new(),
+            )
+            .await;
         assert!(
-            matches!(result, Err(SourceError::Network)),
+            matches!(result, Err(ProviderError::Network(_))),
             "hang must surface Network, got {result:?}"
         );
         assert!(
@@ -2217,7 +2235,9 @@ mod quota_tests {
         let result = driver
             .usage_screen(
                 &script,
-                Duration::from_secs(10),
+                // Generous: the assertion is about ordering (abort
+                // before typing), not speed; CI hosts get slow.
+                Duration::from_secs(30),
                 &usage_host::CancellationToken::new(),
             )
             .await;
@@ -2230,6 +2250,39 @@ mod quota_tests {
         assert!(
             !record.exists() || std::fs::read_to_string(&record).unwrap().is_empty(),
             "driver typed into a trust dialog"
+        );
+    }
+
+    /// A dead binary that paints nothing is Unavailable fast — never
+    /// Parse, never a full-budget wait for a screen that cannot come.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_binary_is_unavailable_not_parse() {
+        let process = usage_host::AllowlistedProcess::with_allowed([PathBuf::from(
+            "/usr/bin/false",
+        )]);
+        let pty = usage_host::AllowlistedPty::with_allowed([PathBuf::from("/usr/bin/false")]);
+        let driver = HostClaudeDriver {
+            process: &process,
+            pty: &pty,
+            executables: vec![PathBuf::from("/usr/bin/false")],
+            env: vec![],
+        };
+        let started = std::time::Instant::now();
+        let result = driver
+            .usage_screen(
+                &PathBuf::from("/usr/bin/false"),
+                Duration::from_secs(10),
+                &usage_host::CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::Unavailable(_))),
+            "dead binary must be Unavailable, got {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "no full-budget wait for a dead binary"
         );
     }
 
