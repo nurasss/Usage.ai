@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/usage-core", "crates/usage-host", "crates/usage-providers", "crates/usage-runtime", "crates/usage-storage", "src-tauri"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.3.0"
 edition = "2021"
 license = "MIT"
 authors = ["Usage.ai"]

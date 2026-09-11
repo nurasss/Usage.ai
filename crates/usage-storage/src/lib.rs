@@ -3280,6 +3280,62 @@ fn migrates_v7_database_with_candidates_table() {
 }
 
 #[test]
+fn migrates_v8_account_rows_to_v9_without_data_loss() {
+    // A v8 database (no notifications_muted column) upgrades in
+    // place: existing account rows survive with mute defaulted off,
+    // and the new setter works immediately after.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usage.db");
+    let account_id = uuid::Uuid::new_v4().to_string();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for migration in [
+            "migrations/001_initial.sql",
+            "migrations/002_accounts_budgets.sql",
+            "migrations/003_attempts_cooldowns.sql",
+            "migrations/004_identity_confidence.sql",
+            "migrations/005_provenance.sql",
+            "migrations/006_legacy_identity.sql",
+            "migrations/007_claude_cache_buckets.sql",
+            "migrations/008_profile_candidates.sql",
+        ] {
+            let sql = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(migration),
+            )
+            .unwrap();
+            conn.execute_batch(&sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES(?,?,?,?,?)",
+            rusqlite::params![
+                account_id,
+                "openai",
+                "Legacy",
+                "Active",
+                "2026-01-01T00:00:00Z"
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 8u32).unwrap();
+    }
+    let mut storage = Storage::open(&path).unwrap();
+    let account = storage
+        .get_account(account_id.parse().unwrap())
+        .unwrap()
+        .expect("legacy row survives the upgrade");
+    assert_eq!(account.label, "Legacy");
+    assert!(!account.notifications_muted);
+    assert!(storage
+        .set_account_muted(account_id.parse().unwrap(), true)
+        .unwrap());
+    assert!(storage
+        .get_account(account_id.parse().unwrap())
+        .unwrap()
+        .unwrap()
+        .notifications_muted);
+}
+
+#[test]
 fn migrates_to_v9_with_account_mute_default_off() {
     let mut storage = Storage::in_memory().unwrap();
     let id = uuid::Uuid::new_v4();
