@@ -106,15 +106,57 @@ mod tests {
         // Manual bypasses cadence but never cooldowns.
         assert!(refresh_due(Some(ago(10)), None, false, true, interval, now));
         assert!(!refresh_due(Some(ago(10)), None, true, true, interval, now));
-        assert!(!refresh_due(Some(ago(10)), None, true, false, interval, now));
+        assert!(!refresh_due(
+            Some(ago(10)),
+            None,
+            true,
+            false,
+            interval,
+            now
+        ));
         // Active scope (fresh observations): 2-minute cadence.
-        assert!(refresh_due(Some(ago(180)), Some(ago(60)), false, false, interval, now));
-        assert!(!refresh_due(Some(ago(60)), Some(ago(30)), false, false, interval, now));
+        assert!(refresh_due(
+            Some(ago(180)),
+            Some(ago(60)),
+            false,
+            false,
+            interval,
+            now
+        ));
+        assert!(!refresh_due(
+            Some(ago(60)),
+            Some(ago(30)),
+            false,
+            false,
+            interval,
+            now
+        ));
         // Idle scope: configured interval with a 5-minute floor.
-        assert!(refresh_due(Some(ago(400)), Some(ago(3600)), false, false, interval, now));
-        assert!(!refresh_due(Some(ago(100)), Some(ago(3600)), false, false, interval, now));
+        assert!(refresh_due(
+            Some(ago(400)),
+            Some(ago(3600)),
+            false,
+            false,
+            interval,
+            now
+        ));
+        assert!(!refresh_due(
+            Some(ago(100)),
+            Some(ago(3600)),
+            false,
+            false,
+            interval,
+            now
+        ));
         // Stale observations are not activity.
-        assert!(!refresh_due(Some(ago(100)), Some(ago(2000)), false, false, interval, now));
+        assert!(!refresh_due(
+            Some(ago(100)),
+            Some(ago(2000)),
+            false,
+            false,
+            interval,
+            now
+        ));
     }
     #[test]
     fn wake_gap_needs_triple_interval() {

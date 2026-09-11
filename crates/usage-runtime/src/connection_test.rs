@@ -536,6 +536,7 @@ mod tests {
             custom_path: Some("/path/that/does/not/exist/ever/12345".into()),
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()
@@ -580,6 +581,7 @@ mod tests {
             custom_path: Some(local_root.to_str().unwrap().into()),
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()
@@ -619,6 +621,7 @@ mod tests {
             custom_path: Some(local_root.to_str().unwrap().into()),
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()
@@ -659,6 +662,7 @@ mod tests {
             custom_path: Some(local_root.to_str().unwrap().into()),
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()
@@ -694,6 +698,7 @@ mod tests {
             custom_path: Some("/nonexistent/path/claude/test".into()),
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()
@@ -732,6 +737,7 @@ mod tests {
             custom_path: Some(local_root.to_str().unwrap().into()),
             enabled: true,
             identity_confidence: IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()

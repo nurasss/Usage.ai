@@ -537,10 +537,7 @@ mod tests {
             if active_yes_count() == before {
                 break;
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "yes child leaked"
-            );
+            assert!(tokio::time::Instant::now() < deadline, "yes child leaked");
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }

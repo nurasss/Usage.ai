@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { addAccount, connectCandidate, copyDiagnostics, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, ignoreCandidate, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, scanCandidates, testConnection, updateAccount } from './lib/api';
+  import { addAccount, connectCandidate, copyDiagnostics, defaultSettings, deleteBudget, exportDiagnostics, exportHistory, ignoreCandidate, loadAccounts, loadAppInfo, loadBudgets, loadDescriptors, loadDiagnostics, loadImportStats, loadSettings, loadSnapshot, loadStorageStatus, refreshAll, removeAccount, reportOnlineState, saveBudget, saveSettings, scanCandidates, setAccountMuted, testConnection, updateAccount } from './lib/api';
   import { formatAge, formatCompact, formatCountdown, stateLabel } from './lib/format';
   import { applyTheme, formatAccountLabel, navKey, providerPresentation } from './lib/ui';
   import type { AccountInfo, AppInfo, AppSettings, AppSnapshot, Budget, Diagnostics, ImportStats, ProductDescriptor, ProfileCandidate, ProviderSnapshot, Quota, StorageStatus } from './lib/types';
@@ -180,6 +180,11 @@
     catch { notice = 'Не удалось обновить аккаунт'; window.setTimeout(() => notice = '', 2500); }
   }
 
+  async function toggleMute(account: AccountInfo) {
+    try { await setAccountMuted(account.id, !account.notificationsMuted); accounts = await loadAccounts(); }
+    catch { notice = 'Не удалось обновить уведомления'; window.setTimeout(() => notice = '', 2500); }
+  }
+
   async function probeAccount(id: string) {    try {
       const result = await testConnection(id);
       testResult = `${result.product}: ${stateLabel(result.connectionState)}`;
@@ -277,6 +282,7 @@
           <label><span>Запускать при входе</span><input type="checkbox" bind:checked={settings.launchAtLogin} /></label>
           <label><span>Интервал обновления</span><select aria-label="Интервал обновления" bind:value={settings.refreshIntervalMinutes}><option value={1}>1 минута</option><option value={5}>5 минут</option><option value={10}>10 минут</option><option value={15}>15 минут</option><option value={30}>30 минут</option><option value={60}>60 минут</option><option value={null}>Вручную</option></select></label>
           <label><span>Строка меню</span><select aria-label="Режим строки меню" bind:value={settings.menuBarMode}><option value="icon">Только значок</option><option value="iconMetric">Значок + метрика</option></select></label>
+          <label><span>Профиль в строке меню</span><select aria-label="Профиль в строке меню" bind:value={settings.trayProfileAccountId}><option value={null}>Авто (минимум)</option>{#each accounts as account}<option value={account.id}>{formatAccountLabel(account.label, account.identityConfidence)}</option>{/each}</select></label>
           <label><span>Оформление</span><select aria-label="Оформление" bind:value={settings.theme} on:change={() => applyTheme(settings.theme)}><option value="system">Системное</option><option value="light">Светлое</option><option value="dark">Тёмное</option></select></label>
           <label><span>Глобальная клавиша</span><input class="shortcut-input" aria-label="Глобальная клавиша" bind:value={settings.globalShortcut} /></label>
         </div>
@@ -336,7 +342,7 @@
           {:else}
             {#each accounts as account}
               <div class="account-line"><span>{formatAccountLabel(account.label, account.identityConfidence)} · {account.productId ?? account.providerId} · {account.enabled ? account.lifecycle : 'выключен'}{account.identityConfidence ? ` · ${account.identityConfidence}` : ''}</span></div>
-              <div class="button-row"><button class="secondary" on:click={() => toggleAccount(account)}>{account.enabled ? 'Выключить' : 'Включить'}</button><button class="secondary" on:click={() => probeAccount(account.id)}>Проверить</button><button class="secondary" on:click={() => dropAccount(account.id, false)}>Архив</button><button class="secondary" on:click={() => dropAccount(account.id, true)}>Удалить</button></div>
+              <div class="button-row"><button class="secondary" on:click={() => toggleAccount(account)}>{account.enabled ? 'Выключить' : 'Включить'}</button><button class="secondary" on:click={() => toggleMute(account)}>{account.notificationsMuted ? 'Вкл. уведомления' : 'Без уведомлений'}</button><button class="secondary" on:click={() => probeAccount(account.id)}>Проверить</button><button class="secondary" on:click={() => dropAccount(account.id, false)}>Архив</button><button class="secondary" on:click={() => dropAccount(account.id, true)}>Удалить</button></div>
             {/each}
           {/if}
         </div>
@@ -400,7 +406,7 @@
           <section class="provider-card" id={providerKey(provider)}>
             <div class="provider-head">
               <div class="brand" style={`background:${colorFor(provider)}`}>{glyphFor(provider)}</div>
-              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{formatAccountLabel(provider.alias, provider.identityConfidence)} · <i class={`dot ${provider.coverage === 'UnverifiedSemantics' ? 'unverified' : provider.connectionState}`}></i>{provider.coverage === 'UnverifiedSemantics' ? 'Семантика не подтверждена' : stateLabel(provider.connectionState)}</p></div>
+              <div class="provider-name"><h2>{provider.providerName} <span>/ {provider.productName}</span></h2><p>{formatAccountLabel(provider.alias, provider.identityConfidence)} · <i class={`dot ${provider.coverage === 'UnverifiedSemantics' ? 'unverified' : provider.connectionState}`}></i>{provider.coverage === 'UnverifiedSemantics' ? 'Семантика не подтверждена' : stateLabel(provider.connectionState)}{#if provider.selectedSource} · <span class="source-badge" title="Стратегия-источник">{provider.selectedSource}</span>{/if}</p></div>
               {#if provider.planLabel}<span class="plan">{provider.planLabel}</span>{/if}
             </div>
             {#if provider.coverage === 'UnverifiedSemantics'}

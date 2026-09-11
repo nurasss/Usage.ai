@@ -64,7 +64,10 @@ pub async fn run_full_refresh(state: &AppState, app: &AppHandle, trigger: Trigge
     );
     let requests = due;
     let mut outcomes = state.coordinator.refresh_many(requests).await;
-    outcomes.extend(idle.iter().map(|scope| state.coordinator.lkg_outcome(scope)));
+    outcomes.extend(
+        idle.iter()
+            .map(|scope| state.coordinator.lkg_outcome(scope)),
+    );
     let mut snapshot = assemble_snapshot(state, &outcomes, &metas);
     // The next-refresh label follows the configured interval instead of
     // a fixed offset; manual mode has no next automatic refresh.
@@ -117,7 +120,8 @@ pub fn partition_due(
     (due, idle)
 }
 
-pub fn assemble_snapshot(    state: &AppState,
+pub fn assemble_snapshot(
+    state: &AppState,
     outcomes: &[RefreshOutcome],
     metas: &HashMap<ScopeKey, AccountMeta>,
 ) -> AppSnapshot {
@@ -314,14 +318,18 @@ fn outcome_to_dto(
         .iter()
         .find(|attempt| !matches!(attempt.status, usage_runtime::AttemptStatus::Ok))
         .map(|attempt| {
-            let code = attempt.safe_code.as_deref().unwrap_or(match attempt.status {
-                usage_runtime::AttemptStatus::Error => "error",
-                usage_runtime::AttemptStatus::Skipped => "skipped",
-                usage_runtime::AttemptStatus::Ok => "ok",
-            });
+            let code = attempt
+                .safe_code
+                .as_deref()
+                .unwrap_or(match attempt.status {
+                    usage_runtime::AttemptStatus::Error => "error",
+                    usage_runtime::AttemptStatus::Skipped => "skipped",
+                    usage_runtime::AttemptStatus::Ok => "ok",
+                });
             format!("{}:{code}", attempt.source)
         });
     dto.identity_confidence = identity_confidence;
+    dto.selected_source = outcome.selected_source.clone();
     dto
 }
 
@@ -395,6 +403,34 @@ pub fn primary_remaining(providers: &[ProviderDto]) -> Option<f64> {
         .fold(None, |min: Option<f64>, value| {
             Some(min.map_or(value, |m: f64| m.min(value)))
         })
+}
+
+/// Menu-bar metric with fixed-profile selection (V13-06): a pinned
+/// account serves its own minimum only while fresh and
+/// tray-eligible; anything else (unknown id, stale, unverified)
+/// falls back to the automatic most-constrained metric. The setting
+/// persists in the settings file, so the selection survives restart.
+pub fn tray_metric(providers: &[ProviderDto], fixed_account_id: Option<&str>) -> Option<f64> {
+    if let Some(wanted) = fixed_account_id {
+        let pinned = providers
+            .iter()
+            .find(|p| p.account_id == wanted)
+            .filter(|p| {
+                p.freshness == usage_core::Freshness::Fresh && p.coverage.allows_tray_metric()
+            })
+            .and_then(|p| {
+                p.quotas
+                    .iter()
+                    .filter_map(|q| q.remaining_percent)
+                    .fold(None, |min: Option<f64>, value| {
+                        Some(min.map_or(value, |m: f64| m.min(value)))
+                    })
+            });
+        if pinned.is_some() {
+            return pinned;
+        }
+    }
+    primary_remaining(providers)
 }
 
 pub fn coordinator_of(state: &AppState) -> Arc<Coordinator> {
@@ -667,6 +703,7 @@ mod tests {
             fetched_at: "2026-09-09T00:00:00Z".into(),
             observed_at: None,
             capabilities: vec![],
+            selected_source: Some("test-source".into()),
             quotas: vec![crate::dto::QuotaDto {
                 pool_id: "default".into(),
                 window_id: Some("w1".into()),
@@ -730,6 +767,48 @@ mod tests {
     }
 
     #[test]
+    fn tray_fixed_profile_pins_or_falls_back() {
+        let mut pinned = sample_provider(Coverage::Complete, 42.0);
+        pinned.account_id = "acc-pinned".into();
+        let mut other = sample_provider(Coverage::Complete, 10.0);
+        other.account_id = "acc-other".into();
+        let providers = vec![pinned, other];
+        // Pinned and eligible: its own metric, not the minimum.
+        assert_eq!(
+            tray_metric(&providers, Some("acc-pinned")),
+            Some(42.0),
+            "fixed profile serves its own metric"
+        );
+        // Unknown id: automatic fallback.
+        assert_eq!(
+            tray_metric(&providers, Some("acc-missing")),
+            Some(10.0),
+            "unknown pin falls back to automatic minimum"
+        );
+        // No pin: automatic minimum.
+        assert_eq!(tray_metric(&providers, None), Some(10.0));
+        // Pinned but unverified: never served, fallback applies.
+        let mut unver = sample_provider(Coverage::UnverifiedSemantics, 5.0);
+        unver.account_id = "acc-unver".into();
+        let providers = vec![unver, sample_provider(Coverage::Complete, 77.0)];
+        assert_eq!(
+            tray_metric(&providers, Some("acc-unver")),
+            Some(77.0),
+            "unverified pin must not reach the tray"
+        );
+        // Pinned but stale: fallback applies.
+        let mut stale = sample_provider(Coverage::Complete, 5.0);
+        stale.account_id = "acc-stale".into();
+        stale.freshness = Freshness::Stale(60);
+        let providers = vec![stale, sample_provider(Coverage::Complete, 66.0)];
+        assert_eq!(
+            tray_metric(&providers, Some("acc-stale")),
+            Some(66.0),
+            "stale pin must not reach the tray"
+        );
+    }
+
+    #[test]
     fn full_side_effect_regression_unverified_semantics_produces_no_authoritative_side_effects() {
         // Input snapshot: Fresh + Connected + UnverifiedSemantics + 20% remaining
         let p = sample_provider(Coverage::UnverifiedSemantics, 20.0);
@@ -744,6 +823,7 @@ mod tests {
         // 2. Notification evaluator check: emits none
         let notice_view = usage_runtime::ProviderNoticeView {
             account_id: p.account_id.clone(),
+            alias: p.alias.clone(),
             provider_name: p.provider_name.clone(),
             product_name: p.product_name.clone(),
             connection_state: p.connection_state.clone(),
@@ -853,7 +933,8 @@ mod tests {
     }
 
     #[test]
-    fn fallback_reason_names_first_failed_attempt() {        use usage_runtime::{AttemptRecord, AttemptStatus};
+    fn fallback_reason_names_first_failed_attempt() {
+        use usage_runtime::{AttemptRecord, AttemptStatus};
         let metas = HashMap::new();
         let states = HashMap::new();
         let mut outcome = claude_outcome(Some("claude-oauth-usage"), true);

@@ -611,7 +611,8 @@ impl Coordinator {
         scope: &ScopeKey,
         error: Option<SourceError>,
         attempts: Vec<AttemptRecord>,
-    ) -> RefreshOutcome {        let snapshot = self.storage.lock().ok().and_then(|storage| {
+    ) -> RefreshOutcome {
+        let snapshot = self.storage.lock().ok().and_then(|storage| {
             storage
                 .last_known_good(scope.account_id, &scope.product_id)
                 .ok()
@@ -1681,6 +1682,7 @@ mod tests {
             enabled: true,
             custom_path: None,
             identity_confidence: confidence,
+            notifications_muted: false,
         }
     }
 

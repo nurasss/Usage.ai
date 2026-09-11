@@ -16,6 +16,11 @@ pub struct AppSettings {
     pub notifications_enabled: bool,
     pub quiet_hours_start: Option<String>,
     pub quiet_hours_end: Option<String>,
+    /// Fixed tray profile (V13-06): account id whose remaining quota
+    /// the menu bar shows, or None for the automatic most-constrained
+    /// authoritative metric. Persists in the settings file.
+    #[serde(default)]
+    pub tray_profile_account_id: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -31,6 +36,7 @@ impl Default for AppSettings {
             notifications_enabled: false,
             quiet_hours_start: None,
             quiet_hours_end: None,
+            tray_profile_account_id: None,
         }
     }
 }
@@ -92,6 +98,10 @@ pub struct ProviderDto {
     pub fetched_at: String,
     pub observed_at: Option<String>,
     pub capabilities: Vec<String>,
+    /// Strategy that served this snapshot (None for LKG fills without
+    /// a recorded source): the card badge answers "откуда".
+    #[serde(default)]
+    pub selected_source: Option<String>,
     pub quotas: Vec<QuotaDto>,
     pub tokens_today: Option<u64>,
     pub reported_cost_today: Option<MoneyDto>,
@@ -207,6 +217,10 @@ pub struct AccountDto {
     pub enabled: bool,
     pub custom_path: Option<String>,
     pub identity_confidence: String,
+    /// Per-profile alert mute (V13-06): silenced profiles still
+    /// refresh; only their notifications are suppressed.
+    #[serde(default)]
+    pub notifications_muted: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -250,6 +264,7 @@ pub fn managed_account_to_dto(a: &ManagedAccount) -> AccountDto {
         enabled: a.enabled,
         custom_path: a.custom_path.clone(),
         identity_confidence: format!("{:?}", a.identity_confidence),
+        notifications_muted: a.notifications_muted,
     }
 }
 
@@ -280,6 +295,7 @@ pub fn from_snapshot(
         fetched_at: s.fetched_at.to_rfc3339(),
         observed_at: s.observed_at.map(|d| d.to_rfc3339()),
         capabilities: s.capabilities.into_iter().map(capability_name).collect(),
+        selected_source: None,
         quotas: s
             .quotas
             .into_iter()
@@ -346,6 +362,7 @@ pub fn unavailable(
         fetched_at: chrono::Utc::now().to_rfc3339(),
         observed_at: None,
         capabilities: vec![],
+        selected_source: None,
         quotas: vec![],
         tokens_today: None,
         reported_cost_today: None,

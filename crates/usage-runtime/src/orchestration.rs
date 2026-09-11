@@ -378,6 +378,7 @@ mod profile_isolation_tests {
             enabled,
             custom_path: Some(root.to_string_lossy().into_owned()),
             identity_confidence: usage_core::IdentityConfidence::Unknown,
+            notifications_muted: false,
         };
         storage
             .lock()

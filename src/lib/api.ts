@@ -81,6 +81,11 @@ export async function updateAccount(accountId: string, patch: { alias?: string; 
   });
 }
 
+export async function setAccountMuted(accountId: string, muted: boolean): Promise<boolean> {
+  if (!inTauri()) return muted;
+  return invoke<boolean>('set_account_muted', { accountId, muted });
+}
+
 export async function testConnection(accountId: string): Promise<Diagnostics> {
   if (!inTauri()) throw new Error('demo');
   return invoke<Diagnostics>('test_connection', { accountId });
@@ -135,7 +140,7 @@ export async function reportOnlineState(online: boolean): Promise<void> {
   try { await invoke('report_online_state', { online }); } catch { /* observed state only */ }
 }
 
-export const defaultSettings: AppSettings = { launchAtLogin: false, refreshIntervalMinutes: 5, menuBarMode: 'icon', globalShortcut: 'Ctrl+Alt+U', theme: 'system', retentionDays: 90, quotaWarningPercent: 20, notificationsEnabled: false };
+export const defaultSettings: AppSettings = { launchAtLogin: false, refreshIntervalMinutes: 5, menuBarMode: 'icon', globalShortcut: 'Ctrl+Alt+U', theme: 'system', retentionDays: 90, quotaWarningPercent: 20, notificationsEnabled: false, trayProfileAccountId: null };
 export async function loadSettings(): Promise<AppSettings> { if (!inTauri()) return defaultSettings; return invoke<AppSettings>('get_settings'); }
 export async function saveSettings(settings: AppSettings): Promise<void> { if (!inTauri()) return; await invoke('save_settings', { settings }); }
 

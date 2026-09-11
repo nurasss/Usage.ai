@@ -7,7 +7,7 @@ use crate::appstate::AppState;
 use crate::commands::settings::read_settings;
 use crate::dto::AppSnapshot;
 use crate::platform::window::toggle_panel;
-use crate::refresh_flow::{primary_remaining, run_full_refresh};
+use crate::refresh_flow::run_full_refresh;
 
 pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let refresh = MenuItemBuilder::with_id("refresh", "Обновить")
@@ -61,13 +61,18 @@ pub fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Menu-bar metric (§27.7): `iconMetric` shows the minimum fresh
-/// remaining percent as the tray title; `icon` clears it. A failure
-/// to update the tray never fails the refresh.
+/// Menu-bar metric (§27.7, V13-06): `iconMetric` shows the fixed
+/// profile's remaining percent when pinned and eligible, else the
+/// minimum fresh remaining percent; `icon` clears it. A failure to
+/// update the tray never fails the refresh.
 pub fn update_metric(app: &AppHandle, state: &AppState, snapshot: &AppSnapshot) {
-    let mode = read_settings(state).menu_bar_mode;
-    let title: Option<String> = if mode == "iconMetric" {
-        primary_remaining(&snapshot.providers).map(|remaining| format!("{remaining:.0}%"))
+    let settings = read_settings(state);
+    let title: Option<String> = if settings.menu_bar_mode == "iconMetric" {
+        crate::refresh_flow::tray_metric(
+            &snapshot.providers,
+            settings.tray_profile_account_id.as_deref(),
+        )
+        .map(|remaining| format!("{remaining:.0}%"))
     } else {
         None
     };

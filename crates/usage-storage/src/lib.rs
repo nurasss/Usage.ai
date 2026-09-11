@@ -7,7 +7,7 @@ use std::{
 };
 use usage_core::{Account, CostRecord, UsageRecord};
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 const USAGE_UPSERT_SQL: &str = "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,cache_read_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=MAX(usage_records.period_start,excluded.period_start),period_end=MAX(usage_records.period_end,excluded.period_end),model=COALESCE(usage_records.model,excluded.model),input_tokens=CASE WHEN excluded.input_tokens IS NULL THEN usage_records.input_tokens WHEN usage_records.input_tokens IS NULL THEN excluded.input_tokens ELSE MAX(usage_records.input_tokens,excluded.input_tokens) END,output_tokens=CASE WHEN excluded.output_tokens IS NULL THEN usage_records.output_tokens WHEN usage_records.output_tokens IS NULL THEN excluded.output_tokens ELSE MAX(usage_records.output_tokens,excluded.output_tokens) END,cached_tokens=CASE WHEN excluded.cached_tokens IS NULL THEN usage_records.cached_tokens WHEN usage_records.cached_tokens IS NULL THEN excluded.cached_tokens ELSE MAX(usage_records.cached_tokens,excluded.cached_tokens) END,cache_creation_tokens=CASE WHEN excluded.cache_creation_tokens IS NULL THEN usage_records.cache_creation_tokens WHEN usage_records.cache_creation_tokens IS NULL THEN excluded.cache_creation_tokens ELSE MAX(usage_records.cache_creation_tokens,excluded.cache_creation_tokens) END,cache_read_tokens=CASE WHEN excluded.cache_read_tokens IS NULL THEN usage_records.cache_read_tokens WHEN usage_records.cache_read_tokens IS NULL THEN excluded.cache_read_tokens ELSE MAX(usage_records.cache_read_tokens,excluded.cache_read_tokens) END,reasoning_tokens=CASE WHEN excluded.reasoning_tokens IS NULL THEN usage_records.reasoning_tokens WHEN usage_records.reasoning_tokens IS NULL THEN excluded.reasoning_tokens ELSE MAX(usage_records.reasoning_tokens,excluded.reasoning_tokens) END,total_tokens=CASE WHEN excluded.total_tokens IS NULL THEN usage_records.total_tokens WHEN usage_records.total_tokens IS NULL THEN excluded.total_tokens ELSE MAX(usage_records.total_tokens,excluded.total_tokens) END,requests=CASE WHEN excluded.requests IS NULL THEN usage_records.requests WHEN usage_records.requests IS NULL THEN excluded.requests ELSE MAX(usage_records.requests,excluded.requests) END,coverage=excluded.coverage,connection_id=COALESCE(excluded.connection_id,usage_records.connection_id),file_id=COALESCE(excluded.file_id,usage_records.file_id),file_generation=MAX(usage_records.file_generation,excluded.file_generation)";
 
@@ -261,6 +261,9 @@ impl Storage {
         }
         if current < 8 {
             tx.execute_batch(include_str!("../migrations/008_profile_candidates.sql"))?;
+        }
+        if current < 9 {
+            tx.execute_batch(include_str!("../migrations/009_account_mute.sql"))?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1377,7 +1380,7 @@ impl Storage {
         Ok(self
             .conn
             .query_row(
-                "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence FROM accounts WHERE id=?",
+                "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence,notifications_muted FROM accounts WHERE id=?",
                 [account_id.to_string()],
                 |r| {
                     let id_raw: String = r.get(0)?;
@@ -1398,6 +1401,7 @@ impl Storage {
                         enabled: enabled_int != 0,
                         custom_path: r.get(8)?,
                         identity_confidence: parse_confidence(r.get(9)?),
+                        notifications_muted: r.get::<_, i64>(10).unwrap_or(0) != 0,
                     })
                 },
             )
@@ -1406,7 +1410,7 @@ impl Storage {
 
     pub fn list_managed_accounts(&self) -> Result<Vec<ManagedAccount>> {
         let mut statement = self.conn.prepare(
-            "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence FROM accounts ORDER BY alias",
+            "SELECT id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence,notifications_muted FROM accounts ORDER BY alias",
         )?;
         let rows = statement
             .query_map([], |r| {
@@ -1428,6 +1432,7 @@ impl Storage {
                     enabled: enabled_int != 0,
                     custom_path: r.get(8)?,
                     identity_confidence: parse_confidence(r.get(9)?),
+                    notifications_muted: r.get::<_, i64>(10).unwrap_or(0) != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1436,7 +1441,7 @@ impl Storage {
 
     pub fn create_managed_account(&mut self, account: &ManagedAccount) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,product_id=excluded.product_id,external_identity_fingerprint=excluded.external_identity_fingerprint,alias=excluded.alias,connection_ref=excluded.connection_ref,lifecycle=excluded.lifecycle,enabled=excluded.enabled,custom_path=excluded.custom_path,identity_confidence=excluded.identity_confidence",
+            "INSERT INTO accounts(id,provider_id,product_id,external_identity_fingerprint,alias,connection_ref,lifecycle,enabled,custom_path,identity_confidence,notifications_muted,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,product_id=excluded.product_id,external_identity_fingerprint=excluded.external_identity_fingerprint,alias=excluded.alias,connection_ref=excluded.connection_ref,lifecycle=excluded.lifecycle,enabled=excluded.enabled,custom_path=excluded.custom_path,identity_confidence=excluded.identity_confidence,notifications_muted=excluded.notifications_muted",
             params![
                 account.id.to_string(),
                 account.provider_id,
@@ -1448,10 +1453,20 @@ impl Storage {
                 i64::from(account.enabled),
                 account.custom_path,
                 format!("{:?}", account.identity_confidence),
+                i64::from(account.notifications_muted),
                 Utc::now().to_rfc3339()
             ],
         )?;
         Ok(())
+    }
+
+    /// Per-profile notification mute (V13-06): silences alerts for one
+    /// account without touching its refresh lifecycle.
+    pub fn set_account_muted(&mut self, account_id: uuid::Uuid, muted: bool) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE accounts SET notifications_muted=? WHERE id=?",
+            params![i64::from(muted), account_id.to_string()],
+        )? > 0)
     }
 
     /// First-seen identity persistence and explicit re-bind only.
@@ -1932,6 +1947,7 @@ pub struct ManagedAccount {
     pub enabled: bool,
     pub custom_path: Option<String>,
     pub identity_confidence: usage_core::IdentityConfidence,
+    pub notifications_muted: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2816,6 +2832,7 @@ mod tests {
             enabled: true,
             custom_path: None,
             identity_confidence: usage_core::IdentityConfidence::Weak,
+            notifications_muted: false,
         };
         s.create_managed_account(&account).unwrap();
         assert!(s.get_account(account.id).unwrap().unwrap().enabled);
@@ -3260,4 +3277,62 @@ fn migrates_v7_database_with_candidates_table() {
         .upsert_candidate("ff00", "anthropic", "claude-code", ".claude-work")
         .unwrap();
     assert_eq!(storage.list_candidates(true).unwrap().len(), 1);
+}
+
+#[test]
+fn migrates_to_v9_with_account_mute_default_off() {
+    let mut storage = Storage::in_memory().unwrap();
+    let id = uuid::Uuid::new_v4();
+    storage
+        .create_managed_account(&ManagedAccount {
+            id,
+            provider_id: "openai".into(),
+            product_id: Some("codex".into()),
+            external_identity: None,
+            label: "T".into(),
+            connection_ref: None,
+            lifecycle: usage_core::AccountLifecycle::Active,
+            enabled: true,
+            custom_path: None,
+            identity_confidence: usage_core::IdentityConfidence::Unknown,
+            notifications_muted: false,
+        })
+        .unwrap();
+    // Default off, set/get roundtrip, surviving re-read.
+    assert!(
+        !storage
+            .get_account(id)
+            .unwrap()
+            .unwrap()
+            .notifications_muted
+    );
+    assert!(storage.set_account_muted(id, true).unwrap());
+    assert!(
+        storage
+            .get_account(id)
+            .unwrap()
+            .unwrap()
+            .notifications_muted
+    );
+    assert!(
+        storage
+            .list_managed_accounts()
+            .unwrap()
+            .iter()
+            .find(|a| a.id == id)
+            .unwrap()
+            .notifications_muted
+    );
+    assert!(storage.set_account_muted(id, false).unwrap());
+    assert!(
+        !storage
+            .get_account(id)
+            .unwrap()
+            .unwrap()
+            .notifications_muted
+    );
+    // Unknown account: no row touched.
+    assert!(!storage
+        .set_account_muted(uuid::Uuid::new_v4(), true)
+        .unwrap());
 }

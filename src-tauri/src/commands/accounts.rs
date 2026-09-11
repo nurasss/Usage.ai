@@ -49,6 +49,7 @@ pub async fn configure_openai_admin_connection(
         enabled: true,
         custom_path: None,
         identity_confidence: usage_core::IdentityConfidence::Weak,
+        notifications_muted: false,
     };
     state
         .storage
@@ -158,6 +159,7 @@ pub fn add_account(
         } else {
             usage_core::IdentityConfidence::Unknown
         },
+        notifications_muted: false,
     };
     if needs_secret {
         // Synchronous Keychain write through the blocking host path is
@@ -264,6 +266,32 @@ pub async fn test_connection(
         warnings: diag.warnings,
         recent_attempts: vec![],
     })
+}
+
+/// Per-profile notification mute (V13-06): silences alerts for one
+/// account; its refresh lifecycle is untouched.
+#[tauri::command]
+pub fn set_account_muted(
+    account_id: String,
+    muted: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let id: Uuid = account_id.parse().map_err(|_| "invalid_account_id")?;
+    let storage = state.storage.clone();
+    set_account_muted_inner(&storage, id, muted)
+}
+
+pub fn set_account_muted_inner(
+    storage: &std::sync::Mutex<usage_storage::Storage>,
+    id: Uuid,
+    muted: bool,
+) -> Result<bool, String> {
+    // Returns whether a row was touched: false means no such account
+    // (never a silent success).
+    let mut storage = storage.lock().map_err(|_| "storage_lock")?;
+    Ok(storage
+        .set_account_muted(id, muted)
+        .map_err(|_| "account_mute_failed")?)
 }
 
 #[tauri::command]
@@ -456,6 +484,7 @@ pub fn connect_candidate(
         enabled: true,
         custom_path: Some(path.to_string_lossy().into_owned()),
         identity_confidence: usage_core::IdentityConfidence::Unknown,
+        notifications_muted: false,
     };
     {
         let mut storage = state.storage.lock().map_err(|_| "storage_lock")?;
@@ -504,4 +533,66 @@ pub fn ignore_candidate(
         .map_err(|_| "storage_lock")?
         .set_candidate_status(&root_hash, "ignored")
         .map_err(|_| "candidate_store_failed")?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn stored_account(storage: &Mutex<usage_storage::Storage>) -> Uuid {
+        let id = Uuid::new_v4();
+        storage
+            .lock()
+            .unwrap()
+            .create_managed_account(&ManagedAccount {
+                id,
+                provider_id: "openai".into(),
+                product_id: Some("codex".into()),
+                external_identity: None,
+                label: "T".into(),
+                connection_ref: None,
+                lifecycle: AccountLifecycle::Active,
+                enabled: true,
+                custom_path: None,
+                identity_confidence: usage_core::IdentityConfidence::Unknown,
+                notifications_muted: false,
+            })
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn mute_roundtrips_without_touching_lifecycle() {
+        let storage = Mutex::new(usage_storage::Storage::in_memory().unwrap());
+        let id = stored_account(&storage);
+        assert!(set_account_muted_inner(&storage, id, true).unwrap());
+        let account = storage.lock().unwrap().get_account(id).unwrap().unwrap();
+        assert!(account.notifications_muted);
+        assert!(account.enabled);
+        assert_eq!(account.lifecycle, AccountLifecycle::Active);
+        assert!(set_account_muted_inner(&storage, id, false).unwrap());
+        assert!(
+            !storage
+                .lock()
+                .unwrap()
+                .get_account(id)
+                .unwrap()
+                .unwrap()
+                .notifications_muted
+        );
+        // Unknown account: storage reports untouched.
+        assert!(!set_account_muted_inner(&storage, Uuid::new_v4(), true).unwrap());
+    }
+
+    #[test]
+    fn settings_without_tray_profile_deserialize_to_none() {
+        // Backward compat: settings files written before V13-06 load
+        // with automatic tray metric.
+        let legacy = r#"{"launchAtLogin":false,"refreshIntervalMinutes":5,"menuBarMode":"icon","globalShortcut":"Ctrl+Alt+U","theme":"system","retentionDays":90,"quotaWarningPercent":20,"notificationsEnabled":false,"quietHoursStart":null,"quietHoursEnd":null}"#;
+        let settings: crate::dto::AppSettings = serde_json::from_str(legacy).unwrap();
+        assert!(settings.tray_profile_account_id.is_none());
+        let roundtrip = serde_json::to_string(&settings).unwrap();
+        assert!(roundtrip.contains("trayProfileAccountId"));
+    }
 }

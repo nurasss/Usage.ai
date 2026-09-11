@@ -16,11 +16,30 @@ pub fn deliver(app: &AppHandle, state: &AppState, snapshot: &AppSnapshot) {
     if !settings.notifications_enabled || quiet_now(&settings) {
         return;
     }
+    // Per-profile mute: silenced accounts refresh normally but never
+    // alert. Unknown accounts default to notifying (fail-open toward
+    // visibility, never toward silence).
+    let muted: std::collections::HashSet<String> = state
+        .storage
+        .lock()
+        .ok()
+        .map(|storage| {
+            storage
+                .list_managed_accounts()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|account| account.notifications_muted)
+                .map(|account| account.id.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     let views: Vec<ProviderNoticeView> = snapshot
         .providers
         .iter()
+        .filter(|p| !muted.contains(&p.account_id))
         .map(|p| ProviderNoticeView {
             account_id: p.account_id.clone(),
+            alias: p.alias.clone(),
             provider_name: p.provider_name.clone(),
             product_name: p.product_name.clone(),
             connection_state: p.connection_state.clone(),
@@ -44,9 +63,10 @@ pub fn deliver(app: &AppHandle, state: &AppState, snapshot: &AppSnapshot) {
     let planned: Vec<PlannedNotice> = match state.planner.lock() {
         Ok(mut planner) => {
             let now = Utc::now();
+            let thresholds = usage_runtime::warning_thresholds(settings.quota_warning_percent);
             views
                 .iter()
-                .flat_map(|v| planner.plan_provider(v, now))
+                .flat_map(|v| planner.plan_provider_at(v, now, &thresholds))
                 .collect()
         }
         Err(_) => vec![],

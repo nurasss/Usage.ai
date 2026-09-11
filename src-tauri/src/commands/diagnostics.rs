@@ -152,7 +152,8 @@ fn redact_labeled(text: &str, label: &str, marker: &str) -> String {
             k += 1;
         }
         // Allow the usual token tail chars after the alnum run.
-        while k < bytes.len() && matches!(bytes[k], b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=') {
+        while k < bytes.len() && matches!(bytes[k], b'-' | b'_' | b'.' | b'~' | b'+' | b'/' | b'=')
+        {
             k += 1;
         }
         if k - start_val >= 4 {
@@ -244,10 +245,7 @@ pub fn diagnostics_export_payload(state: &AppState) -> serde_json::Value {
 /// free-text redaction. Personal paths never appear (aliases only);
 /// anything resembling a secret becomes `[redacted-*]`.
 #[tauri::command]
-pub fn copy_diagnostics_text(
-    state: tauri::State<'_, AppState>,
-    account_id: String,
-) -> String {
+pub fn copy_diagnostics_text(state: tauri::State<'_, AppState>, account_id: String) -> String {
     let diagnostics = get_diagnostics_inner(state.inner());
     let imports = get_import_stats_inner(state.inner());
     render_copy_text(&diagnostics, &imports, &account_id)
@@ -311,7 +309,10 @@ pub fn render_copy_text(
             stats.checkpoint_resets,
         ));
         for warning in &stats.warnings {
-            out.push_str(&format!("  import warning: {}\n", redact_free_text(warning)));
+            out.push_str(&format!(
+                "  import warning: {}\n",
+                redact_free_text(warning)
+            ));
         }
     }
     out
@@ -387,10 +388,7 @@ mod tests {
     #[test]
     fn latency_from_valid_timestamps() {
         assert_eq!(
-            attempt_latency_ms(
-                "2026-09-10T10:00:00Z",
-                "2026-09-10T10:00:01.500Z"
-            ),
+            attempt_latency_ms("2026-09-10T10:00:00Z", "2026-09-10T10:00:01.500Z"),
             Some(1500)
         );
         assert_eq!(attempt_latency_ms("bogus", "2026-09-10T10:00:01Z"), None);

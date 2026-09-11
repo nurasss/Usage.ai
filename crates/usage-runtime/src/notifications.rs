@@ -19,6 +19,9 @@ pub struct QuotaNoticeView {
 #[derive(Debug, Clone)]
 pub struct ProviderNoticeView {
     pub account_id: String,
+    /// Human profile label: every native notification names the
+    /// profile it belongs to (acceptance), never just the product.
+    pub alias: String,
     pub provider_name: String,
     pub product_name: String,
     pub connection_state: ConnectionState,
@@ -54,6 +57,14 @@ fn auth_like(state: &ConnectionState) -> bool {
     )
 }
 
+/// Used-% warning levels from the user's remaining-% setting P:
+/// always fire at exhausted (100% used) plus the configured level
+/// (100-P). P is clamped to 1..=99 so both levels stay distinct.
+pub fn warning_thresholds(warn_remaining_percent: u8) -> [u8; 2] {
+    let level = 100u8.saturating_sub(warn_remaining_percent.clamp(1, 99));
+    [100, level.max(1)]
+}
+
 fn state_label(state: &ConnectionState) -> &'static str {
     match state {
         ConnectionState::AuthenticationRequired => "Нужна авторизация",
@@ -70,6 +81,19 @@ impl Planner {
         view: &ProviderNoticeView,
         now: DateTime<Utc>,
     ) -> Vec<PlannedNotice> {
+        self.plan_provider_at(view, now, &[100, 90, 80])
+    }
+
+    /// Threshold-parameterized planning: `warn_used` lists used-%
+    /// levels that fire (e.g. `[100, 80]` warns at exhausted and at
+    /// 80% used). The app layer derives it from the user's
+    /// quota-warning setting; tests pin explicit lists.
+    pub fn plan_provider_at(
+        &mut self,
+        view: &ProviderNoticeView,
+        now: DateTime<Utc>,
+        warn_used: &[u8],
+    ) -> Vec<PlannedNotice> {
         let mut out = vec![];
         let account_key = view.account_id.clone();
         // Disconnect/auth transitions fire even on stale snapshots.
@@ -78,7 +102,10 @@ impl Planner {
         {
             out.push(PlannedNotice {
                 account_id: view.account_id.clone(),
-                title: format!("{} · {}", view.provider_name, view.product_name),
+                title: format!(
+                    "{} · {} · {}",
+                    view.alias, view.provider_name, view.product_name
+                ),
                 body: format!(
                     "{} — откройте исходный клиент или проверьте подключение",
                     state_label(&view.connection_state)
@@ -118,7 +145,7 @@ impl Planner {
             if reset_confirmed {
                 out.push(PlannedNotice {
                     account_id: view.account_id.clone(),
-                    title: format!("{} · {}", view.provider_name, quota.name),
+                    title: format!("{} · {} · {}", view.alias, view.provider_name, quota.name),
                     body: "Лимит восстановлен — подтверждено новым наблюдением".into(),
                     metric: format!("quota-reset:{}", quota.pool_id),
                     threshold: 0,
@@ -148,7 +175,10 @@ impl Planner {
                             if exhaust_at < reset_at {
                                 out.push(PlannedNotice {
                                     account_id: view.account_id.clone(),
-                                    title: format!("{} · {}", view.provider_name, quota.name),
+                                    title: format!(
+                                        "{} · {} · {}",
+                                        view.alias, view.provider_name, quota.name
+                                    ),
                                     body: "Темп выше лимита: может исчерпаться до сброса".into(),
                                     metric: format!("pace:{}", quota.pool_id),
                                     threshold: 0,
@@ -159,13 +189,13 @@ impl Planner {
                     }
                 }
             }
-            for threshold in [100u8, 90, 80] {
+            for threshold in warn_used.iter().copied() {
                 if remaining > f64::from(100 - threshold) {
                     continue;
                 }
                 out.push(PlannedNotice {
                     account_id: view.account_id.clone(),
-                    title: format!("{} · {}", view.provider_name, quota.name),
+                    title: format!("{} · {} · {}", view.alias, view.provider_name, quota.name),
                     body: format!("Использовано {threshold}% · осталось {:.0}%", remaining),
                     metric: format!("quota:{}", quota.pool_id),
                     threshold,
@@ -224,6 +254,7 @@ mod tests {
     ) -> ProviderNoticeView {
         ProviderNoticeView {
             account_id: "a1".into(),
+            alias: "Personal".into(),
             provider_name: "OpenAI".into(),
             product_name: "Codex".into(),
             connection_state: state,
@@ -474,5 +505,50 @@ mod tests {
             n2.is_empty(),
             "unverified provider notices must be completely suppressed"
         );
+    }
+
+    #[test]
+    fn titles_name_the_profile() {
+        let mut planner = Planner::default();
+        let now = Utc::now();
+        let notices = planner.plan_provider(
+            &view(
+                ConnectionState::Connected,
+                true,
+                vec![quota("w", 5.0, "win")],
+            ),
+            now,
+        );
+        assert!(!notices.is_empty());
+        assert!(
+            notices.iter().all(|n| n.title.starts_with("Personal · ")),
+            "every title names the profile: {:?}",
+            notices.iter().map(|n| &n.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn warning_thresholds_derive_from_remaining_setting() {
+        assert_eq!(warning_thresholds(20), [100, 80]);
+        assert_eq!(warning_thresholds(10), [100, 90]);
+        assert_eq!(warning_thresholds(0), [100, 99]);
+        assert_eq!(warning_thresholds(100), [100, 1]);
+    }
+
+    #[test]
+    fn custom_thresholds_fire_at_configured_level_only() {
+        let mut planner = Planner::default();
+        let now = Utc::now();
+        // 15% remaining: fires at used>=80, stays silent for used>=90.
+        let view = view(
+            ConnectionState::Connected,
+            true,
+            vec![quota("w", 15.0, "win")],
+        );
+        let notices = planner.plan_provider_at(&view, now, &[100, 80]);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].threshold, 80);
+        let silent = Planner::default().plan_provider_at(&view, now, &[100, 90]);
+        assert!(silent.is_empty());
     }
 }

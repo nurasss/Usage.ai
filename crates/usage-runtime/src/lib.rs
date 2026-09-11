@@ -17,7 +17,9 @@ pub use aggregation::{
 };
 pub use connection_test::{test_connection, ConnectionTestDiagnostics};
 pub use history_import::{import_connection, ImportReport, ImportRequest};
-pub use notifications::{PlannedNotice, Planner, ProviderNoticeView, QuotaNoticeView};
+pub use notifications::{
+    warning_thresholds, PlannedNotice, Planner, ProviderNoticeView, QuotaNoticeView,
+};
 pub use orchestration::{
     collect_requests, ensure_local_accounts, import_all_history, stable_local_account, AccountMeta,
 };

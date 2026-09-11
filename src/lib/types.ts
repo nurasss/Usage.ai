@@ -49,6 +49,7 @@ export interface ProviderSnapshot {
   quotaFallback?: boolean;
   fallbackReason?: string;
   identityConfidence?: string;
+  selectedSource?: string;
 }
 
 export interface OverviewSegment { label: string; value: number; color: string; }
@@ -78,6 +79,7 @@ export interface AppSettings {
   globalShortcut: string; theme: 'system' | 'light' | 'dark'; retentionDays: number;
   quotaWarningPercent: number; notificationsEnabled: boolean;
   quietHoursStart?: string; quietHoursEnd?: string;
+  trayProfileAccountId?: string | null;
 }
 
 export interface AttemptInfo {
@@ -98,6 +100,7 @@ export interface Diagnostics {
 export interface AccountInfo {
   id: string; providerId: string; productId?: string; label: string; lifecycle: string;
   connectionRef?: string; enabled: boolean; customPath?: string; identityConfidence?: string;
+  notificationsMuted?: boolean;
 }
 
 export type AccountModel = 'localClient' | 'apiKey' | 'discoveryOnly';

@@ -80,6 +80,7 @@ pub fn run() {
             crate::commands::accounts::list_accounts,
             crate::commands::accounts::add_account,
             crate::commands::accounts::update_account,
+            crate::commands::accounts::set_account_muted,
             crate::commands::accounts::test_connection,
             crate::commands::accounts::configure_openai_admin_connection,
             crate::commands::accounts::remove_connection_secret,
