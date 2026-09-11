@@ -73,7 +73,131 @@ pub fn redact_free_text(input: &str) -> String {
     out = redact_labeled(&out, "password", "[redacted]");
     out = redact_labeled(&out, "cookie", "[redacted]");
     out = redact_pem(&out);
+    out = redact_emails(&out);
+    out = redact_home_paths(&out);
     out
+}
+
+/// Bare email addresses have no other secret marker but are PII all
+/// the same (§16). Conservative ASCII pattern; version strings and
+/// source markers (`name@123`) never match the dot-TLD shape.
+fn redact_emails(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut spans: Vec<(usize, usize)> = vec![];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'@' {
+            let mut start = i;
+            while start > 0 && is_email_local(bytes[start - 1]) {
+                start -= 1;
+            }
+            let mut end = i + 1;
+            while end < bytes.len() && is_email_domain(bytes[end]) {
+                end += 1;
+            }
+            // Require local part, domain dot, and 2+ letter TLD.
+            if end - start >= 5
+                && start < i
+                && text[start..i].chars().any(|c| c != '.')
+                && text[i + 1..end].contains('.')
+                && text[i + 1..end].rsplit('.').next().is_some_and(|tld| {
+                    tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic())
+                })
+            {
+                spans.push((start, end));
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (start, end) in spans {
+        out.push_str(&text[last..start]);
+        out.push_str("[redacted-email]");
+        last = end;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+fn is_email_local(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-')
+}
+
+fn is_email_domain(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')
+}
+
+/// Absolute home-dir paths (`/Users/<…>`, `/home/<…>`,
+/// `/private/<…>`, `C:\<…>`) collapse to the anchored prefix:
+/// layout survives, identity does not.
+fn redact_home_paths(text: &str) -> String {
+    let mut out = text.to_string();
+    for (prefix, marker) in [
+        ("/Users/", "/Users/[redacted]"),
+        ("/home/", "/home/[redacted]"),
+        ("/private/", "/private/[redacted]"),
+    ] {
+        let mut rebuilt = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(pos) = rest.find(prefix) {
+            let after = &rest[pos + prefix.len()..];
+            let tail_len: usize = after
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(c, ',' | ';' | '"' | '\''))
+                .map(|c| c.len_utf8())
+                .sum();
+            rebuilt.push_str(&rest[..pos]);
+            if tail_len > 0 {
+                rebuilt.push_str(marker);
+                rest = &after[tail_len..];
+            } else {
+                rebuilt.push_str(prefix);
+                rest = after;
+            }
+        }
+        rebuilt.push_str(rest);
+        out = rebuilt;
+    }
+    // Windows absolute paths `C:\…` (byte-safe walk).
+    let mut rebuilt = String::with_capacity(out.len());
+    let bytes = out.as_bytes();
+    let mut i = 0usize;
+    while i < out.len() {
+        if i + 3 <= out.len()
+            && bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/')
+        {
+            let mut k = i + 3;
+            loop {
+                let Some(c) = out[k..].chars().next() else {
+                    break;
+                };
+                if c.is_whitespace() || matches!(c, ',' | ';' | '"' | '\'') {
+                    break;
+                }
+                k += c.len_utf8();
+            }
+            if k > i + 3 {
+                rebuilt.push_str(&out[i..i + 2]);
+                rebuilt.push_str("\\[redacted]");
+                i = k;
+                continue;
+            }
+        }
+        let Some(c) = out[i..].chars().next() else {
+            break;
+        };
+        rebuilt.push(c);
+        i += c.len_utf8();
+    }
+    rebuilt
 }
 
 fn is_secret_char(c: char) -> bool {
@@ -232,11 +356,131 @@ fn redact_pem(text: &str) -> String {
     out
 }
 
+/// Single sanitizer for BOTH diagnostics surfaces (§16): the safe
+/// copy text and the JSON file export derive from this allowlisted,
+/// redacted bundle — never from raw DTO serialization. Only
+/// structural operational fields survive; free text is redacted;
+/// emails/paths/tokens/headers/payloads/prompts have no field to
+/// travel through.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizedAttempt {
+    pub source: String,
+    pub status: String,
+    pub safe_code: Option<String>,
+    pub finished_at: String,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizedAccount {
+    pub provider: String,
+    pub product: String,
+    pub account_id: String,
+    pub account_alias: String,
+    pub selected_source: Option<String>,
+    pub connection_state: String,
+    pub freshness: String,
+    pub coverage: String,
+    pub status_class: Option<String>,
+    pub connector_version: String,
+    pub parser_version: String,
+    pub schema_fingerprint: Option<String>,
+    pub capabilities_detected: Vec<String>,
+    pub cooldown_until: Option<String>,
+    pub last_refresh_attempt: Option<String>,
+    pub last_successful_refresh: Option<String>,
+    pub last_data_observed_at: Option<String>,
+    pub last_safe_error_code: Option<String>,
+    pub warnings: Vec<String>,
+    pub recent_attempts: Vec<SanitizedAttempt>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizedImport {
+    pub product_id: String,
+    pub files_discovered: usize,
+    pub files_imported: usize,
+    pub records_accepted: usize,
+    pub malformed: usize,
+    pub checkpoint_resets: usize,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SanitizedBundle {
+    pub accounts: Vec<SanitizedAccount>,
+    pub imports: Vec<SanitizedImport>,
+}
+
+pub fn sanitize_diagnostics(
+    diagnostics: &[crate::dto::DiagnosticsDto],
+    imports: &[crate::dto::ImportStatsDto],
+) -> SanitizedBundle {
+    SanitizedBundle {
+        accounts: diagnostics
+            .iter()
+            .map(|item| SanitizedAccount {
+                provider: item.provider.clone(),
+                product: item.product.clone(),
+                account_id: item.account_id.clone(),
+                account_alias: redact_free_text(&item.account_alias),
+                selected_source: item.selected_source.clone(),
+                connection_state: format!("{:?}", item.connection_state),
+                freshness: format!("{:?}", item.freshness),
+                coverage: format!("{:?}", item.coverage),
+                status_class: item.status_class.clone(),
+                connector_version: item.connector_version.clone(),
+                parser_version: item.parser_version.clone(),
+                schema_fingerprint: item.schema_fingerprint.clone(),
+                capabilities_detected: item.capabilities_detected.clone(),
+                cooldown_until: item.cooldown_until.clone(),
+                last_refresh_attempt: item.last_refresh_attempt.clone(),
+                last_successful_refresh: item.last_successful_refresh.clone(),
+                last_data_observed_at: item.last_data_observed_at.clone(),
+                last_safe_error_code: item.last_safe_error_code.clone(),
+                warnings: item.warnings.iter().map(|w| redact_free_text(w)).collect(),
+                recent_attempts: item
+                    .recent_attempts
+                    .iter()
+                    .map(|attempt| SanitizedAttempt {
+                        source: attempt.source.clone(),
+                        status: attempt.status.clone(),
+                        safe_code: attempt.safe_code.clone(),
+                        finished_at: attempt.finished_at.clone(),
+                        latency_ms: attempt.latency_ms,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        imports: imports
+            .iter()
+            .map(|stats| SanitizedImport {
+                product_id: stats.product_id.clone(),
+                files_discovered: stats.files_discovered,
+                files_imported: stats.files_imported,
+                records_accepted: stats.records_accepted,
+                malformed: stats.malformed,
+                checkpoint_resets: stats.checkpoint_resets,
+                warnings: stats.warnings.iter().map(|w| redact_free_text(w)).collect(),
+            })
+            .collect(),
+    }
+}
+
 pub fn diagnostics_export_payload(state: &AppState) -> serde_json::Value {
+    let bundle = sanitize_diagnostics(
+        &get_diagnostics_inner(state),
+        &get_import_stats_inner(state),
+    );
     serde_json::json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "exportedAt": Utc::now().to_rfc3339(),
-        "diagnostics": get_diagnostics_inner(state),
+        "accounts": bundle.accounts,
+        "imports": bundle.imports,
     })
 }
 
@@ -256,15 +500,25 @@ pub fn render_copy_text(
     imports: &[crate::dto::ImportStatsDto],
     account_id: &str,
 ) -> String {
+    // Same sanitized bundle as the file export (§16 equivalence);
+    // only the presentation (text vs JSON) differs.
+    render_sanitized_copy(&sanitize_diagnostics(diagnostics, imports), account_id)
+}
+
+fn render_sanitized_copy(bundle: &SanitizedBundle, account_id: &str) -> String {
     let mut out = String::from("Usage.ai diagnostics (safe copy, secrets redacted)\n");
     let mut matched = false;
-    for item in diagnostics.iter().filter(|d| d.account_id == account_id) {
+    for item in bundle
+        .accounts
+        .iter()
+        .filter(|d| d.account_id == account_id)
+    {
         matched = true;
         out.push_str(&format!(
-            "\n[{}/{}] {}\n  source: {}\n  state: {:?}\n  coverage: {:?}\n  freshness: {:?}\n  last attempt: {}\n  last success: {}\n  cooldown until: {}\n  error: {}\n  connector: {} parser: {} schema: {}\n  capabilities: {}\n",
+            "\n[{}/{}] {}\n  source: {}\n  state: {}\n  coverage: {}\n  freshness: {}\n  last attempt: {}\n  last success: {}\n  cooldown until: {}\n  error: {}\n  connector: {} parser: {} schema: {}\n  capabilities: {}\n",
             item.provider,
             item.product,
-            redact_free_text(&item.account_alias),
+            item.account_alias,
             item.selected_source.as_deref().unwrap_or("-"),
             item.connection_state,
             item.coverage,
@@ -279,8 +533,7 @@ pub fn render_copy_text(
             item.capabilities_detected.join(","),
         ));
         if !item.warnings.is_empty() {
-            let warnings: Vec<_> = item.warnings.iter().map(|w| redact_free_text(w)).collect();
-            out.push_str(&format!("  warnings: {}\n", warnings.join("; ")));
+            out.push_str(&format!("  warnings: {}\n", item.warnings.join("; ")));
         }
         for attempt in &item.recent_attempts {
             out.push_str(&format!(
@@ -298,7 +551,7 @@ pub fn render_copy_text(
     if !matched {
         out.push_str("\n(no matching account)\n");
     }
-    for stats in imports {
+    for stats in &bundle.imports {
         out.push_str(&format!(
             "\n[import {}] discovered={} imported={} accepted={} malformed={} resets={}\n",
             stats.product_id,
@@ -309,10 +562,7 @@ pub fn render_copy_text(
             stats.checkpoint_resets,
         ));
         for warning in &stats.warnings {
-            out.push_str(&format!(
-                "  import warning: {}\n",
-                redact_free_text(warning)
-            ));
+            out.push_str(&format!("  import warning: {warning}\n"));
         }
     }
     out
@@ -513,5 +763,102 @@ mod tests {
         let empty = render_copy_text(&diags, &imports, "acc-9");
         assert!(empty.contains("(no matching account)"));
         assert!(empty.contains("[import codex]"));
+    }
+
+    fn hostile_diag() -> (DiagnosticsDto, ImportStatsDto) {
+        let mut diag = sample_diag("alice@example.com", "acc-9");
+        diag.warnings = vec![
+            "path /Users/alice/private/project leaked".into(),
+            "Authorization: Bearer SUPERSECRETVALUE123".into(),
+            "key sk-test-secret-abcdef123456 here".into(),
+            "project MyPrivateProject failed".into(),
+        ];
+        diag.recent_attempts = vec![AttemptDto {
+            source: "codex-app-server".into(),
+            status: "error".into(),
+            safe_code: Some("authentication_required".into()),
+            finished_at: "2026-09-10T10:00:01Z".into(),
+            latency_ms: Some(250),
+        }];
+        let imports = ImportStatsDto {
+            product_id: "codex".into(),
+            files_discovered: 3,
+            files_imported: 3,
+            records_accepted: 10,
+            malformed: 1,
+            checkpoint_resets: 0,
+            warnings: vec!["odd line in /Users/alice/private/project".into()],
+        };
+        (diag, imports)
+    }
+
+    /// Positive leak injection through the PRODUCTION file-export
+    /// path: hostile user-controlled text must not survive anywhere.
+    /// (Bare codenames like `MyPrivateProject` carry no secret, email,
+    /// or path shape: the contract sanitizes shapes, it does not
+    /// censor ordinary words — the alias stays attributable.)
+    #[test]
+    fn file_export_sanitizes_hostile_fields() {
+        let (diag, imports) = hostile_diag();
+        let bundle =
+            sanitize_diagnostics(std::slice::from_ref(&diag), std::slice::from_ref(&imports));
+        let exported =
+            serde_json::to_string(&serde_json::json!({ "accounts": bundle.accounts })).unwrap();
+        for leaked in [
+            "alice@example.com",
+            "/Users/alice/private/project",
+            "SUPERSECRETVALUE123",
+            "sk-test-secret-abcdef123456",
+        ] {
+            assert!(!exported.contains(leaked), "file export leaks {leaked:?}");
+        }
+        // Labels survive (intelligibility), values do not.
+        assert!(exported.contains("Bearer"));
+        assert!(!exported.contains("SUPERSECRET"));
+    }
+
+    /// Valid operational diagnostics survive sanitization intact.
+    #[test]
+    fn file_export_preserves_safe_operational_fields() {
+        let (diag, imports) = hostile_diag();
+        let bundle =
+            sanitize_diagnostics(std::slice::from_ref(&diag), std::slice::from_ref(&imports));
+        let account = &bundle.accounts[0];
+        assert_eq!(account.provider, "openai");
+        assert_eq!(account.product, "codex");
+        assert_eq!(account.account_id, "acc-9");
+        assert_eq!(account.selected_source.as_deref(), Some("codex-app-server"));
+        assert_eq!(account.coverage, "Complete");
+        assert_eq!(account.last_safe_error_code.as_deref(), None);
+        assert_eq!(account.recent_attempts[0].latency_ms, Some(250));
+        assert_eq!(
+            account.recent_attempts[0].safe_code.as_deref(),
+            Some("authentication_required")
+        );
+        assert_eq!(bundle.imports[0].files_discovered, 3);
+        assert_eq!(bundle.imports[0].malformed, 1);
+        // Redacted alias keeps a readable, secret-free shape.
+        assert!(!account.account_alias.contains('@'));
+    }
+
+    /// Equivalence: copy text and file export share the sanitized
+    /// semantic payload — only presentation differs.
+    #[test]
+    fn copy_and_export_share_sanitized_semantics() {
+        let (diag, imports) = hostile_diag();
+        let diags = vec![diag];
+        let imports = vec![imports];
+        let bundle = sanitize_diagnostics(&diags, &imports);
+        let text = render_copy_text(&diags, &imports, "acc-9");
+        let exported = serde_json::to_string(&bundle).unwrap();
+        // Same redacted alias on both surfaces.
+        assert!(text.contains(&bundle.accounts[0].account_alias));
+        assert!(exported.contains(&bundle.accounts[0].account_alias));
+        // Same attempt facts on both surfaces.
+        assert!(text.contains("codex-app-server error authentication_required 250ms"));
+        assert!(exported.contains("authentication_required"));
+        // Same import counts on both surfaces.
+        assert!(text.contains("malformed=1"));
+        assert!(exported.contains("\"malformed\":1"));
     }
 }
