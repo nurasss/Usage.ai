@@ -530,8 +530,19 @@ mod tests {
             .expect("capped run");
         assert!(out.len() <= 4096 + 64 * 1024, "cap exceeded: {}", out.len());
         assert!(!out.is_empty());
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(active_yes_count(), before, "yes child leaked");
+        // Poll for reaping: a real leak persists forever, but
+        // scheduling delays under load must not flake the gate.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if active_yes_count() == before {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "yes child leaked"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
     #[cfg(unix)]
     fn active_yes_count() -> usize {

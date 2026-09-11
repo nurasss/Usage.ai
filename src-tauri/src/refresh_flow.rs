@@ -46,8 +46,25 @@ pub async fn run_full_refresh(state: &AppState, app: &AppHandle, trigger: Trigge
         .iter()
         .map(|(request, meta)| (request.scope.clone(), meta.clone()))
         .collect();
-    let requests = pairs.into_iter().map(|(request, _)| request).collect();
-    let outcomes = state.coordinator.refresh_many(requests).await;
+    // Adaptive cadence (§14.2): manual refresh is always due;
+    // scheduled/wake ticks refresh due scopes and serve LKG fills
+    // for the rest — no polling storm, no failure recorded for idle
+    // scopes. Persisted cooldowns stay enforced inside execution.
+    let manual = trigger == Trigger::Manual;
+    let interval = crate::commands::settings::read_settings(state)
+        .refresh_interval_minutes
+        .map(|minutes| std::time::Duration::from_secs(minutes * 60))
+        .unwrap_or(usage_core::refresh_policy::NORMAL_CADENCE_FLOOR);
+    let (due, idle) = partition_due(
+        pairs,
+        &state.coordinator.states_snapshot(),
+        manual,
+        interval,
+        Utc::now(),
+    );
+    let requests = due;
+    let mut outcomes = state.coordinator.refresh_many(requests).await;
+    outcomes.extend(idle.iter().map(|scope| state.coordinator.lkg_outcome(scope)));
     let mut snapshot = assemble_snapshot(state, &outcomes, &metas);
     // The next-refresh label follows the configured interval instead of
     // a fixed offset; manual mode has no next automatic refresh.
@@ -65,8 +82,42 @@ pub async fn run_full_refresh(state: &AppState, app: &AppHandle, trigger: Trigge
     snapshot
 }
 
-pub fn assemble_snapshot(
-    state: &AppState,
+/// Split refresh requests into due scopes and idle ones. Pure over
+/// coordinator state snapshots so the cadence decision stays
+/// unit-testable; the scheduler loop itself is just a timer.
+pub fn partition_due(
+    pairs: Vec<(RefreshRequest, AccountMeta)>,
+    states: &HashMap<ScopeKey, usage_runtime::RefreshState>,
+    manual: bool,
+    interval: std::time::Duration,
+    now: chrono::DateTime<Utc>,
+) -> (Vec<RefreshRequest>, Vec<ScopeKey>) {
+    let mut due = vec![];
+    let mut idle = vec![];
+    for (request, _) in pairs {
+        let scope_state = states.get(&request.scope);
+        let cooling = scope_state
+            .and_then(|s| s.cooldown_until)
+            .is_some_and(|until| until > now);
+        let last_success = scope_state.and_then(|s| s.last_success);
+        let last_observed = scope_state.and_then(|s| s.last_observed);
+        if usage_core::refresh_policy::refresh_due(
+            last_success,
+            last_observed,
+            cooling,
+            manual,
+            interval,
+            now,
+        ) {
+            due.push(request);
+        } else {
+            idle.push(request.scope.clone());
+        }
+    }
+    (due, idle)
+}
+
+pub fn assemble_snapshot(    state: &AppState,
     outcomes: &[RefreshOutcome],
     metas: &HashMap<ScopeKey, AccountMeta>,
 ) -> AppSnapshot {
@@ -802,8 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_reason_names_first_failed_attempt() {
-        use usage_runtime::{AttemptRecord, AttemptStatus};
+    fn fallback_reason_names_first_failed_attempt() {        use usage_runtime::{AttemptRecord, AttemptStatus};
         let metas = HashMap::new();
         let states = HashMap::new();
         let mut outcome = claude_outcome(Some("claude-oauth-usage"), true);
@@ -830,5 +880,96 @@ mod tests {
             dto.fallback_reason.as_deref(),
             Some("claude-pty-usage:authentication_required")
         );
+    }
+
+    fn partition_request(scope: ScopeKey) -> (RefreshRequest, AccountMeta) {
+        use usage_runtime::Trigger;
+        (
+            RefreshRequest {
+                scope: scope.clone(),
+                account: usage_core::Account {
+                    id: scope.account_id,
+                    provider_id: scope.provider_id.clone(),
+                    external_identity: None,
+                    label: "T".into(),
+                    connection_ref: None,
+                    lifecycle: usage_core::AccountLifecycle::Active,
+                },
+                custom_root: None,
+                secret: None,
+                trigger: Trigger::Scheduled,
+            },
+            AccountMeta { alias: "T".into() },
+        )
+    }
+
+    #[test]
+    fn partition_due_skips_idle_and_cooling_scopes() {
+        use usage_runtime::RefreshState;
+        let now = Utc::now();
+        let interval = std::time::Duration::from_secs(300);
+        let fresh = ScopeKey {
+            account_id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+        };
+        let idle = ScopeKey {
+            account_id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+        };
+        let cooling = ScopeKey {
+            account_id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+        };
+        let new = ScopeKey {
+            account_id: Uuid::new_v4(),
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+        };
+        let mut states = HashMap::new();
+        // Fresh success, no observations: idle (not due).
+        states.insert(
+            idle.clone(),
+            RefreshState {
+                last_success: Some(now - Duration::seconds(30)),
+                ..Default::default()
+            },
+        );
+        // Recent success but cooling: never due, even manual.
+        states.insert(
+            cooling.clone(),
+            RefreshState {
+                last_success: Some(now - Duration::seconds(30)),
+                cooldown_until: Some(now + Duration::minutes(5)),
+                ..Default::default()
+            },
+        );
+        let pairs = vec![
+            partition_request(fresh.clone()),
+            partition_request(idle.clone()),
+            partition_request(cooling.clone()),
+            partition_request(new.clone()),
+        ];
+        let (due, skipped) = partition_due(pairs, &states, false, interval, now);
+        let due_ids: Vec<_> = due.iter().map(|r| r.scope.account_id).collect();
+        // Fresh (old success) and new (bootstrap) are due; idle and
+        // cooling serve LKG fills.
+        assert!(due_ids.contains(&fresh.account_id));
+        assert!(due_ids.contains(&new.account_id));
+        assert_eq!(due.len(), 2);
+        let skipped_ids: Vec<_> = skipped.iter().map(|s| s.account_id).collect();
+        assert!(skipped_ids.contains(&idle.account_id));
+        assert!(skipped_ids.contains(&cooling.account_id));
+        // Manual bypasses cadence but never cooldowns.
+        let pairs = vec![
+            partition_request(idle.clone()),
+            partition_request(cooling.clone()),
+        ];
+        let (due, skipped) = partition_due(pairs, &states, true, interval, now);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].scope.account_id, idle.account_id);
+        assert_eq!(skipped.len(), 1);
     }
 }

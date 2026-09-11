@@ -598,13 +598,20 @@ impl Coordinator {
         })
     }
 
+    /// Last-known-good fill for scopes skipped by cadence: serves the
+    /// stored snapshot as stale with no error and no attempt, so an
+    /// idle scope never shows a failure it never had. Cooling scopes
+    /// keep their persisted error state untouched elsewhere.
+    pub fn lkg_outcome(&self, scope: &ScopeKey) -> RefreshOutcome {
+        self.stale_outcome(scope, None, vec![])
+    }
+
     fn stale_outcome(
         &self,
         scope: &ScopeKey,
         error: Option<SourceError>,
         attempts: Vec<AttemptRecord>,
-    ) -> RefreshOutcome {
-        let snapshot = self.storage.lock().ok().and_then(|storage| {
+    ) -> RefreshOutcome {        let snapshot = self.storage.lock().ok().and_then(|storage| {
             storage
                 .last_known_good(scope.account_id, &scope.product_id)
                 .ok()
@@ -1146,6 +1153,51 @@ mod tests {
         assert!(second[0].stale);
         assert!(second[0].snapshot.is_some());
         assert!(second[0].error.is_some());
+    }
+
+    #[tokio::test]
+    async fn lkg_outcome_serves_stored_snapshot_without_error_or_attempts() {
+        // Cadence-skipped scopes must render their last-known-good
+        // payload silently: stale view, no error, no attempt recorded.
+        let dir = codex_fixture_sessions();
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let http = script_http(ScriptBehavior::CostPage(cost_page()));
+        let coordinator = Arc::new(Coordinator::new(test_hosts(http), storage.clone()));
+        let acc = account("openai", "T");
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+        };
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        // Empty storage: stale shell, still error-free.
+        let empty = coordinator.lkg_outcome(&scope);
+        assert!(empty.stale);
+        assert!(empty.error.is_none());
+        assert!(empty.snapshot.is_none());
+        assert!(empty.attempts.is_empty());
+        // After a successful refresh the stored snapshot is served.
+        let first = coordinator
+            .refresh_many(vec![RefreshRequest {
+                scope: scope.clone(),
+                account: acc.clone(),
+                custom_root: Some(dir.path().join("sessions")),
+                secret: None,
+                trigger: Trigger::Manual,
+            }])
+            .await;
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].stale);
+        let filled = coordinator.lkg_outcome(&scope);
+        assert!(filled.stale);
+        assert!(filled.error.is_none());
+        assert!(filled.attempts.is_empty());
+        let snapshot = filled.snapshot.expect("LKG snapshot");
+        assert!(!snapshot.quotas.is_empty());
+        assert!(matches!(
+            snapshot.freshness,
+            usage_core::Freshness::Stale(_)
+        ));
     }
 
     #[tokio::test]
