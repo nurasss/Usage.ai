@@ -1,0 +1,12 @@
+{
+  "_note": "SANCTIONED malicious-input fixture for PII tripwire tests (remediation §20). Every value below must NEVER appear in diagnostics export output. The repository PII tripwire explicitly allowlists THIS FILE ONLY so the injection can live in-tree without tripping repo hygiene. Do not add real secrets here.",
+  "alias": "alice@example.com",
+  "identity_note": "raw account identity note for acc-9",
+  "warning_path": "path /Users/alice/private/project leaked",
+  "warning_bearer": "Bearer SUPERSECRET",
+  "warning_key": "sk-test-secret",
+  "warning_project": "project MyPrivateProject failed",
+  "warning_workspace": "John Smith Personal Workspace sync error",
+  "warning_client_secret": "client-secret-foo rejected",
+  "warning_account": "PRIVATE_ACCOUNT_NAME mismatch"
+}
