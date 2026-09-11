@@ -1145,8 +1145,7 @@ mod tests {
 #[cfg(test)]
 mod credit_and_order_tests {
     use super::*;
-    use crate::strategy::{FetchContext, FetchStrategy};
-    use uuid::Uuid;
+    use crate::strategy::FetchContext;
 
     #[test]
     fn absent_credits_stay_silent_present_credits_warn() {

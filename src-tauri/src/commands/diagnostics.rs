@@ -175,10 +175,7 @@ fn redact_home_paths(text: &str) -> String {
             && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/')
         {
             let mut k = i + 3;
-            loop {
-                let Some(c) = out[k..].chars().next() else {
-                    break;
-                };
+            while let Some(c) = out[k..].chars().next() {
                 if c.is_whitespace() || matches!(c, ',' | ';' | '"' | '\'') {
                     break;
                 }
