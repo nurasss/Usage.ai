@@ -14,11 +14,15 @@ jobs:
         with: { components: rustfmt, clippy }
       - run: npm ci
       - run: npm run check
+      - run: npm run check:pii
       - run: npm test
       - run: npm run build
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # --locked everywhere: the release tree must build from the
+      # committed lockfile without implicit updates.
+      - run: cargo check --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
 
   intel-macos:
     runs-on: macos-13
@@ -31,8 +35,13 @@ jobs:
           targets: x86_64-apple-darwin
           components: rustfmt, clippy
       - run: npm ci
-      - run: cargo test --workspace --target x86_64-apple-darwin
+      - run: cargo check --workspace --locked --target x86_64-apple-darwin
+      - run: cargo test --workspace --locked --target x86_64-apple-darwin
       - run: npm run tauri build -- --target x86_64-apple-darwin
+        env:
+          # Locked-equivalent for the Tauri-driven cargo build: no
+          # network, no implicit lockfile updates.
+          CARGO_NET_OFFLINE: 'true'
       - name: Verify Intel executable and bundles
         run: |
           executable="$(find target/x86_64-apple-darwin/release/bundle/macos -type f -perm -111 -maxdepth 4 | head -1)"

@@ -3328,11 +3328,13 @@ fn migrates_v8_account_rows_to_v9_without_data_loss() {
     assert!(storage
         .set_account_muted(account_id.parse().unwrap(), true)
         .unwrap());
-    assert!(storage
-        .get_account(account_id.parse().unwrap())
-        .unwrap()
-        .unwrap()
-        .notifications_muted);
+    assert!(
+        storage
+            .get_account(account_id.parse().unwrap())
+            .unwrap()
+            .unwrap()
+            .notifications_muted
+    );
 }
 
 #[test]
