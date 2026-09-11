@@ -1157,6 +1157,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offline_skips_official_api_without_http_calls() {
+        // Offline hosts never dial provider APIs: the OfficialApi
+        // strategy is skipped pre-flight (no HTTP call), while local
+        // ends would still run in the same tick.
+        let http = script_http(ScriptBehavior::CostPage(cost_page()));
+        let files = Arc::new(ScopedFiles);
+        let network = Arc::new(ObservedNetwork::default());
+        network.set(usage_host::OnlineState::Offline);
+        let hosts = Arc::new(Hosts {
+            clock: Arc::new(SystemClock),
+            logger: Arc::new(NullLogger),
+            keychain: Arc::new(MemoryKeychain::default()),
+            http: http.clone(),
+            files: files.clone(),
+            file_scope: files,
+            network,
+            process: Arc::new(usage_host::AllowlistedProcess::default()),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
+        });
+        let storage = Arc::new(Mutex::new(Storage::in_memory().unwrap()));
+        let coordinator = Arc::new(Coordinator::new(hosts, storage.clone()));
+        let acc = account("openai", "T");
+        storage.lock().unwrap().upsert_account(&acc).unwrap();
+        let scope = ScopeKey {
+            account_id: acc.id,
+            provider_id: "openai".into(),
+            product_id: "openai-api".into(),
+        };
+        let outcomes = coordinator
+            .refresh_many(vec![RefreshRequest {
+                scope: scope.clone(),
+                account: acc.clone(),
+                custom_root: None,
+                secret: Some(b"sk-test".to_vec()),
+                trigger: Trigger::Scheduled,
+            }])
+            .await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(*http.calls.lock().unwrap(), 0, "no HTTP while offline");
+        assert!(outcomes[0].attempts.iter().any(|attempt| {
+            attempt.source == "openai-api-costs" && matches!(attempt.status, AttemptStatus::Skipped)
+        }));
+    }
+
+    #[tokio::test]
     async fn lkg_outcome_serves_stored_snapshot_without_error_or_attempts() {
         // Cadence-skipped scopes must render their last-known-good
         // payload silently: stale view, no error, no attempt recorded.
