@@ -13,6 +13,8 @@ pub struct PtyRequest<'a> {
     pub timeout: Duration,
     pub output_cap: usize,
     pub cancel: CancellationToken,
+    /// Extra environment, restricted to process::SCOPED_ENV_VARS.
+    pub env: Vec<(String, String)>,
 }
 
 /// Bounded interactive PTY spawn request. No shell, no inherited
@@ -21,6 +23,8 @@ pub struct PtySpawnRequest<'a> {
     pub executable: &'a Path,
     pub args: &'a [&'a str],
     pub cancel: CancellationToken,
+    /// Extra environment, restricted to process::SCOPED_ENV_VARS.
+    pub env: Vec<(String, String)>,
 }
 
 /// Controlled PTY input: line-oriented writes only.
@@ -211,15 +215,29 @@ static SPAWN_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 /// window so TUI layout is stable across hosts. Returns the master
 /// fd and child pid to the caller, which owns both.
 #[cfg(unix)]
-fn spawn_pty_child(executable: &Path, args: &[&str]) -> Result<PtyChild, HostError> {
+fn spawn_pty_child(
+    executable: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+) -> Result<PtyChild, HostError> {
     use std::ffi::CString;
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
+    super::process::check_scoped_env(env)?;
     let exe = CString::new(executable.as_os_str().as_bytes()).map_err(|_| HostError::Policy)?;
     let mut argv_owned = Vec::with_capacity(args.len() + 1);
     argv_owned.push(exe.clone());
     for arg in args {
         argv_owned.push(CString::new(*arg).map_err(|_| HostError::Policy)?);
+    }
+    // Scoped env pairs are validated above and converted pre-fork:
+    // only async-signal-safe setenv/exec happen post-fork.
+    let mut env_owned = Vec::with_capacity(env.len());
+    for (name, value) in env {
+        env_owned.push((
+            CString::new(name.as_str()).map_err(|_| HostError::Policy)?,
+            CString::new(value.as_str()).map_err(|_| HostError::Policy)?,
+        ));
     }
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|s| s.as_ptr()).collect();
     argv.push(std::ptr::null());
@@ -259,6 +277,9 @@ fn spawn_pty_child(executable: &Path, args: &[&str]) -> Result<PtyChild, HostErr
             std::ffi::CString::new("TERM")
                 .ok()
                 .map(|k| libc::setenv(k.as_ptr(), c"xterm-256color".as_ptr(), 1));
+            for (name, value) in &env_owned {
+                libc::setenv(name.as_ptr(), value.as_ptr(), 1);
+            }
             libc::execvp(exe.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }
@@ -341,7 +362,7 @@ impl PTYHost for AllowlistedPty {
             return Err(HostError::Policy);
         }
         let mut child = self
-            .spawn_pty_inner(req.executable, req.args, &req.cancel)
+            .spawn_pty_inner(req.executable, req.args, &req.env, &req.cancel)
             .await?;
         for line in &input.lines {
             if req.cancel.is_cancelled() {
@@ -409,7 +430,7 @@ impl PTYHost for AllowlistedPty {
         if !self.is_allowed(req.executable) {
             return Err(HostError::Policy);
         }
-        self.spawn_pty_inner(req.executable, req.args, &req.cancel)
+        self.spawn_pty_inner(req.executable, req.args, &req.env, &req.cancel)
             .await
     }
 }
@@ -419,6 +440,7 @@ impl AllowlistedPty {
         &self,
         executable: &Path,
         args: &[&str],
+        env: &[(String, String)],
         cancel: &CancellationToken,
     ) -> Result<PtyChild, HostError> {
         if cancel.is_cancelled() {
@@ -426,11 +448,11 @@ impl AllowlistedPty {
         }
         #[cfg(unix)]
         {
-            spawn_pty_child(executable, args)
+            spawn_pty_child(executable, args, env)
         }
         #[cfg(not(unix))]
         {
-            let _ = (executable, args);
+            let _ = (executable, args, env);
             Err(HostError::Unavailable)
         }
     }
@@ -450,6 +472,7 @@ mod tests {
                     timeout: Duration::from_secs(5),
                     output_cap: 64,
                     cancel: CancellationToken::new(),
+                    env: vec![],
                 },
                 PtyInput { lines: vec![] },
             )
@@ -469,6 +492,7 @@ mod tests {
                     timeout: Duration::from_secs(5),
                     output_cap: 64,
                     cancel: token,
+                    env: vec![],
                 },
                 PtyInput { lines: vec![] },
             )
@@ -485,6 +509,7 @@ mod tests {
                 executable: Path::new("/bin/cat"),
                 args: &[],
                 cancel: CancellationToken::new(),
+                env: vec![],
             })
             .await
             .expect("spawn cat under pty");
@@ -523,6 +548,7 @@ mod tests {
                     timeout: Duration::from_secs(10),
                     output_cap: 4096,
                     cancel: CancellationToken::new(),
+                    env: vec![],
                 },
                 PtyInput { lines: vec![] },
             )
@@ -554,5 +580,18 @@ mod tests {
                     .count()
             })
             .unwrap_or(0)
+    }
+    #[tokio::test]
+    async fn scoped_env_rejected_before_fork() {
+        let host = AllowlistedPty::with_allowed([PathBuf::from("/bin/echo")]);
+        let result = host
+            .spawn_pty(PtySpawnRequest {
+                executable: Path::new("/bin/echo"),
+                args: &[],
+                cancel: CancellationToken::new(),
+                env: vec![("LD_PRELOAD".into(), "/tmp/x".into())],
+            })
+            .await;
+        assert!(matches!(result, Err(HostError::Policy)));
     }
 }

@@ -14,6 +14,9 @@ pub struct SpawnRequest<'a> {
     pub stdout_cap: usize,
     pub stderr_cap: usize,
     pub cancel: CancellationToken,
+    /// Extra environment, restricted to [`SCOPED_ENV_VARS`] with
+    /// absolute-path values (e.g. per-profile `CODEX_HOME`).
+    pub env: Vec<(String, String)>,
 }
 
 pub struct SpawnOutput {
@@ -45,6 +48,27 @@ pub struct InteractiveRequest<'a> {
     pub executable: &'a Path,
     pub args: &'a [&'a str],
     pub cancel: CancellationToken,
+    /// Extra environment, restricted to [`SCOPED_ENV_VARS`] with
+    /// absolute-path values (e.g. per-profile `CODEX_HOME`).
+    pub env: Vec<(String, String)>,
+}
+
+/// Environment variable names a strategy may override per profile.
+/// Closed list: anything else is a Policy violation. Values must be
+/// absolute paths (profile roots), never PATH/shell material.
+pub const SCOPED_ENV_VARS: &[&str] = &["CODEX_HOME", "CLAUDE_CONFIG_DIR"];
+
+/// Validate scoped env pairs before any spawn.
+pub(crate) fn check_scoped_env(env: &[(String, String)]) -> Result<(), HostError> {
+    for (name, value) in env {
+        if !SCOPED_ENV_VARS.contains(&name.as_str()) {
+            return Err(HostError::Policy);
+        }
+        if !std::path::Path::new(value).is_absolute() {
+            return Err(HostError::Policy);
+        }
+    }
+    Ok(())
 }
 
 /// Owned interactive child. Only this handle can signal its process;
@@ -164,8 +188,10 @@ impl ProcessHost for AllowlistedProcess {
         if !self.is_allowed(req.executable) {
             return Err(HostError::Policy);
         }
+        check_scoped_env(&req.env)?;
         let mut child = tokio::process::Command::new(req.executable)
             .args(req.args)
+            .envs(req.env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -233,8 +259,10 @@ impl ProcessHost for AllowlistedProcess {
         if !self.is_allowed(req.executable) {
             return Err(HostError::Policy);
         }
+        check_scoped_env(&req.env)?;
         let mut child = tokio::process::Command::new(req.executable)
             .args(req.args)
+            .envs(req.env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -270,6 +298,61 @@ mod tests {
         token
     }
 
+    /// Scoped env allowlist: only CODEX_HOME/CLAUDE_CONFIG_DIR with
+    /// absolute paths pass; everything else is Policy — for both
+    /// one-shot and interactive spawns.
+    #[tokio::test]
+    async fn scoped_env_names_and_paths_are_enforced() {
+        let host = AllowlistedProcess::with_allowed([PathBuf::from("/bin/echo")]);
+        for (name, value) in [
+            ("EVIL", "/tmp"),
+            ("PATH", "/tmp"),
+            ("CODEX_HOME", "relative/path"),
+            ("CLAUDE_CONFIG_DIR", ""),
+        ] {
+            let denied = host
+                .spawn(SpawnRequest {
+                    executable: Path::new("/bin/echo"),
+                    args: &[],
+                    timeout: Duration::from_secs(5),
+                    stdout_cap: 64,
+                    stderr_cap: 64,
+                    cancel: CancellationToken::new(),
+                    env: vec![(name.into(), value.into())],
+                })
+                .await;
+            assert!(
+                matches!(denied, Err(HostError::Policy)),
+                "{name}={value} must be denied"
+            );
+            let denied = host
+                .spawn_interactive(InteractiveRequest {
+                    executable: Path::new("/bin/echo"),
+                    args: &[],
+                    cancel: CancellationToken::new(),
+                    env: vec![(name.into(), value.into())],
+                })
+                .await;
+            assert!(
+                matches!(denied, Err(HostError::Policy)),
+                "interactive {name}={value} must be denied"
+            );
+        }
+        // Allowlisted pair spawns fine.
+        let ok = host
+            .spawn(SpawnRequest {
+                executable: Path::new("/bin/echo"),
+                args: &[],
+                timeout: Duration::from_secs(5),
+                stdout_cap: 64,
+                stderr_cap: 64,
+                cancel: CancellationToken::new(),
+                env: vec![("CODEX_HOME".into(), "/tmp".into())],
+            })
+            .await;
+        assert!(ok.is_ok());
+    }
+
     use super::*;
     fn echo_host() -> AllowlistedProcess {
         AllowlistedProcess::with_allowed([PathBuf::from("/bin/echo")])
@@ -285,6 +368,7 @@ mod tests {
                 stdout_cap: 1024,
                 stderr_cap: 1024,
                 cancel: CancellationToken::new(),
+                env: vec![],
             })
             .await
             .unwrap();
@@ -304,6 +388,7 @@ mod tests {
                     stdout_cap: 1024,
                     stderr_cap: 1024,
                     cancel: CancellationToken::new(),
+                    env: vec![],
                 })
                 .await;
             assert!(result.is_err(), "{exe} must be denied");
@@ -320,6 +405,7 @@ mod tests {
                 stdout_cap: 64,
                 stderr_cap: 64,
                 cancel: CancellationToken::new(),
+                env: vec![],
             })
             .await
             .unwrap();
@@ -337,6 +423,7 @@ mod tests {
                 stdout_cap: 64,
                 stderr_cap: 64,
                 cancel: cancelled_token(),
+                env: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Cancelled)));
@@ -359,6 +446,7 @@ mod tests {
                 stdout_cap: 64,
                 stderr_cap: 64,
                 cancel,
+                env: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Cancelled)));
@@ -382,6 +470,7 @@ mod interactive_tests {
                 executable: Path::new("/bin/cat"),
                 args: &[],
                 cancel: CancellationToken::new(),
+                env: vec![],
             })
             .await
             .unwrap();
@@ -404,6 +493,7 @@ mod interactive_tests {
                 executable: Path::new("/bin/sh"),
                 args: &["-c", "echo pwned"],
                 cancel: CancellationToken::new(),
+                env: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Policy)));
@@ -417,6 +507,7 @@ mod interactive_tests {
                 executable: Path::new("/bin/cat"),
                 args: &[],
                 cancel: CancellationToken::new(),
+                env: vec![],
             })
             .await
             .unwrap();

@@ -920,31 +920,35 @@ fn build_strategy(
     custom_root: Option<PathBuf>,
 ) -> Option<Box<dyn FetchStrategy>> {
     match kind {
-        // Anti-contamination: the App Server always reflects its own
-        // home login, so it only serves default (non-custom) scopes.
-        // Custom profiles keep their JSONL observation source.
-        StrategyKind::CodexAppServer if custom_root.is_some() => None,
+        // Account-scoped quota (§11.5): the server is spawned with
+        // CODEX_HOME set to the scope's own root, so it reads THAT
+        // profile's auth. Proven: an empty root reports an empty
+        // account (AuthenticationRequired), never the default login —
+        // no cross-profile fallback is structurally possible.
         StrategyKind::CodexAppServer => Some(Box::new(
             usage_providers::codex_appserver::CodexAppServerStrategy {
                 executables: crate::registry::resolve_codex_executables(hosts),
                 stub: None,
+                custom_root: custom_root.clone(),
             },
         )),
         StrategyKind::CodexJsonl => Some(Box::new(
             usage_providers::codex::CodexJsonlStrategy::new(custom_root),
         )),
-        // Anti-contamination (mirrors Codex): the quota ends reflect
-        // the CLI's own login, never a custom profile root. Custom
-        // Claude profiles keep their JSONL observation source, so no
-        // cross-profile credential fallback can occur.
-        StrategyKind::ClaudePtyUsage if custom_root.is_some() => None,
+        // Account-scoped quota (§11.5): the CLI is driven with
+        // CLAUDE_CONFIG_DIR set to the scope's own root, so it reads
+        // THAT profile's auth. Custom profiles keep JSONL too; a root
+        // without login surfaces auth state, never another profile.
         StrategyKind::ClaudePtyUsage => {
             Some(Box::new(usage_providers::claude::ClaudePtyUsageStrategy {
                 executables: crate::registry::resolve_claude_executables(hosts),
                 stub: None,
+                custom_root: custom_root.clone(),
             }))
         }
         StrategyKind::ClaudeOAuthUsage if custom_root.is_some() => None,
+        // OAuth stays default-only: there is no per-profile scoped
+        // credential source, and inventing one would violate §11.5.
         StrategyKind::ClaudeOAuthUsage => Some(Box::new(
             usage_providers::claude::ClaudeOAuthUsageStrategy { oauth_url: None },
         )),
@@ -1199,6 +1203,64 @@ mod tests {
         assert!(outcomes[0].attempts.iter().any(|attempt| {
             attempt.source == "openai-api-costs" && matches!(attempt.status, AttemptStatus::Skipped)
         }));
+    }
+
+    /// Ordered Claude ends tolerate a dormant OAuth fallback (§10.3.2
+    /// is conditional: no verified endpoint + no scoped credential =
+    /// NotConfigured, never an error). Proved at strategy level so it
+    /// holds on any host without spawning real CLIs: a login-less end
+    /// is skipped, the dormant OAuth end is skipped, and the history
+    /// end serves with empty quotas. (Coordinator order itself comes
+    /// from the descriptor and is pinned by
+    /// `claude_strategies_follow_descriptor_order`.)
+    #[tokio::test]
+    async fn claude_ordering_skips_dormant_oauth_on_any_host() {
+        use usage_providers::claude::{ClaudeJsonlStrategy, ClaudeOAuthUsageStrategy};
+        use usage_providers::strategy::{Availability, FetchContext, FetchStrategy};
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("t.jsonl"),
+            "{\"timestamp\":\"2026-09-08T12:00:00Z\",\"uuid\":\"u1\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}}\n",
+        )
+        .unwrap();
+        let http = script_http(ScriptBehavior::CostPage(cost_page()));
+        let hosts = test_hosts(http);
+        let acc = account("anthropic", "T");
+        let descriptor =
+            usage_providers::descriptor::find_descriptor("anthropic", "claude-code").unwrap();
+        let cancel = usage_host::CancellationToken::new();
+        let ctx = FetchContext {
+            account: &acc,
+            facade: hosts.facade(&crate::registry::facade_policy_for(
+                "anthropic",
+                "claude-code",
+            )),
+            descriptor,
+            timeout: std::time::Duration::from_secs(5),
+            local_root: Some(
+                hosts
+                    .file_scope
+                    .scope_root(dir.path(), &cancel)
+                    .expect("scope temp root"),
+            ),
+            secret: None,
+            cancel,
+        };
+        // S1 without executable: NotConfigured (skip, no spawn).
+        let pty = usage_providers::claude::ClaudePtyUsageStrategy::new(vec![]);
+        // S2 without URL/secret: NotConfigured (dormant, never fires).
+        let oauth = ClaudeOAuthUsageStrategy { oauth_url: None };
+        // History end serves its own trust state with empty quotas.
+        let jsonl = ClaudeJsonlStrategy::new(Some(dir.path().to_path_buf()));
+        assert_eq!(pty.availability(&ctx).await, Availability::NotConfigured);
+        assert_eq!(oauth.availability(&ctx).await, Availability::NotConfigured);
+        assert_eq!(jsonl.availability(&ctx).await, Availability::Ready);
+        let payload = jsonl.fetch(&ctx).await.expect("history serves");
+        let snapshot = payload.snapshot.expect("history snapshot");
+        assert!(snapshot.quotas.is_empty());
+        assert_eq!(snapshot.coverage, usage_core::Coverage::UnverifiedSemantics);
     }
 
     #[tokio::test]
@@ -2046,31 +2108,39 @@ mod app_server_scope_tests {
 
     #[test]
     fn app_server_serves_default_scopes_only() {
+        // Superseded by account-scoped routing
+        // (codex_quota_end_serves_every_scope_with_own_root): the App
+        // Server is spawned per scope with that scope's CODEX_HOME.
+        // Kept as a smoke pin for the default scope path.
         let hosts = bare_hosts();
         let strategy = build_strategy(&hosts, StrategyKind::CodexAppServer, None);
         assert!(strategy.is_some());
-        // A custom profile root must never receive the home login's
-        // quota: the strategy is structurally inapplicable there.
-        let custom = build_strategy(
-            &hosts,
-            StrategyKind::CodexAppServer,
-            Some(PathBuf::from("/tmp/custom-home")),
-        );
-        assert!(custom.is_none());
     }
 
     #[test]
     fn claude_quota_ends_serve_default_scopes_only() {
-        // No cross-profile credential fallback: both quota ends are
-        // built for default scopes; custom roots keep JSONL only,
-        // while the history end serves everywhere (§8, §11.2).
+        // Account-scoped quota (§11.5): the PTY end is built for every
+        // scope with the scope's own root (CLAUDE_CONFIG_DIR); the
+        // OAuth end stays default-only (no per-profile credential).
+        // Custom roots never inherit the default login's quota.
         let hosts = bare_hosts();
         assert!(build_strategy(&hosts, StrategyKind::ClaudePtyUsage, None).is_some());
         assert!(build_strategy(&hosts, StrategyKind::ClaudeOAuthUsage, None).is_some());
         assert!(build_strategy(&hosts, StrategyKind::ClaudeJsonl, None).is_some());
         let custom = Some(PathBuf::from("/tmp/custom-claude"));
-        assert!(build_strategy(&hosts, StrategyKind::ClaudePtyUsage, custom.clone()).is_none());
+        assert!(build_strategy(&hosts, StrategyKind::ClaudePtyUsage, custom.clone()).is_some());
         assert!(build_strategy(&hosts, StrategyKind::ClaudeOAuthUsage, custom.clone()).is_none());
         assert!(build_strategy(&hosts, StrategyKind::ClaudeJsonl, custom).is_some());
+    }
+
+    #[test]
+    fn codex_quota_end_serves_every_scope_with_own_root() {
+        // Same account-scoping for Codex: every scope gets an App
+        // Server strategy bound to its own CODEX_HOME.
+        let hosts = bare_hosts();
+        assert!(build_strategy(&hosts, StrategyKind::CodexAppServer, None).is_some());
+        let custom = Some(PathBuf::from("/tmp/custom-codex"));
+        assert!(build_strategy(&hosts, StrategyKind::CodexAppServer, custom.clone()).is_some());
+        assert!(build_strategy(&hosts, StrategyKind::CodexJsonl, custom).is_some());
     }
 }

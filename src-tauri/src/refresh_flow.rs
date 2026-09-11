@@ -809,6 +809,31 @@ mod tests {
     }
 
     #[test]
+    fn tray_ignores_synthetic_claude_cases_a_b() {
+        // Case A: Fresh + Connected synthetic Claude at 20% is
+        // non-authoritative end to end: no tray metric.
+        let synthetic = sample_provider(Coverage::UnverifiedSemantics, 20.0);
+        assert!(!synthetic.coverage.is_authoritative());
+        assert_eq!(
+            primary_remaining(std::slice::from_ref(&synthetic)),
+            None,
+            "Case A: synthetic Claude must not drive the tray"
+        );
+        assert_eq!(
+            tray_metric(std::slice::from_ref(&synthetic), None),
+            None,
+            "Case A: automatic selection must skip synthetic Claude"
+        );
+        // Case B: verified 61% + synthetic 20% → 61%.
+        let verified = sample_provider(Coverage::Complete, 61.0);
+        assert_eq!(
+            tray_metric(&[verified, synthetic], None),
+            Some(61.0),
+            "Case B: synthetic 20% must never beat verified 61%"
+        );
+    }
+
+    #[test]
     fn full_side_effect_regression_unverified_semantics_produces_no_authoritative_side_effects() {
         // Input snapshot: Fresh + Connected + UnverifiedSemantics + 20% remaining
         let p = sample_provider(Coverage::UnverifiedSemantics, 20.0);
@@ -885,7 +910,7 @@ mod tests {
                 fetched_at: Utc::now(),
                 connection_state: ConnectionState::Connected,
                 freshness: Freshness::Fresh,
-                coverage: Coverage::Partial,
+                coverage: Coverage::UnverifiedSemantics,
             }),
             stale: false,
             error: None,
@@ -913,6 +938,10 @@ mod tests {
         assert_eq!(dto.quotas.len(), 1);
         assert_eq!(dto.identity_confidence.as_deref(), Some("Verified"));
         assert!(dto.fallback_reason.is_none());
+        // Synthetic Claude shape is non-authoritative even when it
+        // renders: tray and notifications both consult this flag.
+        assert_eq!(dto.coverage, Coverage::UnverifiedSemantics);
+        assert!(!dto.coverage.is_authoritative());
         // OAuth fallback end: explicit banner.
         let dto = outcome_to_dto(
             &claude_outcome(Some("claude-oauth-usage"), true),

@@ -409,6 +409,14 @@ pub async fn run_quota_session<T: AppServerTransport + ?Sized>(
         return Err(ProviderError::Network("codex_appserver_cancelled".into()));
     }
     let account = parse_account_response(&results[1])?;
+    // An account object without identity (proven live: a login-less
+    // CODEX_HOME reports `{}` with requiresOpenaiAuth=true) is not
+    // an empty success — it is a missing login. Surfacing auth state
+    // keeps per-profile binding honest: the snapshot never claims a
+    // quota the profile does not have.
+    if account.account_type == "unknown" {
+        return Err(ProviderError::AuthenticationRequired);
+    }
     let limits = parse_ratelimits_response(&results[2])?;
     Ok((account, limits))
 }
@@ -477,6 +485,13 @@ fn quotas_from_buckets(
 pub struct CodexAppServerStrategy {
     pub executables: Vec<PathBuf>,
     pub stub: Option<Arc<dyn AppServerTransport>>,
+    /// Profile root this strategy serves. None = default login.
+    /// Some(root) spawns the server with CODEX_HOME=root, so the
+    /// server reads THAT profile's auth — never the default login.
+    /// Proven live: an empty root reports an empty account (no type,
+    /// no email), never the default login, so cross-profile fallback
+    /// is structurally impossible (§11.5).
+    pub custom_root: Option<PathBuf>,
 }
 
 impl CodexAppServerStrategy {
@@ -484,6 +499,7 @@ impl CodexAppServerStrategy {
         Self {
             executables,
             stub: None,
+            custom_root: None,
         }
     }
 
@@ -492,7 +508,22 @@ impl CodexAppServerStrategy {
         Self {
             executables: vec![],
             stub: Some(stub),
+            custom_root: None,
         }
+    }
+
+    /// Scoped environment for the child: exactly one variable,
+    /// default login untouched when None.
+    fn profile_env(&self) -> Vec<(String, String)> {
+        self.custom_root
+            .as_ref()
+            .map(|root| {
+                vec![(
+                    "CODEX_HOME".to_string(),
+                    root.to_string_lossy().into_owned(),
+                )]
+            })
+            .unwrap_or_default()
     }
 
     /// Bounded health handshake against one candidate: spawn, send a
@@ -503,12 +534,14 @@ impl CodexAppServerStrategy {
     pub async fn probe_candidate(
         process: &dyn usage_host::ProcessHost,
         executable: &Path,
+        env: &[(String, String)],
         cancel: &usage_host::CancellationToken,
     ) -> bool {
         let transport = HostProcessTransport {
             process,
             executable: executable.to_path_buf(),
             timeout: PROBE_TIMEOUT,
+            env: env.to_vec(),
         };
         let init = rpc_request(
             1,
@@ -553,7 +586,7 @@ impl CodexAppServerStrategy {
             if cancel.is_cancelled() {
                 return None;
             }
-            if Self::probe_candidate(process, candidate, cancel).await {
+            if Self::probe_candidate(process, candidate, &self.profile_env(), cancel).await {
                 Self::mark_healthy(candidate);
                 return Some(candidate.clone());
             }
@@ -636,6 +669,7 @@ impl crate::strategy::FetchStrategy for CodexAppServerStrategy {
                 process,
                 executable,
                 timeout: RPC_TIMEOUT,
+                env: self.profile_env(),
             };
             run_quota_session(&transport, &ctx.cancel).await
         };
@@ -690,6 +724,7 @@ pub struct HostProcessTransport<'a> {
     pub process: &'a dyn usage_host::ProcessHost,
     pub executable: PathBuf,
     pub timeout: Duration,
+    pub env: Vec<(String, String)>,
 }
 
 #[async_trait::async_trait]
@@ -706,6 +741,7 @@ impl AppServerTransport for HostProcessTransport<'_> {
                 executable: &self.executable,
                 args: &["app-server"],
                 cancel: cancel.clone(),
+                env: self.env.clone(),
             })
             .await
             .map_err(|_| ProviderError::Unavailable("codex_appserver_spawn".into()))?;
@@ -1055,6 +1091,7 @@ mod tests {
             process: &host,
             executable: script,
             timeout: std::time::Duration::from_millis(150),
+            env: vec![],
         };
         let started = std::time::Instant::now();
         let result = transport
@@ -1108,6 +1145,8 @@ mod tests {
 #[cfg(test)]
 mod credit_and_order_tests {
     use super::*;
+    use crate::strategy::{FetchContext, FetchStrategy};
+    use uuid::Uuid;
 
     #[test]
     fn absent_credits_stay_silent_present_credits_warn() {
@@ -1208,11 +1247,11 @@ mod credit_and_order_tests {
         let process = usage_host::AllowlistedProcess::with_allowed([dead.clone(), script.clone()]);
         let cancel = usage_host::CancellationToken::new();
         assert!(
-            !CodexAppServerStrategy::probe_candidate(&process, &dead, &cancel).await,
+            !CodexAppServerStrategy::probe_candidate(&process, &dead, &[], &cancel).await,
             "instant-exit binary is not a server"
         );
         assert!(
-            CodexAppServerStrategy::probe_candidate(&process, &script, &cancel).await,
+            CodexAppServerStrategy::probe_candidate(&process, &script, &[], &cancel).await,
             "handshake responder is healthy"
         );
         // Order matters: dead-first must still resolve to the responder.
@@ -1220,6 +1259,142 @@ mod credit_and_order_tests {
         let picked = strategy.select_executable(&process, &cancel).await;
         assert_eq!(picked, Some(script.clone()));
         let _ = std::fs::remove_file(&script);
+    }
+
+    /// Per-profile isolation (§11.5/§14): two CODEX_HOMEs served by
+    /// one shim binary observe only their own login. The responder
+    /// varies its identity by $CODEX_HOME and records every input
+    /// line into that same home; each fetch must bind its own
+    /// identity and leave the sibling home untouched.
+    #[tokio::test]
+    async fn profile_a_fetch_cannot_observe_profile_b() {
+        use crate::strategy::FetchStrategy;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        let base = tempfile::tempdir().unwrap();
+        let root_a = base.path().join("root-a");
+        let root_b = base.path().join("root-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let limits: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/codex/appserver-ratelimits.json"))
+                .unwrap();
+        // JSON-RPC framing is one object per line: the fixture is
+        // pretty-printed on disk, so compact it like a real server.
+        // (Unparsable fragment lines are skipped by the matcher, so a
+        // multi-line responder would starve id matching until timeout
+        // instead of failing fast — framing is load-bearing here.)
+        let limits_line = serde_json::to_string(&limits).unwrap();
+        std::fs::write(root_a.join("limits.json"), &limits_line).unwrap();
+        std::fs::write(root_b.join("limits.json"), &limits_line).unwrap();
+        let script = base.path().join("fake-codex.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nrecord=\"$CODEX_HOME/record.txt\"\nplan=team\ncase \"$CODEX_HOME\" in *root-a*) plan=plus;; esac\nn=0\nwhile IFS= read -r line; do\n  n=$((n+1))\n  printf '%s\\n' \"$line\" >> \"$record\"\n  if [ \"$n\" -eq 1 ]; then printf '%s\\n' '{\"id\":1,\"result\":{}}'; fi\n  if [ \"$n\" -eq 2 ]; then printf '{\"id\":2,\"result\":{\"account\":{\"type\":\"chatgpt\",\"planType\":\"'; printf '%s' \"$plan\"; printf '%s\\n' '\"},\"requiresOpenaiAuth\":true}}'; fi\n  if [ \"$n\" -eq 3 ]; then printf '{\"id\":3,\"result\":%s}\\n' \"$(cat \"$CODEX_HOME/limits.json\")\"; exit 0; fi\ndone\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hosts = usage_host::Hosts {
+            clock: Arc::new(usage_host::SystemClock),
+            logger: Arc::new(usage_host::NullLogger),
+            keychain: Arc::new(usage_host::MemoryKeychain::default()),
+            http: Arc::new(usage_host::ReqwestHttpHost::default()),
+            files: Arc::new(usage_host::ScopedFiles),
+            file_scope: Arc::new(usage_host::ScopedFiles),
+            network: Arc::new(usage_host::ObservedNetwork::default()),
+            process: Arc::new(usage_host::AllowlistedProcess::with_allowed([
+                script.clone()
+            ])),
+            pty: Arc::new(usage_host::AllowlistedPty::default()),
+        };
+        let descriptor =
+            crate::descriptor::find_descriptor("openai", "codex").expect("codex descriptor");
+        // Drive both fetches through real spawns with per-root env.
+        let mut identities = std::collections::HashMap::new();
+        for (name, root) in [("a", &root_a), ("b", &root_b)] {
+            let account = Account {
+                id: uuid::Uuid::new_v4(),
+                provider_id: "openai".into(),
+                external_identity: None,
+                label: "T".into(),
+                connection_ref: None,
+                lifecycle: usage_core::AccountLifecycle::Active,
+            };
+            let strategy = CodexAppServerStrategy {
+                executables: vec![script.clone()],
+                stub: None,
+                custom_root: Some(root.clone()),
+            };
+            let ctx = FetchContext {
+                account: &account,
+                facade: hosts.facade(&usage_host::facade::FacadePolicy {
+                    files: true,
+                    http: false,
+                    process: true,
+                    pty: false,
+                    allowed_hosts: &[],
+                    keychain_service: None,
+                }),
+                descriptor,
+                timeout: std::time::Duration::from_secs(10),
+                local_root: None,
+                secret: None,
+                cancel: usage_host::CancellationToken::new(),
+            };
+            assert_eq!(
+                strategy.availability(&ctx).await,
+                crate::strategy::Availability::Ready
+            );
+            let payload = strategy.fetch(&ctx).await.expect("root fetch");
+            identities.insert(name, payload.observed_identity.expect("identity binds"));
+            // Each home recorded exactly its own traffic: the 3-line
+            // session (plus one gate probe line on first contact —
+            // the health cache skips re-probing). Separate files per
+            // home mean no observation can cross (the identity asserts
+            // below prove the binding too).
+            let record = std::fs::read_to_string(root.join("record.txt")).expect("own record");
+            for method in ["initialize", "account/read", "account/rateLimits/read"] {
+                assert!(record.contains(method), "{name} record misses {method}");
+            }
+        }
+        assert_ne!(
+            identities["a"], identities["b"],
+            "A and B bind different logins"
+        );
+        assert_eq!(
+            identities["a"],
+            identity_fingerprint("chatgpt", Some("plus"))
+        );
+        assert_eq!(
+            identities["b"],
+            identity_fingerprint("chatgpt", Some("team"))
+        );
+    }
+
+    /// A login-less root reports an empty account, which is auth
+    /// state — never an empty success (§13).
+    #[tokio::test]
+    async fn unknown_account_type_is_authentication_required() {
+        struct Stub;
+        #[async_trait::async_trait]
+        impl AppServerTransport for Stub {
+            async fn transact(
+                &self,
+                _requests: Vec<serde_json::Value>,
+                _cancel: &usage_host::CancellationToken,
+            ) -> Result<Vec<serde_json::Value>, ProviderError> {
+                Ok(vec![
+                    serde_json::json!({}),
+                    serde_json::json!({"account": {}, "requiresOpenaiAuth": true}),
+                    serde_json::json!({}),
+                ])
+            }
+        }
+        let outcome = run_quota_session(&Stub, &usage_host::CancellationToken::new()).await;
+        assert!(matches!(
+            outcome,
+            Err(ProviderError::AuthenticationRequired)
+        ));
     }
 }
 

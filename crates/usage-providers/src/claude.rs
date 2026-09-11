@@ -371,10 +371,13 @@ const AUTH_GATE_TIMEOUT: Duration = Duration::from_secs(6);
 /// One-shot `auth status` output is a 4-field JSON object; anything
 /// larger is not the observed shape.
 const AUTH_STATUS_CAP: usize = 8 * 1024;
-/// PTY drive sub-budgets inside the caller timeout: boot + /usage
-/// render, then post-/exit drain. The coordinator caps the total at
-/// SOURCE_TIMEOUT (15s).
-const USAGE_WAIT: Duration = Duration::from_secs(10);
+/// PTY drive staging inside the caller timeout: first paint (or
+/// proceed anyway), command render, post-/exit drain. The render
+/// stage scales with the caller budget instead of a second hardcoded
+/// constant; the coordinator caps the total at SOURCE_TIMEOUT.
+const BOOT_WAIT: Duration = Duration::from_secs(4);
+const RENDER_CAP: Duration = Duration::from_secs(20);
+const SHUTDOWN_RESERVE: Duration = Duration::from_secs(5);
 const EXIT_DRAIN: Duration = Duration::from_secs(3);
 const SCREEN_CAP: usize = 256 * 1024;
 
@@ -428,6 +431,9 @@ pub struct HostClaudeDriver<'a> {
     pub process: &'a dyn usage_host::ProcessHost,
     pub pty: &'a dyn usage_host::PTYHost,
     pub executables: Vec<PathBuf>,
+    /// Scoped profile environment (CLAUDE_CONFIG_DIR) applied to both
+    /// the auth-status gate and the interactive drive.
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -452,6 +458,7 @@ impl HostClaudeDriver<'_> {
                 stdout_cap: AUTH_STATUS_CAP,
                 stderr_cap: 1024,
                 cancel: cancel.clone(),
+                env: self.env.clone(),
             })
             .await
             .map_err(|_| ProviderError::Unavailable("claude_auth_spawn".into()))?;
@@ -502,21 +509,55 @@ impl ClaudeUsageDriver for HostClaudeDriver<'_> {
         cancel: &usage_host::CancellationToken,
     ) -> Result<String, ProviderError> {
         use usage_host::PtySpawnRequest;
+        let started = tokio::time::Instant::now();
         let mut child = self
             .pty
             .spawn_pty(PtySpawnRequest {
                 executable,
                 args: &[],
                 cancel: cancel.clone(),
+                env: self.env.clone(),
             })
             .await
             .map_err(|_| ProviderError::Unavailable("claude_pty_spawn".into()))?;
+        let mut raw = Vec::new();
+        // Stage 1 — first paint: never type into a session that has
+        // not drawn yet. Silence alone never fails (the app may paint
+        // slowly); the scan below only gates foreign prompts.
+        let boot_until = started + BOOT_WAIT;
+        while raw.is_empty() {
+            if cancel.is_cancelled() {
+                let _ = child.kill().await;
+                return Err(ProviderError::Network("claude_pty_cancelled".into()));
+            }
+            let remaining = boot_until.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, child.read_chunk(32 * 1024)).await {
+                Ok(Ok(Some(bytes))) if !bytes.is_empty() => raw.extend_from_slice(&bytes),
+                _ => break,
+            }
+        }
+        if has_trust_markers(&strip_ansi(&raw)) {
+            let _ = child.kill().await;
+            return Err(ProviderError::Unavailable(
+                "claude_pty_untrusted_prompt".into(),
+            ));
+        }
         child
             .write_all(b"/usage\r")
             .await
             .map_err(|_| ProviderError::Unavailable("claude_pty_io".into()))?;
-        let deadline = tokio::time::Instant::now() + timeout.min(USAGE_WAIT);
-        let mut raw = Vec::new();
+        // Stage 2 — render within the caller-blessed budget minus a
+        // shutdown reserve (drain + kill). Production keeps its ~10s;
+        // explicitly longer caller timeouts (live probes) buy patience
+        // instead of hitting a second hardcoded wall.
+        let render_budget = timeout
+            .min(RENDER_CAP)
+            .saturating_sub(SHUTDOWN_RESERVE)
+            .max(Duration::from_secs(2));
+        let deadline = started + BOOT_WAIT + render_budget;
         let mut usage_timed_out = false;
 
         loop {
@@ -549,7 +590,16 @@ impl ClaudeUsageDriver for HostClaudeDriver<'_> {
                         if raw.len() > SCREEN_CAP {
                             break;
                         }
-                        if screen_is_decisive(&strip_ansi(&raw)) {
+                        let text = strip_ansi(&raw);
+                        // A trust dialog can pop up mid-session: stop
+                        // typing immediately, never answer it.
+                        if has_trust_markers(&text) {
+                            let _ = child.kill().await;
+                            return Err(ProviderError::Unavailable(
+                                "claude_pty_untrusted_prompt".into(),
+                            ));
+                        }
+                        if screen_is_decisive(&text) {
                             break;
                         }
                     }
@@ -586,6 +636,27 @@ impl ClaudeUsageDriver for HostClaudeDriver<'_> {
 /// evidence — no need to wait out the full budget.
 fn screen_is_decisive(text: &str) -> bool {
     has_login_markers(text) || has_window_evidence(text)
+}
+
+/// Phrases of a foreign interactive prompt (workspace trust,
+/// approval, onboarding gates). The driver must NEVER type into
+/// these: auto-answering a trust dialog with `/usage` would approve
+/// it. Checked on first paint AND continuously — a dialog can pop up
+/// after the session starts.
+fn has_trust_markers(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "do you trust",
+        "trust this",
+        "trust the current",
+        "workspace trust",
+        "trust folder",
+        "grant access",
+        "allow access",
+        "press enter to continue",
+    ]
+    .iter()
+    .any(|m| lower.contains(m))
 }
 
 /// Phrases observed on the real login flow (claude 2.1.245 prints an
@@ -931,6 +1002,11 @@ fn pty_quotas(windows: &[PtyWindow], observed_at: DateTime<Utc>) -> Vec<Quota> {
 pub struct ClaudePtyUsageStrategy {
     pub executables: Vec<PathBuf>,
     pub stub: Option<Arc<dyn ClaudeUsageDriver>>,
+    /// Profile root this strategy serves. None = default login.
+    /// Some(root) spawns the CLI with CLAUDE_CONFIG_DIR=root, so the
+    /// CLI reads THAT profile's auth — never the default login
+    /// (§11.5: no cross-profile credential fallback).
+    pub custom_root: Option<PathBuf>,
 }
 
 impl ClaudePtyUsageStrategy {
@@ -938,6 +1014,7 @@ impl ClaudePtyUsageStrategy {
         Self {
             executables,
             stub: None,
+            custom_root: None,
         }
     }
 
@@ -946,7 +1023,22 @@ impl ClaudePtyUsageStrategy {
         Self {
             executables: vec![],
             stub: Some(stub),
+            custom_root: None,
         }
+    }
+
+    /// Scoped environment for the child: exactly one variable,
+    /// default login untouched when None.
+    fn profile_env(&self) -> Vec<(String, String)> {
+        self.custom_root
+            .as_ref()
+            .map(|root| {
+                vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    root.to_string_lossy().into_owned(),
+                )]
+            })
+            .unwrap_or_default()
     }
 
     fn capabilities() -> BTreeSet<Capability> {
@@ -972,6 +1064,7 @@ impl ClaudePtyUsageStrategy {
             // driver below instead of a dummy pty.
             pty: &NoPty,
             executables: self.executables.clone(),
+            env: self.profile_env(),
         }
         .login_gate(cancel)
         .await
@@ -1055,6 +1148,7 @@ impl crate::strategy::FetchStrategy for ClaudePtyUsageStrategy {
                 process,
                 pty,
                 executables: self.executables.clone(),
+                env: self.profile_env(),
             };
             // Re-gate at fetch: a login that lapsed since
             // availability must surface as auth state, and the drive
@@ -1112,14 +1206,14 @@ impl crate::strategy::FetchStrategy for ClaudePtyUsageStrategy {
                 freshness: Freshness::Fresh,
                 // Unverified window semantics: never Complete until a
                 // logged-in host reconciles the shape.
-                coverage: Coverage::Partial,
+                coverage: Coverage::UnverifiedSemantics,
             }),
             usage: vec![],
             costs: vec![],
             balances: vec![],
             warnings,
             schema_fingerprint: PTY_USAGE_FINGERPRINT,
-            coverage: Coverage::Partial,
+            coverage: Coverage::UnverifiedSemantics,
             observed_at: Some(observed_at),
             source_error: None,
             // No account identity leaves the screen: tier text only,
@@ -1352,14 +1446,15 @@ impl crate::strategy::FetchStrategy for ClaudeOAuthUsageStrategy {
                 fetched_at: observed_at,
                 connection_state: ConnectionState::Connected,
                 freshness: Freshness::Fresh,
-                coverage: Coverage::Partial,
+                // Synthetic shape: non-authoritative until reconciled.
+                coverage: Coverage::UnverifiedSemantics,
             }),
             usage: vec![],
             costs: vec![],
             balances: vec![],
             warnings,
             schema_fingerprint: OAUTH_USAGE_FINGERPRINT,
-            coverage: Coverage::Partial,
+            coverage: Coverage::UnverifiedSemantics,
             observed_at: Some(observed_at),
             source_error: None,
             observed_identity: None,
@@ -1836,7 +1931,7 @@ mod quota_tests {
         let snapshot = payload.snapshot.expect("snapshot");
         assert_eq!(snapshot.quotas.len(), 3);
         assert_eq!(snapshot.plan_label.as_deref(), Some("Pro"));
-        assert_eq!(snapshot.coverage, Coverage::Partial);
+        assert_eq!(snapshot.coverage, Coverage::UnverifiedSemantics);
         assert!(snapshot
             .capabilities
             .contains(&Capability::SubscriptionQuota));
@@ -1947,7 +2042,7 @@ mod quota_tests {
             temp.path(),
             "fake-claude.sh",
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  printf '%s\\n' '{{\"loggedIn\":true,\"authMethod\":\"oauth\"}}'\n  exit 0\nfi\nscreen='{screen}'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *\"/usage\"*) cat \"$screen\";;\n    *\"/exit\"*) exit 0;;\n  esac\ndone\nexit 0\n",
+                "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  printf '%s\\n' '{{\"loggedIn\":true,\"authMethod\":\"oauth\"}}'\n  exit 0\nfi\nscreen='{screen}'\nprintf '%s\\n' 'Claude Code v9.9.9 research preview'\nwhile IFS= read -r line; do\n  case \"$line\" in\n    *\"/usage\"*) cat \"$screen\";;\n    *\"/exit\"*) exit 0;;\n  esac\ndone\nexit 0\n",
                 screen = screen.display()
             ),
         );
@@ -1957,6 +2052,7 @@ mod quota_tests {
             process: &process,
             pty: &pty,
             executables: vec![script.clone()],
+            env: vec![],
         };
         // Login gate through the real process backend first.
         assert_eq!(
@@ -1985,6 +2081,69 @@ mod quota_tests {
         assert!(has_window_evidence(&text), "screen evidence present");
     }
 
+    /// Per-profile isolation (§11.5/§14, explicit requirement): two
+    /// CLAUDE_CONFIG_DIR roots driven through the real forkpty
+    /// backend observe only their own login. The responder varies its
+    /// plan by config dir and records every input line into that same
+    /// dir; each fetch must bind its own plan and leave the sibling
+    /// dir's record free of foreign commands.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_a_fetch_cannot_observe_claude_b() {
+        let base = tempfile::tempdir().unwrap();
+        let root_a = base.path().join("root-a");
+        let root_b = base.path().join("root-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        for (root, plan) in [(&root_a, "Alpha"), (&root_b, "Beta")] {
+            std::fs::write(
+                root.join("screen.txt"),
+                format!(
+                    "Claude Code Usage\nPlan: {plan}\n\nSession 42% used\nWeekly (all models) 61% used\nResets at 2026-09-17T00:00:00Z\n"
+                ),
+            )
+            .unwrap();
+        }
+        let script = write_script(
+            base.path(),
+            "fake-claude-ab.sh",
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  printf '%s\\n' '{\"loggedIn\":true}'\n  exit 0\nfi\nrecord=\"$CLAUDE_CONFIG_DIR/record.txt\"\nscreen=\"$CLAUDE_CONFIG_DIR/screen.txt\"\nprintf '%s\\n' 'boot splash'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> \"$record\"\n  case \"$line\" in\n    *\"/usage\"*) cat \"$screen\";;\n    *\"/exit\"*) exit 0;;\n  esac\ndone\n",
+        );
+        let hosts = hosts(
+            Arc::new(usage_host::AllowlistedProcess::with_allowed([
+                script.clone()
+            ])),
+            Arc::new(usage_host::AllowlistedPty::with_allowed([script.clone()])),
+            Arc::new(usage_host::ReqwestHttpHost::default()),
+        );
+        let mut plans = std::collections::HashMap::new();
+        for (name, root) in [("a", &root_a), ("b", &root_b)] {
+            let account = account();
+            let strategy = ClaudePtyUsageStrategy {
+                executables: vec![script.clone()],
+                stub: None,
+                custom_root: Some(root.clone()),
+            };
+            let ctx = test_ctx(&hosts, &account, true, true, false, None, 15);
+            assert_eq!(strategy.availability(&ctx).await, Availability::Ready);
+            let payload = strategy.fetch(&ctx).await.expect("root fetch");
+            let snapshot = payload.snapshot.expect("snapshot");
+            assert_eq!(snapshot.quotas.len(), 2);
+            plans.insert(name, snapshot.plan_label.expect("plan binds"));
+            // This home observed exactly its own drive: the record
+            // file exists here (env routing works) and carries our
+            // /usage command. No exact full-sequence equality: under
+            // host load the exit handshake may race the kill.
+            let record = std::fs::read_to_string(root.join("record.txt")).expect("own record");
+            assert!(
+                record.lines().any(|l| l.trim_end_matches('\r') == "/usage"),
+                "{name} record misses /usage"
+            );
+        }
+        assert_eq!(plans["a"].as_str(), "Alpha");
+        assert_eq!(plans["b"].as_str(), "Beta");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn hanging_drive_is_bounded_network_error() {
@@ -1992,7 +2151,7 @@ mod quota_tests {
         let script = write_script(
             temp.path(),
             "hang-claude.sh",
-            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  printf '%s\\n' '{\"loggedIn\":true}'\n  exit 0\nfi\nsleep 30\n",
+            "#!/bin/sh\nif [ \"$1\" = \"auth\" ]; then\n  printf '%s\\n' '{\"loggedIn\":true}'\n  exit 0\nfi\nprintf '%s\\n' 'booting, please wait'\nsleep 30\n",
         );
         let hosts = hosts(
             Arc::new(usage_host::AllowlistedProcess::with_allowed([
@@ -2013,6 +2172,64 @@ mod quota_tests {
         assert!(
             started.elapsed() < Duration::from_secs(12),
             "drive must stay bounded"
+        );
+    }
+
+    #[test]
+    fn trust_markers_catch_foreign_prompts_only() {
+        assert!(has_trust_markers("Do you trust the files in this folder?"));
+        assert!(has_trust_markers("Workspace trust required to continue"));
+        assert!(has_trust_markers("Press Enter to continue"));
+        assert!(has_trust_markers("Grant access to proceed"));
+        // Usage evidence, login flow and plain splash stay clean.
+        assert!(!has_trust_markers(SCREEN));
+        assert!(!has_trust_markers(
+            "https://claude.com/cai/oauth/authorize?code=true\nPaste code here if prompted>"
+        ));
+        assert!(!has_trust_markers("Claude Code v9.9.9\nSession 42% used"));
+    }
+
+    /// A trust dialog must stop the drive BEFORE anything is typed:
+    /// auto-answering it with `/usage` would approve it. The script
+    /// records every received byte; the record stays empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trust_dialog_aborts_without_typing() {
+        let temp = tempfile::tempdir().unwrap();
+        let record = temp.path().join("record.txt");
+        let script = write_script(
+            temp.path(),
+            "trust-claude.sh",
+            &format!(
+                "#!/bin/sh\nrecord='{record}'\nprintf '%s\\n' 'Do you trust the files in this folder?'\nprintf '%s\\n' '  1. Yes, proceed'\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> \"$record\"\ndone\n",
+                record = record.display()
+            ),
+        );
+        // Drive must refuse before typing anything.
+        let process = usage_host::AllowlistedProcess::with_allowed([script.clone()]);
+        let pty = usage_host::AllowlistedPty::with_allowed([script.clone()]);
+        let driver = HostClaudeDriver {
+            process: &process,
+            pty: &pty,
+            executables: vec![script.clone()],
+            env: vec![],
+        };
+        let result = driver
+            .usage_screen(
+                &script,
+                Duration::from_secs(10),
+                &usage_host::CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::Unavailable(_))),
+            "trust dialog must abort, got {result:?}"
+        );
+        // Nothing was ever typed: deterministic regardless of
+        // scheduling, because the only writer is the driver.
+        assert!(
+            !record.exists() || std::fs::read_to_string(&record).unwrap().is_empty(),
+            "driver typed into a trust dialog"
         );
     }
 
@@ -2139,7 +2356,7 @@ mod quota_tests {
             Some(1789603200)
         );
         assert_eq!(snapshot.plan_label.as_deref(), Some("Pro"));
-        assert_eq!(snapshot.coverage, Coverage::Partial);
+        assert_eq!(snapshot.coverage, Coverage::UnverifiedSemantics);
         assert!(payload
             .warnings
             .iter()
@@ -2404,6 +2621,7 @@ mod live_acceptance {
             process: process.as_ref(),
             pty: hosts.pty.as_ref(),
             executables,
+            env: vec![],
         };
         // The gate parses the REAL binary's output shape (logged in
         // or not) — this is the live contract of auth_status_of.

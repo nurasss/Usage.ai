@@ -551,4 +551,40 @@ mod tests {
         let silent = Planner::default().plan_provider_at(&view, now, &[100, 90]);
         assert!(silent.is_empty());
     }
+
+    // P0 trust regression (remediation): synthetic/unreconciled
+    // quota (Fresh + Connected + UnverifiedSemantics) must never
+    // produce authoritative quota notices, no matter how low.
+    #[test]
+    fn synthetic_claude_never_emits_quota_notices_case_a() {
+        let mut planner = Planner::default();
+        let now = Utc::now();
+        let view = view_with_coverage(
+            ConnectionState::Connected,
+            true,
+            Coverage::UnverifiedSemantics,
+            vec![quota("claude-pty-weekly", 20.0, "w1")],
+        );
+        assert!(!view.coverage.is_authoritative());
+        assert!(planner.plan_provider(&view, now).is_empty());
+    }
+
+    #[test]
+    fn synthetic_claude_crossing_all_thresholds_stays_silent_case_c() {
+        let mut planner = Planner::default();
+        let now = Utc::now();
+        // 50/20/10/5% remaining would fire every verified threshold.
+        for remaining in [50.0, 20.0, 10.0, 5.0] {
+            let view = view_with_coverage(
+                ConnectionState::Connected,
+                true,
+                Coverage::UnverifiedSemantics,
+                vec![quota("claude-pty-weekly", remaining, "w1")],
+            );
+            assert!(
+                planner.plan_provider(&view, now).is_empty(),
+                "synthetic {remaining}% must stay silent"
+            );
+        }
+    }
 }
