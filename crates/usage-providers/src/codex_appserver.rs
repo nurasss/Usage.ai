@@ -542,6 +542,7 @@ impl CodexAppServerStrategy {
             executable: executable.to_path_buf(),
             timeout: PROBE_TIMEOUT,
             env: env.to_vec(),
+            env_remove: vec![],
         };
         let init = rpc_request(
             1,
@@ -670,8 +671,8 @@ impl crate::strategy::FetchStrategy for CodexAppServerStrategy {
                 executable,
                 timeout: RPC_TIMEOUT,
                 env: self.profile_env(),
-            };
-            run_quota_session(&transport, &ctx.cancel).await
+                env_remove: vec![],
+            };            run_quota_session(&transport, &ctx.cancel).await
         };
         let (evidence, limits) = outcome.map_err(|e| match e {
             ProviderError::AuthenticationRequired => SourceError::AuthenticationRequired,
@@ -725,6 +726,9 @@ pub struct HostProcessTransport<'a> {
     pub executable: PathBuf,
     pub timeout: Duration,
     pub env: Vec<(String, String)>,
+    /// Codex auth resolves from CODEX_HOME files, never ambient
+    /// secrets: no scrub list needed (empty).
+    pub env_remove: Vec<String>,
 }
 
 #[async_trait::async_trait]
@@ -742,6 +746,7 @@ impl AppServerTransport for HostProcessTransport<'_> {
                 args: &["app-server"],
                 cancel: cancel.clone(),
                 env: self.env.clone(),
+                env_remove: self.env_remove.clone(),
             })
             .await
             .map_err(|_| ProviderError::Unavailable("codex_appserver_spawn".into()))?;
@@ -1092,6 +1097,7 @@ mod tests {
             executable: script,
             timeout: std::time::Duration::from_millis(150),
             env: vec![],
+            env_remove: vec![],
         };
         let started = std::time::Instant::now();
         let result = transport

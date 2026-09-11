@@ -435,6 +435,19 @@ pub struct HostClaudeDriver<'a> {
     pub env: Vec<(String, String)>,
 }
 
+/// Ambient credential variables scrubbed from every CLI child
+/// environment. An exported shell token is not a scoped credential
+/// source: honoring it makes identical hosts behave differently by
+/// launcher and can promote an invalid token into a fake
+/// "logged in" gate pass (observed: 6-char ANTHROPIC_AUTH_TOKEN).
+/// Endpoint routing (ANTHROPIC_BASE_URL) is left alone.
+fn credential_scrub_list() -> Vec<String> {
+    usage_host::process::SCRUBBED_ENV_VARS
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct AuthStatusWire {
     #[serde(rename = "loggedIn")]
@@ -458,6 +471,7 @@ impl HostClaudeDriver<'_> {
                 stderr_cap: 1024,
                 cancel: cancel.clone(),
                 env: self.env.clone(),
+                env_remove: credential_scrub_list(),
             })
             .await
             .map_err(|_| ProviderError::Unavailable("claude_auth_spawn".into()))?;
@@ -516,6 +530,7 @@ impl ClaudeUsageDriver for HostClaudeDriver<'_> {
                 args: &[],
                 cancel: cancel.clone(),
                 env: self.env.clone(),
+                env_remove: credential_scrub_list(),
             })
             .await
             .map_err(|_| ProviderError::Unavailable("claude_pty_spawn".into()))?;
@@ -2298,6 +2313,64 @@ mod quota_tests {
             Availability::NotConfigured
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Ambient shell credentials never reach the CLI child: the gate
+    /// scrubs the credential list even when the parent environment is
+    /// poisoned. Proved with a recording fake process host (no spawn).
+    #[tokio::test]
+    async fn gate_scrubs_ambient_credentials() {
+        struct ScriptProcess {
+            seen_remove: Mutex<Vec<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl usage_host::ProcessHost for ScriptProcess {
+            async fn spawn(
+                &self,
+                req: usage_host::SpawnRequest<'_>,
+            ) -> Result<usage_host::SpawnOutput, usage_host::HostError> {
+                self.seen_remove.lock().unwrap().push(
+                    req.env_remove.iter().cloned().collect(),
+                );
+                Ok(usage_host::SpawnOutput {
+                    status_code: Some(0),
+                    stdout: br#"{"loggedIn":true,"authMethod":"oauth"}"#.to_vec(),
+                    stderr: vec![],
+                    timed_out: false,
+                })
+            }
+            async fn spawn_interactive(
+                &self,
+                _req: usage_host::InteractiveRequest<'_>,
+            ) -> Result<usage_host::InteractiveChild, usage_host::HostError> {
+                Err(usage_host::HostError::Unavailable)
+            }
+            fn owned_count(&self) -> usize {
+                0
+            }
+        }
+        let process = ScriptProcess {
+            seen_remove: Mutex::new(vec![]),
+        };
+        let pty = usage_host::AllowlistedPty::default();
+        let driver = HostClaudeDriver {
+            process: &process,
+            pty: &pty,
+            executables: vec![PathBuf::from("/bin/claude")],
+            env: vec![],
+        };
+        assert_eq!(
+            driver
+                .login_gate(&usage_host::CancellationToken::new())
+                .await,
+            LoginGate::LoggedIn(PathBuf::from("/bin/claude"))
+        );
+        let seen = process.seen_remove.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0],
+            vec!["ANTHROPIC_API_KEY".to_string(), "ANTHROPIC_AUTH_TOKEN".to_string()]
+        );
     }
 
     // -- S2 OAuth fallback (stubbed HTTP) -----------------------------------

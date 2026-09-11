@@ -17,6 +17,9 @@ pub struct SpawnRequest<'a> {
     /// Extra environment, restricted to [`SCOPED_ENV_VARS`] with
     /// absolute-path values (e.g. per-profile `CODEX_HOME`).
     pub env: Vec<(String, String)>,
+    /// Inherited variables to remove from the child environment,
+    /// restricted to [`SCRUBBED_ENV_VARS`].
+    pub env_remove: Vec<String>,
 }
 
 pub struct SpawnOutput {
@@ -51,12 +54,23 @@ pub struct InteractiveRequest<'a> {
     /// Extra environment, restricted to [`SCOPED_ENV_VARS`] with
     /// absolute-path values (e.g. per-profile `CODEX_HOME`).
     pub env: Vec<(String, String)>,
+    /// Inherited variables to remove from the child environment,
+    /// restricted to [`SCRUBBED_ENV_VARS`].
+    pub env_remove: Vec<String>,
 }
 
 /// Environment variable names a strategy may override per profile.
 /// Closed list: anything else is a Policy violation. Values must be
 /// absolute paths (profile roots), never PATH/shell material.
 pub const SCOPED_ENV_VARS: &[&str] = &["CODEX_HOME", "CLAUDE_CONFIG_DIR"];
+
+/// Ambient credential variables a strategy may scrub from the child
+/// environment. Closed list: removing anything else (PATH, LANG,
+/// endpoint routing) is a Policy violation. Rationale: an exported
+/// shell token is not a scoped credential source — honoring it makes
+/// identical hosts behave differently by launcher and can promote an
+/// invalid token into a fake "logged in" state.
+pub const SCRUBBED_ENV_VARS: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 
 /// Validate scoped env pairs before any spawn.
 pub(crate) fn check_scoped_env(env: &[(String, String)]) -> Result<(), HostError> {
@@ -65,6 +79,16 @@ pub(crate) fn check_scoped_env(env: &[(String, String)]) -> Result<(), HostError
             return Err(HostError::Policy);
         }
         if !std::path::Path::new(value).is_absolute() {
+            return Err(HostError::Policy);
+        }
+    }
+    Ok(())
+}
+
+/// Validate scrubbed names before any spawn.
+pub(crate) fn check_scrubbed_env(env_remove: &[String]) -> Result<(), HostError> {
+    for name in env_remove {
+        if !SCRUBBED_ENV_VARS.contains(&name.as_str()) {
             return Err(HostError::Policy);
         }
     }
@@ -189,9 +213,14 @@ impl ProcessHost for AllowlistedProcess {
             return Err(HostError::Policy);
         }
         check_scoped_env(&req.env)?;
-        let mut child = tokio::process::Command::new(req.executable)
-            .args(req.args)
-            .envs(req.env.iter().map(|(k, v)| (k, v)))
+        check_scrubbed_env(&req.env_remove)?;
+        let mut command = tokio::process::Command::new(req.executable);
+        command.args(req.args);
+        command.envs(req.env.iter().map(|(k, v)| (k, v)));
+        for name in &req.env_remove {
+            command.env_remove(name);
+        }
+        let mut child = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -260,9 +289,14 @@ impl ProcessHost for AllowlistedProcess {
             return Err(HostError::Policy);
         }
         check_scoped_env(&req.env)?;
-        let mut child = tokio::process::Command::new(req.executable)
-            .args(req.args)
-            .envs(req.env.iter().map(|(k, v)| (k, v)))
+        check_scrubbed_env(&req.env_remove)?;
+        let mut command = tokio::process::Command::new(req.executable);
+        command.args(req.args);
+        command.envs(req.env.iter().map(|(k, v)| (k, v)));
+        for name in &req.env_remove {
+            command.env_remove(name);
+        }
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -319,6 +353,7 @@ mod tests {
                     stderr_cap: 64,
                     cancel: CancellationToken::new(),
                     env: vec![(name.into(), value.into())],
+                    env_remove: vec![],
                 })
                 .await;
             assert!(
@@ -331,6 +366,7 @@ mod tests {
                     args: &[],
                     cancel: CancellationToken::new(),
                     env: vec![(name.into(), value.into())],
+                    env_remove: vec![],
                 })
                 .await;
             assert!(
@@ -348,9 +384,76 @@ mod tests {
                 stderr_cap: 64,
                 cancel: CancellationToken::new(),
                 env: vec![("CODEX_HOME".into(), "/tmp".into())],
+                env_remove: vec![],
             })
             .await;
         assert!(ok.is_ok());
+        // Credential scrub list: a planted ambient marker must not
+        // reach the child. The guard restores the runner env even on
+        // panic; no other test in the workspace reads this variable
+        // (verified by search), so the brief window is blast-free.
+        struct EnvGuard {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn plant(key: &'static str, value: &str) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+        if Path::new("/usr/bin/env").is_file() {
+            let env_host = AllowlistedProcess::with_allowed([
+                PathBuf::from("/bin/echo"),
+                PathBuf::from("/usr/bin/env"),
+            ]);
+            let _guard = EnvGuard::plant("ANTHROPIC_API_KEY", "marker-12345");
+            let scrubbed = env_host
+                .spawn(SpawnRequest {
+                    executable: Path::new("/usr/bin/env"),
+                    args: &[],
+                    timeout: Duration::from_secs(5),
+                    stdout_cap: 65536,
+                    stderr_cap: 64,
+                    cancel: CancellationToken::new(),
+                    env: vec![],
+                    env_remove: vec!["ANTHROPIC_API_KEY".into()],
+                })
+                .await
+                .expect("env dump spawn");
+            let text = String::from_utf8_lossy(&scrubbed.stdout);
+            assert!(
+                !text.lines().any(|line| line.starts_with("ANTHROPIC_API_KEY=")),
+                "scrubbed variable leaked into child env"
+            );
+        }
+        for name in ["PATH", "HOME", "CODEX_HOME"] {
+            let denied = host
+                .spawn(SpawnRequest {
+                    executable: Path::new("/bin/echo"),
+                    args: &[],
+                    timeout: Duration::from_secs(5),
+                    stdout_cap: 64,
+                    stderr_cap: 64,
+                    cancel: CancellationToken::new(),
+                    env: vec![],
+                    env_remove: vec![name.into()],
+                })
+                .await;
+            assert!(
+                matches!(denied, Err(HostError::Policy)),
+                "removing {name} must be denied"
+            );
+        }
     }
 
     use super::*;
@@ -369,6 +472,7 @@ mod tests {
                 stderr_cap: 1024,
                 cancel: CancellationToken::new(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await
             .unwrap();
@@ -389,6 +493,7 @@ mod tests {
                     stderr_cap: 1024,
                     cancel: CancellationToken::new(),
                     env: vec![],
+                    env_remove: vec![],
                 })
                 .await;
             assert!(result.is_err(), "{exe} must be denied");
@@ -406,6 +511,7 @@ mod tests {
                 stderr_cap: 64,
                 cancel: CancellationToken::new(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await
             .unwrap();
@@ -424,6 +530,7 @@ mod tests {
                 stderr_cap: 64,
                 cancel: cancelled_token(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Cancelled)));
@@ -447,6 +554,7 @@ mod tests {
                 stderr_cap: 64,
                 cancel,
                 env: vec![],
+                env_remove: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Cancelled)));
@@ -471,6 +579,7 @@ mod interactive_tests {
                 args: &[],
                 cancel: CancellationToken::new(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await
             .unwrap();
@@ -494,6 +603,7 @@ mod interactive_tests {
                 args: &["-c", "echo pwned"],
                 cancel: CancellationToken::new(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Policy)));
@@ -508,6 +618,7 @@ mod interactive_tests {
                 args: &[],
                 cancel: CancellationToken::new(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await
             .unwrap();

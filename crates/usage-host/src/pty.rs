@@ -15,6 +15,9 @@ pub struct PtyRequest<'a> {
     pub cancel: CancellationToken,
     /// Extra environment, restricted to process::SCOPED_ENV_VARS.
     pub env: Vec<(String, String)>,
+    /// Inherited variables to remove, restricted to
+    /// process::SCRUBBED_ENV_VARS.
+    pub env_remove: Vec<String>,
 }
 
 /// Bounded interactive PTY spawn request. No shell, no inherited
@@ -25,6 +28,9 @@ pub struct PtySpawnRequest<'a> {
     pub cancel: CancellationToken,
     /// Extra environment, restricted to process::SCOPED_ENV_VARS.
     pub env: Vec<(String, String)>,
+    /// Inherited variables to remove, restricted to
+    /// process::SCRUBBED_ENV_VARS.
+    pub env_remove: Vec<String>,
 }
 
 /// Controlled PTY input: line-oriented writes only.
@@ -219,11 +225,13 @@ fn spawn_pty_child(
     executable: &Path,
     args: &[&str],
     env: &[(String, String)],
+    env_remove: &[String],
 ) -> Result<PtyChild, HostError> {
     use std::ffi::CString;
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
     super::process::check_scoped_env(env)?;
+    super::process::check_scrubbed_env(env_remove)?;
     let exe = CString::new(executable.as_os_str().as_bytes()).map_err(|_| HostError::Policy)?;
     let mut argv_owned = Vec::with_capacity(args.len() + 1);
     argv_owned.push(exe.clone());
@@ -238,6 +246,10 @@ fn spawn_pty_child(
             CString::new(name.as_str()).map_err(|_| HostError::Policy)?,
             CString::new(value.as_str()).map_err(|_| HostError::Policy)?,
         ));
+    }
+    let mut remove_owned = Vec::with_capacity(env_remove.len());
+    for name in env_remove {
+        remove_owned.push(CString::new(name.as_str()).map_err(|_| HostError::Policy)?);
     }
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|s| s.as_ptr()).collect();
     argv.push(std::ptr::null());
@@ -279,6 +291,9 @@ fn spawn_pty_child(
                 .map(|k| libc::setenv(k.as_ptr(), c"xterm-256color".as_ptr(), 1));
             for (name, value) in &env_owned {
                 libc::setenv(name.as_ptr(), value.as_ptr(), 1);
+            }
+            for name in &remove_owned {
+                libc::unsetenv(name.as_ptr());
             }
             libc::execvp(exe.as_ptr(), argv.as_ptr());
             libc::_exit(127);
@@ -362,7 +377,7 @@ impl PTYHost for AllowlistedPty {
             return Err(HostError::Policy);
         }
         let mut child = self
-            .spawn_pty_inner(req.executable, req.args, &req.env, &req.cancel)
+            .spawn_pty_inner(req.executable, req.args, &req.env, &req.env_remove, &req.cancel)
             .await?;
         for line in &input.lines {
             if req.cancel.is_cancelled() {
@@ -430,8 +445,14 @@ impl PTYHost for AllowlistedPty {
         if !self.is_allowed(req.executable) {
             return Err(HostError::Policy);
         }
-        self.spawn_pty_inner(req.executable, req.args, &req.env, &req.cancel)
-            .await
+        self.spawn_pty_inner(
+            req.executable,
+            req.args,
+            &req.env,
+            &req.env_remove,
+            &req.cancel,
+        )
+        .await
     }
 }
 
@@ -441,6 +462,7 @@ impl AllowlistedPty {
         executable: &Path,
         args: &[&str],
         env: &[(String, String)],
+        env_remove: &[String],
         cancel: &CancellationToken,
     ) -> Result<PtyChild, HostError> {
         if cancel.is_cancelled() {
@@ -448,11 +470,11 @@ impl AllowlistedPty {
         }
         #[cfg(unix)]
         {
-            spawn_pty_child(executable, args, env)
+            spawn_pty_child(executable, args, env, env_remove)
         }
         #[cfg(not(unix))]
         {
-            let _ = (executable, args, env);
+            let _ = (executable, args, env, env_remove);
             Err(HostError::Unavailable)
         }
     }
@@ -473,6 +495,7 @@ mod tests {
                     output_cap: 64,
                     cancel: CancellationToken::new(),
                     env: vec![],
+                    env_remove: vec![],
                 },
                 PtyInput { lines: vec![] },
             )
@@ -493,6 +516,7 @@ mod tests {
                     output_cap: 64,
                     cancel: token,
                     env: vec![],
+                    env_remove: vec![],
                 },
                 PtyInput { lines: vec![] },
             )
@@ -510,6 +534,7 @@ mod tests {
                 args: &[],
                 cancel: CancellationToken::new(),
                 env: vec![],
+                env_remove: vec![],
             })
             .await
             .expect("spawn cat under pty");
@@ -549,6 +574,7 @@ mod tests {
                     output_cap: 4096,
                     cancel: CancellationToken::new(),
                     env: vec![],
+                    env_remove: vec![],
                 },
                 PtyInput { lines: vec![] },
             )
@@ -590,8 +616,55 @@ mod tests {
                 args: &[],
                 cancel: CancellationToken::new(),
                 env: vec![("LD_PRELOAD".into(), "/tmp/x".into())],
+                env_remove: vec![],
             })
             .await;
         assert!(matches!(result, Err(HostError::Policy)));
+    }
+
+    /// Credential scrubbing works through forkpty too: a planted
+    /// ambient marker is unset before exec. Guard-restored runner env
+    /// (see process tests for the blast-radius analysis).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_child_env_scrubbed_before_exec() {
+        if !Path::new("/usr/bin/env").is_file() {
+            return;
+        }
+        struct EnvGuard {
+            prev: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(value) => std::env::set_var("ANTHROPIC_AUTH_TOKEN", value),
+                    None => std::env::remove_var("ANTHROPIC_AUTH_TOKEN"),
+                }
+            }
+        }
+        let prev = std::env::var_os("ANTHROPIC_AUTH_TOKEN");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "marker-67890");
+        let _guard = EnvGuard { prev };
+        let host = AllowlistedPty::with_allowed([PathBuf::from("/usr/bin/env")]);
+        let out = host
+            .run(
+                PtyRequest {
+                    executable: Path::new("/usr/bin/env"),
+                    args: &[],
+                    timeout: Duration::from_secs(10),
+                    output_cap: 65536,
+                    cancel: CancellationToken::new(),
+                    env: vec![],
+                    env_remove: vec!["ANTHROPIC_AUTH_TOKEN".into()],
+                },
+                PtyInput { lines: vec![] },
+            )
+            .await
+            .expect("env dump under pty");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("marker-67890"),
+            "scrubbed variable leaked into pty child env"
+        );
     }
 }
