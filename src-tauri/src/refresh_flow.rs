@@ -330,6 +330,7 @@ fn outcome_to_dto(
         });
     dto.identity_confidence = identity_confidence;
     dto.selected_source = outcome.selected_source.clone();
+    crate::dto::reclassify_legacy_claude_dto(&mut dto);
     dto
 }
 
@@ -834,6 +835,69 @@ mod tests {
     }
 
     #[test]
+    fn tray_legacy_claude_partial_reclassifies_before_selection() {
+        // P0 legacy path (§8, case B with a real RC1 payload): the
+        // persisted Partial goes through the production
+        // reclassification before DTO mapping and tray selection —
+        // never straight from storage to the tray.
+        use usage_runtime::snapshot::reclassify_legacy_claude_snapshot;
+        let mut legacy = crate::dto::from_snapshot(
+            legacy_claude_snapshot(),
+            "Anthropic",
+            "Claude Code",
+            "Claude",
+        );
+        // Simulate the pre-fix pipeline (raw load, no guard).
+        assert_eq!(legacy.coverage, Coverage::Partial);
+        assert!(legacy.coverage.is_authoritative());
+        // Production guard: snapshot-level (LKG path) then DTO-level.
+        let mut snapshot = legacy_claude_snapshot();
+        reclassify_legacy_claude_snapshot(&mut snapshot);
+        assert_eq!(snapshot.coverage, Coverage::UnverifiedSemantics);
+        legacy = crate::dto::from_snapshot(snapshot, "Anthropic", "Claude Code", "Claude");
+        crate::dto::reclassify_legacy_claude_dto(&mut legacy);
+        assert!(!legacy.coverage.is_authoritative());
+        let verified = sample_provider(Coverage::Complete, 61.0);
+        assert_eq!(
+            tray_metric(&[verified, legacy], None),
+            Some(61.0),
+            "legacy Claude must not reach the tray even via stored Partial"
+        );
+    }
+
+    /// RC1-equivalent persisted Claude snapshot: synthetic PTY result
+    /// stored as authoritative Partial with 20% remaining.
+    fn legacy_claude_snapshot() -> Snapshot {
+        Snapshot {
+            account_id: Uuid::nil(),
+            provider_id: "anthropic".into(),
+            product_id: "claude-code".into(),
+            plan_label: None,
+            capabilities: [Capability::SubscriptionQuota].into_iter().collect(),
+            quotas: vec![Quota {
+                pool_id: "claude-pty-weekly".into(),
+                window_id: None,
+                name: "Weekly".into(),
+                used_percent: Some(rust_decimal::Decimal::new(80, 0)),
+                remaining_percent: Some(rust_decimal::Decimal::new(20, 0)),
+                used: None,
+                limit: None,
+                unit: MetricUnit::Percent,
+                resets_at: None,
+                window_start: None,
+                window_kind: WindowKind::Unknown,
+                source: "claude-pty-usage@test".into(),
+            }],
+            balances: vec![],
+            observed_at: Some(Utc::now()),
+            fetched_at: Utc::now(),
+            connection_state: ConnectionState::Connected,
+            freshness: Freshness::Fresh,
+            coverage: Coverage::Partial,
+        }
+    }
+
+    #[test]
     fn full_side_effect_regression_unverified_semantics_produces_no_authoritative_side_effects() {
         // Input snapshot: Fresh + Connected + UnverifiedSemantics + 20% remaining
         let p = sample_provider(Coverage::UnverifiedSemantics, 20.0);
@@ -872,8 +936,41 @@ mod tests {
         );
     }
 
-    fn claude_outcome(selected_source: Option<&str>, with_quotas: bool) -> RefreshOutcome {
+    #[test]
+    fn outcome_dto_reclassifies_legacy_claude_partial() {
+        // Every DTO surface (fresh refresh, LKG outcome, cached app)
+        // passes the legacy guard: a stored Partial can never reach
+        // the UI as authoritative, no matter which load path served it.
         let scope = ScopeKey {
+            account_id: Uuid::nil(),
+            provider_id: "anthropic".into(),
+            product_id: "claude-code".into(),
+        };
+        let outcome = RefreshOutcome {
+            scope,
+            snapshot: Some(legacy_claude_snapshot()),
+            stale: true,
+            error: None,
+            attempts: vec![],
+            warnings: vec![],
+            costs_imported: 0,
+            usage_imported: 0,
+            selected_source: Some("claude-pty-usage".into()),
+            schema_fingerprint: Some("v1".into()),
+        };
+        let dto = outcome_to_dto(
+            &outcome,
+            &HashMap::new(),
+            &HashMap::new(),
+            Some("Unknown".into()),
+        );
+        assert_eq!(dto.coverage, Coverage::UnverifiedSemantics);
+        assert!(!dto.coverage.is_authoritative());
+        // Quota data itself survives (only trust is corrected).
+        assert_eq!(dto.quotas.len(), 1);
+    }
+
+    fn claude_outcome(selected_source: Option<&str>, with_quotas: bool) -> RefreshOutcome {        let scope = ScopeKey {
             account_id: Uuid::new_v4(),
             provider_id: "anthropic".into(),
             product_id: "claude-code".into(),

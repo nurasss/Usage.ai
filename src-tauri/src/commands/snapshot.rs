@@ -2,8 +2,18 @@ use tauri::AppHandle;
 use usage_runtime::Trigger;
 
 use crate::appstate::AppState;
-use crate::dto::AppSnapshot;
+use crate::dto::{reclassify_legacy_claude_dto, AppSnapshot};
 use crate::refresh_flow::{cache_snapshot, run_full_refresh};
+
+/// Legacy trust guard on the app-cache load path: a cached snapshot
+/// predating migration 010 can still carry RC1 `Partial` Claude
+/// trust. Reclassified before serving or re-caching.
+fn guard_legacy_trust(mut value: AppSnapshot) -> AppSnapshot {
+    for provider in &mut value.providers {
+        reclassify_legacy_claude_dto(provider);
+    }
+    value
+}
 
 #[tauri::command]
 pub async fn get_snapshot(
@@ -13,11 +23,12 @@ pub async fn get_snapshot(
     // Served errors are explicit: a packaged backend failure never
     // falls back to synthetic demo data (P0-3).
     if let Some(value) = state.cached.lock().map_err(|_| "state_lock")?.clone() {
-        return Ok(value);
+        return Ok(guard_legacy_trust(value));
     }
     if let Ok(storage) = state.storage.lock() {
         if let Ok(Some(json)) = storage.cache("app_snapshot") {
             if let Ok(value) = serde_json::from_str::<AppSnapshot>(&json) {
+                let value = guard_legacy_trust(value);
                 *state.cached.lock().map_err(|_| "state_lock")? = Some(value.clone());
                 return Ok(value);
             }

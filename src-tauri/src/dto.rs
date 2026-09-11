@@ -377,8 +377,23 @@ pub fn unavailable(
     }
 }
 
-pub fn capability_name(value: Capability) -> String {
-    match value {
+/// Legacy trust guard for provider DTOs (defense in depth for
+/// migration 010): a claude-code card still carrying authoritative
+/// `Partial` — the RC1 synthetic shape — is reclassified to
+/// `UnverifiedSemantics` at mapping time. Source-aware
+/// (provider/product/coverage triple only); legitimate `Partial`
+/// from other products is untouched. Applied to every DTO surface:
+/// fresh refresh outcomes AND cached-app loads.
+pub fn reclassify_legacy_claude_dto(provider: &mut ProviderDto) {
+    if provider.provider_id == "anthropic"
+        && provider.product_id == "claude-code"
+        && provider.coverage == Coverage::Partial
+    {
+        provider.coverage = Coverage::UnverifiedSemantics;
+    }
+}
+
+pub fn capability_name(value: Capability) -> String {    match value {
         Capability::SubscriptionQuota => "subscriptionQuota",
         Capability::QuotaResetTime => "quotaResetTime",
         Capability::ApiTokens => "apiTokens",

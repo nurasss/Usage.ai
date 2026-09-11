@@ -7,7 +7,7 @@ use std::{
 };
 use usage_core::{Account, CostRecord, UsageRecord};
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 const USAGE_UPSERT_SQL: &str = "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,cache_read_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=MAX(usage_records.period_start,excluded.period_start),period_end=MAX(usage_records.period_end,excluded.period_end),model=COALESCE(usage_records.model,excluded.model),input_tokens=CASE WHEN excluded.input_tokens IS NULL THEN usage_records.input_tokens WHEN usage_records.input_tokens IS NULL THEN excluded.input_tokens ELSE MAX(usage_records.input_tokens,excluded.input_tokens) END,output_tokens=CASE WHEN excluded.output_tokens IS NULL THEN usage_records.output_tokens WHEN usage_records.output_tokens IS NULL THEN excluded.output_tokens ELSE MAX(usage_records.output_tokens,excluded.output_tokens) END,cached_tokens=CASE WHEN excluded.cached_tokens IS NULL THEN usage_records.cached_tokens WHEN usage_records.cached_tokens IS NULL THEN excluded.cached_tokens ELSE MAX(usage_records.cached_tokens,excluded.cached_tokens) END,cache_creation_tokens=CASE WHEN excluded.cache_creation_tokens IS NULL THEN usage_records.cache_creation_tokens WHEN usage_records.cache_creation_tokens IS NULL THEN excluded.cache_creation_tokens ELSE MAX(usage_records.cache_creation_tokens,excluded.cache_creation_tokens) END,cache_read_tokens=CASE WHEN excluded.cache_read_tokens IS NULL THEN usage_records.cache_read_tokens WHEN usage_records.cache_read_tokens IS NULL THEN excluded.cache_read_tokens ELSE MAX(usage_records.cache_read_tokens,excluded.cache_read_tokens) END,reasoning_tokens=CASE WHEN excluded.reasoning_tokens IS NULL THEN usage_records.reasoning_tokens WHEN usage_records.reasoning_tokens IS NULL THEN excluded.reasoning_tokens ELSE MAX(usage_records.reasoning_tokens,excluded.reasoning_tokens) END,total_tokens=CASE WHEN excluded.total_tokens IS NULL THEN usage_records.total_tokens WHEN usage_records.total_tokens IS NULL THEN excluded.total_tokens ELSE MAX(usage_records.total_tokens,excluded.total_tokens) END,requests=CASE WHEN excluded.requests IS NULL THEN usage_records.requests WHEN usage_records.requests IS NULL THEN excluded.requests ELSE MAX(usage_records.requests,excluded.requests) END,coverage=excluded.coverage,connection_id=COALESCE(excluded.connection_id,usage_records.connection_id),file_id=COALESCE(excluded.file_id,usage_records.file_id),file_generation=MAX(usage_records.file_generation,excluded.file_generation)";
 
@@ -264,6 +264,10 @@ impl Storage {
         }
         if current < 9 {
             tx.execute_batch(include_str!("../migrations/009_account_mute.sql"))?;
+        }
+        if current < 10 {
+            tx.execute_batch(include_str!("../migrations/010_claude_trust.sql"))?;
+            migrate_claude_trust(&tx)?;
         }
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
@@ -1934,6 +1938,85 @@ fn migrate_legacy_rows(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Legacy Claude trust reclassification (migration 010, Master Spec
+/// §2.6): RC1 persisted synthetic Claude quota as authoritative
+/// `Partial`, but no validated authoritative Claude contract has ever
+/// existed — every claude-code `Partial` is synthetic legacy and must
+/// become `UnverifiedSemantics` (fail closed). Source-aware by
+/// construction: only `productId == "claude-code"` rows with
+/// `coverage == "Partial"` are touched; legitimate `Partial` from
+/// other products (e.g. official paginated costs) is never rewritten.
+/// Covers both persisted surfaces: `snapshots` payloads and the
+/// `app_snapshot` UI cache value.
+fn migrate_claude_trust(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let rows: Vec<(i64, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT id, payload_json FROM snapshots WHERE product_id='claude-code'",
+        )?;
+        let mapped = statement.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            Ok((id, payload))
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (snap_id, payload_json) in rows {
+        if let Some(rewritten) = reclassify_claude_partial_json(&payload_json) {
+            tx.execute(
+                "UPDATE snapshots SET payload_json=? WHERE id=?",
+                params![rewritten, snap_id],
+            )?;
+        }
+    }
+    let cached: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM app_cache WHERE cache_key='app_snapshot'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(json) = cached {
+        if let Some(rewritten) = reclassify_claude_partial_json(&json) {
+            tx.execute(
+                "UPDATE app_cache SET payload_json=? WHERE cache_key='app_snapshot'",
+                params![rewritten],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Reclassify one persisted JSON document: a Snapshot object or an
+/// AppSnapshot object with `providers[]`. Returns the rewritten JSON
+/// only when a claude-code `Partial` was actually downgraded; `None`
+/// means untouched (invalid JSON, other products, other coverage).
+/// Pure and unit-tested; also reused by load-time guards conceptually
+/// (runtime applies the same rule to live objects).
+pub(crate) fn reclassify_claude_partial_json(text: &str) -> Option<String> {
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut changed = false;
+    if value.get("productId").and_then(|v| v.as_str()) == Some("claude-code")
+        && value.get("coverage").and_then(|v| v.as_str()) == Some("Partial")
+    {
+        value["coverage"] = serde_json::Value::String("UnverifiedSemantics".into());
+        changed = true;
+    }
+    if let Some(providers) = value.get_mut("providers").and_then(|v| v.as_array_mut()) {
+        for provider in providers.iter_mut() {
+            let is_claude = provider.get("productId").and_then(|v| v.as_str())
+                == Some("claude-code");
+            let is_partial =
+                provider.get("coverage").and_then(|v| v.as_str()) == Some("Partial");
+            if is_claude && is_partial {
+                provider["coverage"] =
+                    serde_json::Value::String("UnverifiedSemantics".into());
+                changed = true;
+            }
+        }
+    }
+    changed.then(|| value.to_string())
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedAccount {
@@ -3338,8 +3421,7 @@ fn migrates_v8_account_rows_to_v9_without_data_loss() {
 }
 
 #[test]
-fn migrates_to_v9_with_account_mute_default_off() {
-    let mut storage = Storage::in_memory().unwrap();
+fn migrates_to_v9_with_account_mute_default_off() {    let mut storage = Storage::in_memory().unwrap();
     let id = uuid::Uuid::new_v4();
     storage
         .create_managed_account(&ManagedAccount {
@@ -3393,4 +3475,155 @@ fn migrates_to_v9_with_account_mute_default_off() {
     assert!(!storage
         .set_account_muted(uuid::Uuid::new_v4(), true)
         .unwrap());
+}
+
+/// RC1-equivalent persisted Claude snapshot: synthetic PTY result
+/// stored as authoritative `Partial` with 20% remaining. Shared by
+/// the legacy-trust regression tests below.
+#[cfg(test)]
+pub(crate) fn rc1_claude_partial_payload(account_id: &str) -> String {
+    serde_json::json!({
+        "accountId": account_id,
+        "providerId": "anthropic",
+        "productId": "claude-code",
+        "planLabel": null,
+        "capabilities": ["subscriptionQuota"],
+        "quotas": [{
+            "poolId": "claude-pty-weekly",
+            "windowId": null,
+            "name": "Weekly",
+            "usedPercent": 80.0,
+            "remainingPercent": 20.0,
+            "used": null,
+            "limit": null,
+            "unit": "Percent",
+            "windowStart": null,
+            "resetsAt": null,
+            "windowKind": "Unknown",
+            "source": "claude-pty-usage@1789603200"
+        }],
+        "balances": [],
+        "observedAt": "2026-09-10T10:00:00Z",
+        "fetchedAt": "2026-09-10T10:00:00Z",
+        "connectionState": "Connected",
+        "freshness": "Fresh",
+        "coverage": "Partial"
+    })
+    .to_string()
+}
+
+#[test]
+fn rc1_claude_partial_snapshot_loads_non_authoritative() {
+    // P0 regression (§5): an RC1-persisted synthetic Claude quota
+    // must NOT load as authoritative after upgrade. Currently RED:
+    // the stored Partial survives migration and load unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usage.db");
+    let account_id = uuid::Uuid::new_v4().to_string();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for migration in [
+            "migrations/001_initial.sql",
+            "migrations/002_accounts_budgets.sql",
+            "migrations/003_attempts_cooldowns.sql",
+            "migrations/004_identity_confidence.sql",
+            "migrations/005_provenance.sql",
+            "migrations/006_legacy_identity.sql",
+            "migrations/007_claude_cache_buckets.sql",
+            "migrations/008_profile_candidates.sql",
+            "migrations/009_account_mute.sql",
+        ] {
+            let sql = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(migration),
+            )
+            .unwrap();
+            conn.execute_batch(&sql).unwrap();
+        }
+        conn.execute(
+            "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES(?,?,?,?,?)",
+            rusqlite::params![account_id, "anthropic", "Claude", "Active", "2026-09-10T10:00:00Z"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots(account_id,product_id,payload_json,observed_at,fetched_at) VALUES(?,?,?,?,?)",
+            rusqlite::params![
+                account_id,
+                "claude-code",
+                rc1_claude_partial_payload(&account_id),
+                "2026-09-10T10:00:00Z",
+                "2026-09-10T10:00:00Z"
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 9u32).unwrap();
+    }
+    let storage = Storage::open(&path).unwrap();
+    let stored = storage
+        .last_known_good(account_id.parse().unwrap(), "claude-code")
+        .unwrap()
+        .expect("legacy row survives upgrade");
+    let payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+    assert_eq!(
+        payload.get("coverage").and_then(|v| v.as_str()),
+        Some("UnverifiedSemantics"),
+        "legacy RC1 Claude Partial must reclassify on load"
+    );
+    drop(storage);
+    // Case D — restart: quit, reopen, reclassification persists and
+    // the migration is idempotent (second open changes nothing).
+    let storage = Storage::open(&path).unwrap();
+    let stored = storage
+        .last_known_good(account_id.parse().unwrap(), "claude-code")
+        .unwrap()
+        .expect("row survives reopen");
+    let payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+    assert_eq!(
+        payload.get("coverage").and_then(|v| v.as_str()),
+        Some("UnverifiedSemantics"),
+        "reclassification persists across restart"
+    );
+    assert_eq!(
+        payload
+            .get("quotas")
+            .and_then(|v| v.as_array())
+            .map(|q| q.len()),
+        Some(1),
+        "quota data itself is preserved, only trust changes"
+    );
+}
+
+#[test]
+fn reclassify_walker_touches_only_claude_partial() {
+    // Case C at the walker level: legitimate Partial from other
+    // products and other coverages survive byte-identical.
+    let openai = serde_json::json!({
+        "providerId": "openai", "productId": "openai-api", "coverage": "Partial"
+    })
+    .to_string();
+    assert_eq!(reclassify_claude_partial_json(&openai), None);
+    let claude_complete = serde_json::json!({
+        "providerId": "anthropic", "productId": "claude-code", "coverage": "Complete"
+    })
+    .to_string();
+    assert_eq!(reclassify_claude_partial_json(&claude_complete), None);
+    assert_eq!(reclassify_claude_partial_json("{broken"), None);
+    // App-cache shape: only the claude-code entry flips.
+    let cache = serde_json::json!({
+        "providers": [
+            {"providerId": "anthropic", "productId": "claude-code", "coverage": "Partial"},
+            {"providerId": "openai", "productId": "codex", "coverage": "Complete"}
+        ]
+    })
+    .to_string();
+    let rewritten = reclassify_claude_partial_json(&cache).expect("rewritten");
+    let value: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+    let providers = value.get("providers").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(
+        providers[0].get("coverage").and_then(|v| v.as_str()),
+        Some("UnverifiedSemantics")
+    );
+    assert_eq!(
+        providers[1].get("coverage").and_then(|v| v.as_str()),
+        Some("Complete")
+    );
 }
