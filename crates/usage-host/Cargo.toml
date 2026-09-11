@@ -20,5 +20,9 @@ tracing.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 
+[target.'cfg(unix)'.dependencies]
+# forkpty backend for PTYHost (unix only; other platforms report Unavailable).
+libc = "0.2.189"
+
 [dev-dependencies]
 tempfile = "3"

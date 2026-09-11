@@ -476,6 +476,11 @@ fn build_strategy(kind: StrategyKind, custom_root: Option<PathBuf>) -> Box<dyn F
         StrategyKind::ClaudeJsonl => Box::new(usage_providers::claude::ClaudeJsonlStrategy::new(
             custom_root,
         )),
+        // Test connections exercise the JSONL observation source;
+        // the quota ends are covered by provider-level stub tests.
+        StrategyKind::ClaudePtyUsage | StrategyKind::ClaudeOAuthUsage => Box::new(
+            usage_providers::claude::ClaudeJsonlStrategy::new(custom_root),
+        ),
         StrategyKind::OpenAiCosts => Box::new(usage_providers::openai_api::OpenAiCostsStrategy {
             base_url: custom_root
                 .as_ref()

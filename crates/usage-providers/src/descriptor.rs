@@ -51,6 +51,10 @@ pub struct ProductDescriptor {
     /// Product strategies may spawn an allowlisted local executable
     /// through ProcessHost (e.g. Codex App Server over stdio).
     pub requires_process: bool,
+    /// Product strategies may drive an allowlisted local executable
+    /// through an owned PTY (e.g. the installed Claude Code usage
+    /// command). Granted separately from `requires_process`.
+    pub requires_pty: bool,
     pub diagnostics_version: &'static str,
 }
 
@@ -93,12 +97,36 @@ pub const CODEX_SOURCES: &[SourceDescriptor] = &[
     },
 ];
 
-pub const CLAUDE_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
-    id: "claude-local-jsonl",
-    classification: crate::strategy::SourceClassification::LocalStructuredData,
-    kill_switch: "",
-    version: "v1",
-}];
+pub const CLAUDE_SOURCES: &[SourceDescriptor] = &[
+    SourceDescriptor {
+        id: "claude-pty-usage",
+        classification: crate::strategy::SourceClassification::SupportedClientApi,
+        kill_switch: "claude-pty-usage",
+        version: "v1",
+    },
+    SourceDescriptor {
+        id: "claude-oauth-usage",
+        classification: crate::strategy::SourceClassification::OfficialApi,
+        kill_switch: "claude-oauth-usage",
+        version: "v1",
+    },
+    SourceDescriptor {
+        id: "claude-local-jsonl",
+        classification: crate::strategy::SourceClassification::LocalStructuredData,
+        kill_switch: "",
+        version: "v1",
+    },
+];
+
+/// Capability set advertised by the Claude quota ends only. The
+/// JSONL history end keeps CLAUDE_CODE_CAPS (no SubscriptionQuota):
+/// quotas and history are different trust states (§8).
+pub const CLAUDE_QUOTA_CAPS: &[Capability] = &[
+    Capability::SubscriptionQuota,
+    Capability::QuotaResetTime,
+    Capability::ApiTokens,
+    Capability::ModelBreakdown,
+];
 
 pub const OPENAI_API_SOURCES: &[SourceDescriptor] = &[SourceDescriptor {
     id: "openai-api-costs",
@@ -127,6 +155,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: Some(".codex-"),
         allow_custom_path: true,
         requires_process: true,
+        requires_pty: false,
         diagnostics_version: "codex-local-v1",
     },
     ProductDescriptor {
@@ -145,7 +174,10 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         local_dir_name: Some(".claude"),
         profile_dir_prefix: Some(".claude-"),
         allow_custom_path: true,
-        requires_process: false,
+        requires_process: true,
+        // PTY grant: the quota end drives the installed CLI through
+        // an owned pty; the JSONL history end never touches it.
+        requires_pty: true,
         diagnostics_version: "claude-local-v1",
     },
     ProductDescriptor {
@@ -165,6 +197,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "openai-api-v1",
     },
     ProductDescriptor {
@@ -184,6 +217,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -203,6 +237,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -222,6 +257,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -241,6 +277,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -260,6 +297,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "discovery-v1",
     },
     ProductDescriptor {
@@ -279,6 +317,7 @@ const DESCRIPTORS: &[ProductDescriptor] = &[
         profile_dir_prefix: None,
         allow_custom_path: false,
         requires_process: false,
+        requires_pty: false,
         diagnostics_version: "discovery-v1",
     },
 ];
@@ -317,6 +356,7 @@ pub struct ProductDescriptorDto {
     pub allow_custom_path: bool,
     pub needs_secret: bool,
     pub requires_process: bool,
+    pub requires_pty: bool,
     pub local_glob: Option<String>,
     pub local_dir_env: Option<String>,
     pub local_dir_name: Option<String>,
@@ -365,6 +405,7 @@ impl From<&ProductDescriptor> for ProductDescriptorDto {
             allow_custom_path: d.allow_custom_path,
             needs_secret: d.account_model == AccountModel::ApiKey,
             requires_process: d.requires_process,
+            requires_pty: d.requires_pty,
             local_glob: d.local_glob.map(str::to_string),
             local_dir_env: d.local_dir_env.map(str::to_string),
             local_dir_name: d.local_dir_name.map(str::to_string),
@@ -402,6 +443,27 @@ mod tests {
         let d = find_descriptor("anthropic", "claude-code").unwrap();
         assert!(!d.capabilities.contains(&Capability::SubscriptionQuota));
         assert!(d.capabilities.contains(&Capability::HistoryLocal));
+    }
+
+    #[test]
+    fn claude_quota_sources_ordered_before_history() {
+        // §8/§10.3: quota ends are separate strategies ahead of the
+        // history end; the runtime order follows this list exactly.
+        let d = find_descriptor("anthropic", "claude-code").unwrap();
+        let ids: Vec<_> = d.sources.iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "claude-pty-usage",
+                "claude-oauth-usage",
+                "claude-local-jsonl"
+            ]
+        );
+        assert!(d.requires_process);
+        assert!(d.requires_pty);
+        // No verified OAuth host yet: the HTTP grant stays closed
+        // until an endpoint + scoped credential are proven.
+        assert!(d.allowed_hosts.is_empty());
     }
 
     #[test]

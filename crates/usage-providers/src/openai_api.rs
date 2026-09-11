@@ -600,6 +600,7 @@ mod tests {
                 allowed_hosts: OPENAI_API_HOSTS,
                 keychain_service: Some("com.nurasss.usageai"),
                 process: false,
+                pty: false,
             }),
             timeout: Duration::from_secs(5),
             local_root: None,
@@ -995,6 +996,7 @@ mod tests {
             allowed_hosts: &["127.0.0.1"],
             keychain_service: Some("com.nurasss.usageai"),
             process: false,
+            pty: false,
         });
         let account = test_account();
         let descriptor = crate::descriptor::find_descriptor("openai", "openai-api").unwrap();
@@ -1083,6 +1085,7 @@ mod tests {
             allowed_hosts: &["127.0.0.1"],
             keychain_service: Some("com.nurasss.usageai"),
             process: false,
+            pty: false,
         });
         let account = test_account();
         let descriptor = crate::descriptor::find_descriptor("openai", "openai-api").unwrap();

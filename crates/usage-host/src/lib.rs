@@ -33,7 +33,7 @@ pub use process::{
     AllowlistedProcess, InteractiveChild, InteractiveRequest, ProcessHost, SpawnOutput,
     SpawnRequest,
 };
-pub use pty::{AllowlistedPty, PTYHost, PtyInput, PtyRequest};
+pub use pty::{AllowlistedPty, PTYHost, PtyChild, PtyInput, PtyRequest, PtySpawnRequest};
 
 /// Scoped OS access bundle handed to provider strategies.
 /// Strategies never touch the OS except through these traits.

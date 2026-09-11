@@ -1,0 +1,11 @@
+[SYNTHETIC v1 — hypothesized shape, NOT observed from a logged-in host.
+The strict parser accepts only explicit window stanzas below; coverage
+stays Partial until a logged-in host reconciles the shape. No PII.]
+
+Claude Code Usage
+Plan: Pro
+
+Session 42.5% of session limit used
+Weekly (all models) 61% used
+Resets at 2026-09-17T00:00:00Z
+Weekly Opus 12% used

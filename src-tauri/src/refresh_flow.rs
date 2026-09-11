@@ -231,12 +231,17 @@ fn outcome_to_dto(
         dto.last_successful_refresh = runtime_state.last_success.map(|d| d.to_rfc3339());
         dto.last_refresh_attempt = runtime_state.last_attempt.map(|d| d.to_rfc3339());
     }
-    // Fallback labeling (§9.3.3): codex quotas that did not come from
-    // the verified App Server source are locally observed observations,
-    // never authoritative values.
-    dto.quota_fallback = outcome.scope.product_id == "codex"
-        && !dto.quotas.is_empty()
-        && outcome.selected_source.as_deref() != Some("codex-app-server");
+    // Fallback labeling (§9.3.3, §10.3): quotas that did not come
+    // from the verified primary source are observations, never
+    // authoritative values. Codex primary = App Server, Claude
+    // primary = PTY usage command; the OAuth end stays fallback
+    // until it proves authoritative (V13-04 fidelity work).
+    dto.quota_fallback = !dto.quotas.is_empty()
+        && match outcome.scope.product_id.as_str() {
+            "codex" => outcome.selected_source.as_deref() != Some("codex-app-server"),
+            "claude-code" => outcome.selected_source.as_deref() != Some("claude-pty-usage"),
+            _ => false,
+        };
     dto
 }
 
@@ -678,5 +683,85 @@ mod tests {
             notices.is_empty(),
             "notifications must emit NONE for unverified provider"
         );
+    }
+
+    fn claude_outcome(selected_source: Option<&str>, with_quotas: bool) -> RefreshOutcome {
+        let scope = ScopeKey {
+            account_id: Uuid::new_v4(),
+            provider_id: "anthropic".into(),
+            product_id: "claude-code".into(),
+        };
+        let quotas = if with_quotas {
+            vec![Quota {
+                pool_id: "claude-pty-weekly".into(),
+                window_id: None,
+                name: "Weekly".into(),
+                used_percent: Some(rust_decimal::Decimal::new(61, 0)),
+                remaining_percent: Some(rust_decimal::Decimal::new(39, 0)),
+                used: None,
+                limit: None,
+                unit: MetricUnit::Percent,
+                resets_at: None,
+                window_start: None,
+                window_kind: WindowKind::Unknown,
+                source: "claude-pty-usage@test".into(),
+            }]
+        } else {
+            vec![]
+        };
+        RefreshOutcome {
+            scope,
+            snapshot: Some(Snapshot {
+                account_id: Uuid::nil(),
+                provider_id: "anthropic".into(),
+                product_id: "claude-code".into(),
+                plan_label: None,
+                capabilities: [Capability::SubscriptionQuota].into_iter().collect(),
+                quotas,
+                balances: vec![],
+                observed_at: Some(Utc::now()),
+                fetched_at: Utc::now(),
+                connection_state: ConnectionState::Connected,
+                freshness: Freshness::Fresh,
+                coverage: Coverage::Partial,
+            }),
+            stale: false,
+            error: None,
+            attempts: vec![],
+            warnings: vec![],
+            costs_imported: 0,
+            usage_imported: 0,
+            selected_source: selected_source.map(str::to_string),
+            schema_fingerprint: Some("v1".into()),
+        }
+    }
+
+    #[test]
+    fn claude_quota_fallback_flags_non_primary_sources() {
+        let metas = HashMap::new();
+        let states = HashMap::new();
+        // Primary PTY end: no banner.
+        let dto = outcome_to_dto(
+            &claude_outcome(Some("claude-pty-usage"), true),
+            &metas,
+            &states,
+        );
+        assert!(!dto.quota_fallback);
+        assert_eq!(dto.quotas.len(), 1);
+        // OAuth fallback end: explicit banner.
+        let dto = outcome_to_dto(
+            &claude_outcome(Some("claude-oauth-usage"), true),
+            &metas,
+            &states,
+        );
+        assert!(dto.quota_fallback);
+        // History end with no quotas: nothing shown, no banner.
+        let dto = outcome_to_dto(
+            &claude_outcome(Some("claude-local-jsonl"), false),
+            &metas,
+            &states,
+        );
+        assert!(!dto.quota_fallback);
+        assert!(dto.quotas.is_empty());
     }
 }

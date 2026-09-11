@@ -899,6 +899,8 @@ fn strategy_source_name(kind: &StrategyKind) -> String {
     match kind {
         StrategyKind::CodexAppServer => "codex-app-server".into(),
         StrategyKind::CodexJsonl => "codex-local-jsonl".into(),
+        StrategyKind::ClaudePtyUsage => "claude-pty-usage".into(),
+        StrategyKind::ClaudeOAuthUsage => "claude-oauth-usage".into(),
         StrategyKind::ClaudeJsonl => "claude-local-jsonl".into(),
         StrategyKind::OpenAiCosts => "openai-api-costs".into(),
     }
@@ -922,6 +924,21 @@ fn build_strategy(
         )),
         StrategyKind::CodexJsonl => Some(Box::new(
             usage_providers::codex::CodexJsonlStrategy::new(custom_root),
+        )),
+        // Anti-contamination (mirrors Codex): the quota ends reflect
+        // the CLI's own login, never a custom profile root. Custom
+        // Claude profiles keep their JSONL observation source, so no
+        // cross-profile credential fallback can occur.
+        StrategyKind::ClaudePtyUsage if custom_root.is_some() => None,
+        StrategyKind::ClaudePtyUsage => {
+            Some(Box::new(usage_providers::claude::ClaudePtyUsageStrategy {
+                executables: crate::registry::resolve_claude_executables(hosts),
+                stub: None,
+            }))
+        }
+        StrategyKind::ClaudeOAuthUsage if custom_root.is_some() => None,
+        StrategyKind::ClaudeOAuthUsage => Some(Box::new(
+            usage_providers::claude::ClaudeOAuthUsageStrategy { oauth_url: None },
         )),
         StrategyKind::ClaudeJsonl => Some(Box::new(
             usage_providers::claude::ClaudeJsonlStrategy::new(custom_root),
@@ -1941,5 +1958,20 @@ mod app_server_scope_tests {
             Some(PathBuf::from("/tmp/custom-home")),
         );
         assert!(custom.is_none());
+    }
+
+    #[test]
+    fn claude_quota_ends_serve_default_scopes_only() {
+        // No cross-profile credential fallback: both quota ends are
+        // built for default scopes; custom roots keep JSONL only,
+        // while the history end serves everywhere (§8, §11.2).
+        let hosts = bare_hosts();
+        assert!(build_strategy(&hosts, StrategyKind::ClaudePtyUsage, None).is_some());
+        assert!(build_strategy(&hosts, StrategyKind::ClaudeOAuthUsage, None).is_some());
+        assert!(build_strategy(&hosts, StrategyKind::ClaudeJsonl, None).is_some());
+        let custom = Some(PathBuf::from("/tmp/custom-claude"));
+        assert!(build_strategy(&hosts, StrategyKind::ClaudePtyUsage, custom.clone()).is_none());
+        assert!(build_strategy(&hosts, StrategyKind::ClaudeOAuthUsage, custom.clone()).is_none());
+        assert!(build_strategy(&hosts, StrategyKind::ClaudeJsonl, custom).is_some());
     }
 }

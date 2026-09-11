@@ -1,6 +1,18 @@
 # Claude Code Integration Spec
 
-Status: **history Implemented (v1.1)** — strategy `claude-local-jsonl`, schema `claude-jsonl-assistant-v1`; **subscription quota still blocked** (no verified source).
+Status: **history Implemented (v1.1)** — strategy `claude-local-jsonl`, schema `claude-jsonl-assistant-v1`; **subscription quota V13-03**: ordered ends `claude-pty-usage` (SupportedClientApi, live-degrading) + `claude-oauth-usage` (OfficialApi, dormant contract) ahead of the history end. Window shapes are SYNTHETIC v1 (`Coverage::Partial`, never `Complete`) until a logged-in host reconciles them.
+
+0. Source order (v1.3): `claude-pty-usage` first, `claude-oauth-usage` second, `claude-local-jsonl` (history end, quotas always empty) last. Quota ends serve default scopes only; custom `~/.claude-<slug>` profiles keep JSONL observation — no cross-profile credential fallback, ever.
+
+0.1. PTY end (verified behaviorally, not yet against a subscription): installed `claude` CLI driven through an owned forkpty child (`/usage`, then `/exit`, nothing else — $0.0000 spend proven across all probes). Fast login gate first (`claude auth status`, observed shape `{"loggedIn":bool,...}`, ~1s, non-interactive): not-logged-in is `NotConfigured` (skip without cooldown — the truth is "sign in"); only a proven login is `Ready`. Executable candidates are static (no PATH/shell); a dead shim fails the gate fast (no first-exists-wins flaw).
+
+0.2. Screen parser is STRICT and locale-pinned (child spawns with `LANG=C LC_ALL=C`): ANSI-stripped text, `label-with-window-hint + ASCII-dot percent` stanzas, RFC3339 resets only, plans/tiers length-capped and never email-like. OBSERVED login markers (oauth authorize URL + paste-code prompt, captured 2026-09-10) classify as `AuthenticationRequired`. Anything else is `Parse` — the parser cannot fabricate from unknown screens. No denominator is ever synthesized from JSONL (§10.3.3); percents stand alone; windows stay `WindowKind::Unknown`.
+
+0.3. OAuth end is a dormant contract: transport (Bearer via `FetchContext.secret` only, allow-listed hosts, bounded, 401/403/429/5xx classified) + parser + ordering tests are implemented and green, but production wires no URL and no host, so availability stays `NotConfigured`. No endpoint is fabricated; no Keychain/credential store is opened (on this host the OAuth token lives outside any file — `auth status` reports `loggedIn:false`, `hasAvailableSubscription:false`).
+
+0.4. Fallback semantics (§8): quota-end failure never fails the refresh — the coordinator falls through to the history end (still `Connected`), and `quota_fallback` banners any shown quotas not served by `claude-pty-usage`. Auth failures set no cooldown (history keeps serving every refresh); Parse/Network failures take the standard transient backoff.
+
+0.5. Live evidence 2026-09-10 (no subscription login on host): `auth status` shape parses live; full strategy degrades `NotConfigured` → `AuthenticationRequired`, bounded, no hang, no spend. Real quota remains BLOCKED on login — stated, not worked around.
 
 0. v1.1 semantics: identity priority `message.id + requestId` → `uuid` → `path:offset`, so repeated streaming chunks share one record and never inflate totals; cache = read + creation; a reachable history source reports `Connected` with history capabilities only (no `subscriptionQuota`), an absent one reports `Unavailable`.
 

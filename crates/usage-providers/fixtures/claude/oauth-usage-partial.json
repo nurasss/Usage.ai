@@ -1,0 +1,10 @@
+{
+  "_synthetic_v1_unverified": true,
+  "_note": "Partial shape: the session window carries a non-numeric percent and must degrade to a warning, never kill the snapshot.",
+  "windows": [
+    {"scope": "session", "used_percent": "lots", "resets_at": null},
+    {"scope": "weekly", "used_percent": 61.0, "resets_at": "2026-09-17T00:00:00Z", "window_minutes": 10080},
+    {"scope": "teapot", "used_percent": 1.0}
+  ],
+  "plan": "Pro"
+}

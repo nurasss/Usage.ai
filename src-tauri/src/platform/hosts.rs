@@ -20,23 +20,27 @@ pub fn macos_hosts(network: &ObservedNetwork) -> Arc<Hosts> {
         file_scope: files,
         network: Arc::new(network.clone()),
         process: Arc::new(usage_host::AllowlistedProcess::with_allowed(
-            codex_executables(),
+            cli_executables("codex"),
         )),
-        pty: Arc::new(usage_host::AllowlistedPty::default()),
+        pty: Arc::new(usage_host::AllowlistedPty::with_allowed(cli_executables(
+            "claude",
+        ))),
     })
 }
 
-/// Local Codex CLI candidates. Existence is checked here in the
-/// platform layer; the strategy only ever receives paths the host
-/// allow-listed. No PATH lookup, no shell.
-fn codex_executables() -> Vec<std::path::PathBuf> {
+/// Local CLI candidates for one binary name. Existence is checked
+/// here in the platform layer; strategies only ever receive paths
+/// the host allow-listed. No PATH lookup, no shell. The PTY
+/// allow-list carries the Claude CLI only — nothing else in the
+/// product needs interactive terminal execution.
+fn cli_executables(name: &str) -> Vec<std::path::PathBuf> {
     let mut candidates = vec![
-        std::path::PathBuf::from("/usr/local/bin/codex"),
-        std::path::PathBuf::from("/opt/homebrew/bin/codex"),
+        std::path::PathBuf::from(format!("/usr/local/bin/{name}")),
+        std::path::PathBuf::from(format!("/opt/homebrew/bin/{name}")),
     ];
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        candidates.push(home.join(".npm-global/bin/codex"));
-        candidates.push(home.join(".local/bin/codex"));
+        candidates.push(home.join(format!(".npm-global/bin/{name}")));
+        candidates.push(home.join(format!(".local/bin/{name}")));
     }
     candidates
         .into_iter()

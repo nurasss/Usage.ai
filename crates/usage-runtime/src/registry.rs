@@ -11,6 +11,8 @@ use usage_providers::descriptor::{all_descriptors, find_descriptor, ProductDescr
 pub enum StrategyKind {
     CodexAppServer,
     CodexJsonl,
+    ClaudePtyUsage,
+    ClaudeOAuthUsage,
     ClaudeJsonl,
     OpenAiCosts,
 }
@@ -19,6 +21,8 @@ pub fn strategy_kind(source_id: &str) -> Option<StrategyKind> {
     match source_id {
         "codex-app-server" => Some(StrategyKind::CodexAppServer),
         "codex-local-jsonl" => Some(StrategyKind::CodexJsonl),
+        "claude-pty-usage" => Some(StrategyKind::ClaudePtyUsage),
+        "claude-oauth-usage" => Some(StrategyKind::ClaudeOAuthUsage),
         "claude-local-jsonl" => Some(StrategyKind::ClaudeJsonl),
         "openai-api-costs" => Some(StrategyKind::OpenAiCosts),
         _ => None,
@@ -77,6 +81,45 @@ pub fn resolve_codex_executable(hosts: &Hosts) -> Option<PathBuf> {
     resolve_codex_executables(hosts).into_iter().next()
 }
 
+/// Static Claude Code CLI locations, tried in order. No PATH lookup,
+/// no shell. Unlike Codex there is no cheap RPC handshake: the
+/// PTY-usage strategy gates on `claude auth status` (fast,
+/// non-interactive, $0) instead, so existence here is only the
+/// static candidate set — every entry must additionally pass the
+/// process allow-list at spawn time.
+pub fn resolve_claude_executables(hosts: &Hosts) -> Vec<PathBuf> {
+    use usage_host::CancellationToken;
+    let Some(home) = hosts.file_scope.home_dir() else {
+        return vec![];
+    };
+    let cancel = CancellationToken::new();
+    let mut found_all = vec![];
+    for candidate in usage_providers::claude::claude_executable_candidates(&home) {
+        let Some(parent) = candidate.parent() else {
+            continue;
+        };
+        let Ok(root) = hosts.file_scope.scope_root(parent, &cancel) else {
+            continue;
+        };
+        let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let found = hosts
+            .files
+            .list_files(&root, name, &cancel)
+            .unwrap_or_default();
+        if !found.is_empty() {
+            found_all.push(candidate);
+        }
+    }
+    found_all
+}
+
+/// First existing Claude candidate, for display/diagnostics only.
+pub fn resolve_claude_executable(hosts: &Hosts) -> Option<PathBuf> {
+    resolve_claude_executables(hosts).into_iter().next()
+}
+
 /// Host facade policy derived from exactly one descriptor: a strategy
 /// physically cannot reach hosts its product was not granted.
 pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::facade::FacadePolicy {
@@ -86,6 +129,7 @@ pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::fac
             files: false,
             http: false,
             process: false,
+            pty: false,
             allowed_hosts: &[],
             keychain_service: None,
         },
@@ -93,6 +137,7 @@ pub fn facade_policy_for(provider_id: &str, product_id: &str) -> usage_host::fac
             files: d.local_glob.is_some(),
             http: !d.allowed_hosts.is_empty(),
             process: d.requires_process,
+            pty: d.requires_pty,
             allowed_hosts: d.allowed_hosts,
             keychain_service: matches!(
                 d.account_model,
@@ -226,11 +271,28 @@ mod tests {
         let codex = facade_policy_for("openai", "codex");
         assert!(codex.files && !codex.http && codex.keychain_service.is_none());
         assert!(codex.process);
+        assert!(!codex.pty);
+        let claude = facade_policy_for("anthropic", "claude-code");
+        assert!(claude.files && !claude.http);
+        assert!(claude.process && claude.pty);
         let api = facade_policy_for("openai", "openai-api");
         assert!(!api.files && api.http && !api.process);
         assert_eq!(api.keychain_service, Some("com.nurasss.usageai"));
         let blocked = facade_policy_for("google", "antigravity");
         assert!(!blocked.files && !blocked.http && blocked.keychain_service.is_none());
+    }
+    #[test]
+    fn claude_strategies_follow_descriptor_order() {
+        // §8/§10.3: quota ends ahead of the history end; the refresh
+        // loop builds in exactly this order.
+        assert_eq!(
+            strategies_for("anthropic", "claude-code"),
+            vec![
+                StrategyKind::ClaudePtyUsage,
+                StrategyKind::ClaudeOAuthUsage,
+                StrategyKind::ClaudeJsonl,
+            ]
+        );
     }
     #[test]
     fn discovery_products_have_no_strategies() {
