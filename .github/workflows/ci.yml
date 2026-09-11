@@ -37,11 +37,18 @@ jobs:
       - run: npm ci
       - run: cargo check --workspace --locked --target x86_64-apple-darwin
       - run: cargo test --workspace --locked --target x86_64-apple-darwin
+      # The Tauri CLI owns its inner cargo invocation and cannot take
+      # --locked, so lock enforcement is explicit: compile the exact
+      # release binary locked first, then bundle, then prove neither
+      # step mutated the committed lockfiles.
+      - run: cargo build --locked --release --target x86_64-apple-darwin -p usage-ai-app
       - run: npm run tauri build -- --target x86_64-apple-darwin
         env:
-          # Locked-equivalent for the Tauri-driven cargo build: no
-          # network, no implicit lockfile updates.
           CARGO_NET_OFFLINE: 'true'
+      - name: Verify lockfiles untouched by the release build
+        run: |
+          git status --porcelain -- Cargo.lock package-lock.json | tee lockcheck.txt
+          test ! -s lockcheck.txt
       - name: Verify Intel executable and bundles
         run: |
           executable="$(find target/x86_64-apple-darwin/release/bundle/macos -type f -perm -111 -maxdepth 4 | head -1)"

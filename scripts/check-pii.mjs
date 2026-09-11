@@ -30,41 +30,56 @@ const RULES = [
   [/AIza[A-Za-z0-9\-_]{10,}/, 'google-like key'],
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/, 'pem private key'],
   [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/, 'email address'],
+  [/Bearer\s+[A-Za-z0-9\-._~+/=]{8,}/, 'bearer token value'],
+  [/\/(Users|home|private)\/[A-Za-z0-9._~-]+(\/[A-Za-z0-9._~-]+)+/, 'absolute home path'],
+  [/[A-Za-z]:(?!\/\/)[\\/][A-Za-z0-9._~\\/-]+/, 'windows absolute path'],
   [/["']?[A-Za-z0-9]{32,}["']?/, 'long opaque token (32+ alnum)'],
 ];
 
-// Allowlisted literals/filenames: placeholders and documented test
-// fakes (audit probe strings, redaction unit fixtures). Each entry is
-// a deliberate, reviewable exception — never a live credential.
-const ALLOW_PATH = [/^scripts\/check-pii\.mjs$/, /CHANGELOG/i, /fixtures\/real\//];
+// Path allowlist: files whose PURPOSE is exercising PII patterns
+// (dedicated redaction tests, the sanctioned injection fixture).
+// Everything else is scanned, including other test files.
+const ALLOW_PATH = [
+  /^scripts\/check-pii\.mjs$/,
+  /CHANGELOG/i,
+  /fixtures\/real\//,
+  /^src\/lib\/redact\.test\.ts$/,
+  /^src-tauri\/fixtures\/diagnostics-pii-injection\.json$/,
+];
+
+// Narrow literal allowlist: each entry names an exact sanctioned fake
+// and why it exists. Broad substrings (like a whole persona domain)
+// are deliberately NOT here: a real leak that merely resembles them
+// must still fire.
 const ALLOW_TEXT = [
-  'example.invalid',
-  '@example.com',
-  '/Users/alice/',
+  'example.invalid', // RFC-reserved placeholder TLD
   'REDACTED',
   'redacted',
   '[redacted',
-  'sk-test',
-  'sk-original',
-  'sk-proj-secret',
-  'SECRET_API_KEY_123',
-  'Bearer abcdef',
-  'sk-1234567890abcdef',
-  'sk-abc123XYZ4567890',
-  'sk-AAAAAAAAAAAAAAAA',
-  'abcdefghijklmnopqrstuvwxyz',
-  'oauth-test-token',
-  'test-token',
-  'token-secret',
-  'api_key_secret',
-  'password=123',
-  'xoxb-123456789012',
-  'ghp_abcdefgh12345678',
-  'MIIBPA',
-  '@2x.png',
-  'user@example.com',
-  'someone@example.com',
-  'nuras',
+  'sk-original', // refresh.rs keychain-secret test fake
+  'sk-proj-secret', // audit-documented synthetic probe string
+  'sk-test-secret', // sanctioned injection string (audit prose + fixture)
+  'sk-test-real-host', // openai_api.rs stub bearer fake
+  'sk-AAAAAAAAAAAAAAAA', // diagnostics.rs sample warning fake
+  'abcdefghijklmnopqrstuvwxyz', // usage-core redact unit alphabet run
+  'someone@example.com', // claude.rs email-plan rejection tests
+  'alice@example.com', // audit-documented synthetic persona
+  // The exact six sanctioned injection strings: they must exist in
+  // the fixture + evidence prose, and must NEVER survive export
+  // bytes (enforced by Rust tripwire tests, not here).
+  'Bearer SUPERSECRET',
+  '/Users/alice/private/project',
+  'sk-test-secret',
+  'MyPrivateProject',
+  'raw account identity note',
+  // This repository's own location as referenced in docs.
+  '/Users/nuras/Desktop/usage.ai',
+  '/Users/nuras/Downloads/',
+  '/Users/nuras/.npm-global/bin/', // public tool install prefix in evidence
+  '/Users/me/', // placeholder path in audit prose
+  '/private/tmp/usage-ai-rc1-audit', // deleted audit worktree prefix
+  '/private/tmp/usage-ai-rc2-audit', // deleted audit worktree prefix
+  '@2x.png', // retina asset convention, not an address
 ];
 // Git SHAs / content hashes in audit docs and lockfiles are not
 // credentials; skip the opaque-token rule on hash-context lines.
