@@ -1654,6 +1654,27 @@ mod live_acceptance {
         };
         let descriptor =
             crate::descriptor::find_descriptor("openai", "codex").expect("codex descriptor");
+        // Mirror the production coordinator's scoped_product_root path:
+        // the live acceptance test must exercise the same profile root used
+        // for the auth.json identity fallback, including CODEX_HOME.
+        let cancel = usage_host::CancellationToken::new();
+        let root = descriptor
+            .local_dir_env
+            .and_then(|name| hosts.file_scope.env_var(name))
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                hosts
+                    .file_scope
+                    .home_dir()
+                    .zip(descriptor.local_dir_name)
+                    .map(|(home, name)| home.join(name))
+            });
+        let local_root = root.and_then(|root| hosts.file_scope.scope_root(&root, &cancel).ok());
+        assert!(
+            local_root.is_some(),
+            "production-scoped Codex root must be available for the live probe"
+        );
         let ctx = FetchContext {
             account: &account,
             facade: hosts.facade(&usage_host::facade::FacadePolicy {
@@ -1666,9 +1687,9 @@ mod live_acceptance {
             }),
             descriptor,
             timeout: Duration::from_secs(25),
-            local_root: None,
+            local_root,
             secret: None,
-            cancel: usage_host::CancellationToken::new(),
+            cancel,
         };
         let strategy = CodexAppServerStrategy::new(executables);
         assert_eq!(strategy.availability(&ctx).await, Availability::Ready);
