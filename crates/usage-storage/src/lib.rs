@@ -5,7 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use usage_core::{Account, CostRecord, UsageRecord};
+use usage_core::{Account, CostRecord, Snapshot, UsageRecord};
 
 const SCHEMA_VERSION: u32 = 10;
 
@@ -879,6 +879,7 @@ impl Storage {
         &mut self,
         bundle: &RefreshBundle<'_>,
     ) -> Result<CommitBundleResult> {
+        validate_refresh_bundle(bundle)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1227,7 +1228,7 @@ impl Storage {
         end: DateTime<Utc>,
     ) -> Result<Vec<(String, u64)>> {
         let mut statement = self.conn.prepare(
-            "SELECT product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage != 'UnverifiedSemantics' GROUP BY product_id ORDER BY product_id",
+            "SELECT product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage IN ('Complete','Partial') GROUP BY product_id ORDER BY product_id",
         )?;
         let rows = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
@@ -1243,7 +1244,7 @@ impl Storage {
         end: DateTime<Utc>,
     ) -> Result<Vec<(String, u64)>> {
         let mut statement = self.conn.prepare(
-            "SELECT product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage = 'UnverifiedSemantics' GROUP BY product_id ORDER BY product_id",
+            "SELECT product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage NOT IN ('Complete','Partial') GROUP BY product_id ORDER BY product_id",
         )?;
         let rows = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
@@ -1259,7 +1260,7 @@ impl Storage {
         end: DateTime<Utc>,
     ) -> Result<u64> {
         let mut statement = self.conn.prepare(
-            "SELECT COUNT(DISTINCT product_id) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage = 'UnverifiedSemantics'",
+            "SELECT COUNT(DISTINCT product_id) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage NOT IN ('Complete','Partial')",
         )?;
         let count: u64 =
             statement.query_row(params![start.to_rfc3339(), end.to_rfc3339()], |r| r.get(0))?;
@@ -1277,6 +1278,30 @@ impl Storage {
             .conn
             .query_row(
                 "SELECT COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE account_id=? AND product_id=? AND period_start>=? AND period_start<?",
+                params![
+                    account_id.to_string(),
+                    product_id,
+                    start.to_rfc3339(),
+                    end.to_rfc3339()
+                ],
+                |r| r.get(0),
+            )?)
+    }
+
+    /// Sum only usage rows whose coverage is authoritative for user-facing
+    /// provider totals. The raw helper above intentionally keeps all rows for
+    /// diagnostics and historical inspection.
+    pub fn authoritative_tokens_for_account_between(
+        &self,
+        account_id: uuid::Uuid,
+        product_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<u64> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE account_id=? AND product_id=? AND period_start>=? AND period_start<? AND coverage IN ('Complete','Partial')",
                 params![
                     account_id.to_string(),
                     product_id,
@@ -1346,7 +1371,7 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<(Option<String>, u64)>> {
-        let mut statement = self.conn.prepare("SELECT model,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage != 'UnverifiedSemantics' GROUP BY model ORDER BY model")?;
+        let mut statement = self.conn.prepare("SELECT model,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage IN ('Complete','Partial') GROUP BY model ORDER BY model")?;
         let rows = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -1632,7 +1657,7 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<(String, String, String, u64)>> {
-        let mut statement = self.conn.prepare("SELECT accounts.alias,usage_records.account_id,usage_records.product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records LEFT JOIN accounts ON accounts.id=usage_records.account_id WHERE period_start>=? AND period_start<? AND usage_records.coverage != 'UnverifiedSemantics' GROUP BY usage_records.account_id,usage_records.product_id ORDER BY accounts.alias")?;
+        let mut statement = self.conn.prepare("SELECT accounts.alias,usage_records.account_id,usage_records.product_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records LEFT JOIN accounts ON accounts.id=usage_records.account_id WHERE period_start>=? AND period_start<? AND usage_records.coverage IN ('Complete','Partial') GROUP BY usage_records.account_id,usage_records.product_id ORDER BY accounts.alias")?;
         let mut rows: Vec<(String, String, String, u64)> = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -1665,7 +1690,7 @@ impl Storage {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<(Option<String>, u64)>> {
-        let mut statement = self.conn.prepare("SELECT billing_scope_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage != 'UnverifiedSemantics' GROUP BY billing_scope_id ORDER BY billing_scope_id")?;
+        let mut statement = self.conn.prepare("SELECT billing_scope_id,COALESCE(SUM(COALESCE(total_tokens,COALESCE(input_tokens,0)+COALESCE(output_tokens,0))),0) FROM usage_records WHERE period_start>=? AND period_start<? AND coverage IN ('Complete','Partial') GROUP BY billing_scope_id ORDER BY billing_scope_id")?;
         let rows = statement
             .query_map(params![start.to_rfc3339(), end.to_rfc3339()], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -1943,16 +1968,16 @@ fn migrate_legacy_rows(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 /// `Partial`, but no validated authoritative Claude contract has ever
 /// existed — every claude-code `Partial` is synthetic legacy and must
 /// become `UnverifiedSemantics` (fail closed). Source-aware by
-/// construction: only `productId == "claude-code"` rows with
-/// `coverage == "Partial"` are touched; legitimate `Partial` from
-/// other products (e.g. official paginated costs) is never rewritten.
+/// construction: only the `providerId == "anthropic"`,
+/// `productId == "claude-code"` rows with `coverage == "Partial"` are
+/// touched; legitimate `Partial` from other products/providers (e.g.
+/// official paginated costs) is never rewritten.
 /// Covers both persisted surfaces: `snapshots` payloads and the
 /// `app_snapshot` UI cache value.
 fn migrate_claude_trust(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     let rows: Vec<(i64, String)> = {
-        let mut statement = tx.prepare(
-            "SELECT id, payload_json FROM snapshots WHERE product_id='claude-code'",
-        )?;
+        let mut statement =
+            tx.prepare("SELECT id, payload_json FROM snapshots WHERE product_id='claude-code'")?;
         let mapped = statement.query_map([], |row| {
             let id: i64 = row.get(0)?;
             let payload: String = row.get(1)?;
@@ -1995,7 +2020,8 @@ fn migrate_claude_trust(tx: &rusqlite::Transaction<'_>) -> Result<()> {
 pub(crate) fn reclassify_claude_partial_json(text: &str) -> Option<String> {
     let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
     let mut changed = false;
-    if value.get("productId").and_then(|v| v.as_str()) == Some("claude-code")
+    if value.get("providerId").and_then(|v| v.as_str()) == Some("anthropic")
+        && value.get("productId").and_then(|v| v.as_str()) == Some("claude-code")
         && value.get("coverage").and_then(|v| v.as_str()) == Some("Partial")
     {
         value["coverage"] = serde_json::Value::String("UnverifiedSemantics".into());
@@ -2003,13 +2029,12 @@ pub(crate) fn reclassify_claude_partial_json(text: &str) -> Option<String> {
     }
     if let Some(providers) = value.get_mut("providers").and_then(|v| v.as_array_mut()) {
         for provider in providers.iter_mut() {
-            let is_claude = provider.get("productId").and_then(|v| v.as_str())
-                == Some("claude-code");
-            let is_partial =
-                provider.get("coverage").and_then(|v| v.as_str()) == Some("Partial");
+            let is_claude = provider.get("providerId").and_then(|v| v.as_str())
+                == Some("anthropic")
+                && provider.get("productId").and_then(|v| v.as_str()) == Some("claude-code");
+            let is_partial = provider.get("coverage").and_then(|v| v.as_str()) == Some("Partial");
             if is_claude && is_partial {
-                provider["coverage"] =
-                    serde_json::Value::String("UnverifiedSemantics".into());
+                provider["coverage"] = serde_json::Value::String("UnverifiedSemantics".into());
                 changed = true;
             }
         }
@@ -2117,6 +2142,46 @@ pub struct RefreshBundle<'a> {
     pub fetched_at: DateTime<Utc>,
     pub usage: &'a [UsageRecord],
     pub costs: &'a [CostRecord],
+}
+
+fn validate_refresh_bundle(bundle: &RefreshBundle<'_>) -> Result<()> {
+    let snapshot: Snapshot = serde_json::from_str(bundle.snapshot_payload_json)
+        .context("invalid refresh snapshot payload")?;
+    if snapshot.account_id != bundle.account_id {
+        anyhow::bail!("refresh_snapshot_account_mismatch");
+    }
+    if snapshot.product_id != bundle.product_id {
+        anyhow::bail!("refresh_snapshot_product_mismatch");
+    }
+    if bundle
+        .usage
+        .iter()
+        .any(|record| record.account_id != bundle.account_id)
+    {
+        anyhow::bail!("refresh_usage_account_mismatch");
+    }
+    if bundle
+        .usage
+        .iter()
+        .any(|record| record.product_id != bundle.product_id)
+    {
+        anyhow::bail!("refresh_usage_product_mismatch");
+    }
+    if bundle
+        .costs
+        .iter()
+        .any(|record| record.account_id != bundle.account_id)
+    {
+        anyhow::bail!("refresh_cost_account_mismatch");
+    }
+    if bundle
+        .costs
+        .iter()
+        .any(|record| record.product_id != bundle.product_id)
+    {
+        anyhow::bail!("refresh_cost_product_mismatch");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2830,6 +2895,69 @@ mod tests {
         assert!(out.contains("Аккаунт не определён"));
         assert!(!out.to_ascii_lowercase().contains("email"));
     }
+
+    #[test]
+    fn refresh_bundle_rejects_foreign_records_before_writing() {
+        let mut storage = Storage::in_memory().unwrap();
+        let account_id = Uuid::new_v4();
+        storage
+            .upsert_account(&Account {
+                id: account_id,
+                provider_id: "openai".into(),
+                external_identity: None,
+                label: "Test".into(),
+                connection_ref: None,
+                lifecycle: usage_core::AccountLifecycle::Active,
+            })
+            .unwrap();
+        let now = Utc::now();
+        let snapshot = Snapshot {
+            account_id,
+            provider_id: "openai".into(),
+            product_id: "codex".into(),
+            plan_label: None,
+            capabilities: Default::default(),
+            quotas: vec![],
+            balances: vec![],
+            observed_at: Some(now),
+            fetched_at: now,
+            connection_state: usage_core::ConnectionState::Connected,
+            freshness: usage_core::Freshness::Fresh,
+            coverage: Coverage::Complete,
+        };
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+        let mut valid = usage("valid", 10);
+        valid.account_id = account_id;
+        valid.product_id = "codex".into();
+        valid.coverage = Coverage::Complete;
+        let valid_bundle = RefreshBundle {
+            account_id,
+            product_id: "codex",
+            snapshot_payload_json: &snapshot_json,
+            observed_at: snapshot.observed_at,
+            fetched_at: snapshot.fetched_at,
+            usage: std::slice::from_ref(&valid),
+            costs: &[],
+        };
+        assert_eq!(
+            storage.commit_refresh_bundle(&valid_bundle).unwrap(),
+            BundleReport {
+                usage_accepted: 1,
+                costs_accepted: 0,
+            }
+        );
+        let before = storage.usage_count().unwrap();
+
+        let mut foreign = valid.clone();
+        foreign.source_record_id = "foreign".into();
+        foreign.account_id = Uuid::new_v4();
+        let invalid_bundle = RefreshBundle {
+            usage: std::slice::from_ref(&foreign),
+            ..valid_bundle
+        };
+        assert!(storage.commit_refresh_bundle(&invalid_bundle).is_err());
+        assert_eq!(storage.usage_count().unwrap(), before);
+    }
     #[test]
     fn account_archive_preserves_history_and_delete_removes_it() {
         let mut s = Storage::in_memory().unwrap();
@@ -2946,6 +3074,11 @@ mod tests {
             s.tokens_for_account_between(Uuid::nil(), "codex", start, end)
                 .unwrap(),
             50
+        );
+        assert_eq!(
+            s.authoritative_tokens_for_account_between(Uuid::nil(), "codex", start, end)
+                .unwrap(),
+            0
         );
         let models = s.model_totals_between(start, end).unwrap();
         assert_eq!(models.len(), 2);
@@ -3421,7 +3554,8 @@ fn migrates_v8_account_rows_to_v9_without_data_loss() {
 }
 
 #[test]
-fn migrates_to_v9_with_account_mute_default_off() {    let mut storage = Storage::in_memory().unwrap();
+fn migrates_to_v9_with_account_mute_default_off() {
+    let mut storage = Storage::in_memory().unwrap();
     let id = uuid::Uuid::new_v4();
     storage
         .create_managed_account(&ManagedAccount {
@@ -3541,7 +3675,13 @@ fn rc1_claude_partial_snapshot_loads_non_authoritative() {
         }
         conn.execute(
             "INSERT INTO accounts(id,provider_id,alias,lifecycle,created_at) VALUES(?,?,?,?,?)",
-            rusqlite::params![account_id, "anthropic", "Claude", "Active", "2026-09-10T10:00:00Z"],
+            rusqlite::params![
+                account_id,
+                "anthropic",
+                "Claude",
+                "Active",
+                "2026-09-10T10:00:00Z"
+            ],
         )
         .unwrap();
         conn.execute(
@@ -3626,4 +3766,9 @@ fn reclassify_walker_touches_only_claude_partial() {
         providers[1].get("coverage").and_then(|v| v.as_str()),
         Some("Complete")
     );
+    let foreign_provider = serde_json::json!({
+        "providerId": "openai", "productId": "claude-code", "coverage": "Partial"
+    })
+    .to_string();
+    assert_eq!(reclassify_claude_partial_json(&foreign_provider), None);
 }

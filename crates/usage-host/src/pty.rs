@@ -216,7 +216,7 @@ impl PtyChild {
 static SPAWN_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
 /// Forkpty spawn: child execs the allowlisted executable DIRECTLY
-/// (execvp with an absolute path performs no search, no shell), with
+/// (execv with an absolute path performs no search, no shell), with
 /// a pinned deterministic locale (LANG/LC_ALL=C) and fixed 100x30
 /// window so TUI layout is stable across hosts. Returns the master
 /// fd and child pid to the caller, which owns both.
@@ -295,7 +295,7 @@ fn spawn_pty_child(
             for name in &remove_owned {
                 libc::unsetenv(name.as_ptr());
             }
-            libc::execvp(exe.as_ptr(), argv.as_ptr());
+            libc::execv(exe.as_ptr(), argv.as_ptr());
             libc::_exit(127);
         }
     }
@@ -305,16 +305,21 @@ fn spawn_pty_child(
     // spuriously-ready master would wedge a current_thread runtime
     // past every timeout (observed: 30s hang on an echo-primed pty).
     let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
-    if flags >= 0 {
+    if flags < 0 || unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        // SAFETY: the pid/master belong to this just-created child/session.
         unsafe {
-            libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            libc::close(master);
         }
+        return Err(HostError::Unavailable);
     }
     let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(master) };
     let async_fd = tokio::io::unix::AsyncFd::new(owned).map_err(|_| {
         // SAFETY: owned child, construction already failed — do not leak it.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
         }
         HostError::Unavailable
     })?;
@@ -356,16 +361,19 @@ impl AllowlistedPty {
         }
     }
 
-    fn is_allowed(&self, executable: &Path) -> bool {
+    fn allowed_executable(&self, executable: &Path) -> Option<PathBuf> {
         let Ok(canonical) = executable.canonicalize() else {
-            return false;
+            return None;
         };
         self.allowed
             .lock()
-            .map(|allowed| allowed.contains(&canonical))
-            .unwrap_or(false)
+            .ok()
+            .filter(|allowed| allowed.contains(&canonical))
+            .map(|_| canonical)
     }
 }
+
+const MAX_PTY_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 #[async_trait]
 impl PTYHost for AllowlistedPty {
@@ -373,24 +381,34 @@ impl PTYHost for AllowlistedPty {
         if req.cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
-        if !self.is_allowed(req.executable) {
-            return Err(HostError::Policy);
-        }
+        let executable = self
+            .allowed_executable(req.executable)
+            .ok_or(HostError::Policy)?;
         let mut child = self
-            .spawn_pty_inner(req.executable, req.args, &req.env, &req.env_remove, &req.cancel)
+            .spawn_pty_inner(
+                &executable,
+                req.args,
+                &req.env,
+                &req.env_remove,
+                &req.cancel,
+            )
             .await?;
         for line in &input.lines {
             if req.cancel.is_cancelled() {
                 let _ = child.kill().await;
                 return Err(HostError::Cancelled);
             }
-            let mut framed = format!("{line}\r");
-            framed.truncate(64 * 1024);
+            if line.len() >= 64 * 1024 {
+                let _ = child.kill().await;
+                return Err(HostError::Policy);
+            }
+            let framed = format!("{line}\r");
             if child.write_all(framed.as_bytes()).await.is_err() {
                 let _ = child.kill().await;
                 return Err(HostError::Unavailable);
             }
         }
+        let output_cap = req.output_cap.clamp(1, MAX_PTY_OUTPUT_BYTES);
         let deadline = tokio::time::Instant::now() + req.timeout;
         let mut out = Vec::new();
         loop {
@@ -403,11 +421,11 @@ impl PTYHost for AllowlistedPty {
                 let _ = child.kill().await;
                 return Err(HostError::Timeout);
             }
-            if out.len() >= req.output_cap.max(1) {
+            if out.len() >= output_cap {
                 let _ = child.kill().await;
                 break;
             }
-            let room = req.output_cap.max(1) - out.len();
+            let room = output_cap - out.len();
             let chunk = tokio::select! {
                 biased;
                 _ = req.cancel.cancelled() => {
@@ -442,11 +460,11 @@ impl PTYHost for AllowlistedPty {
         if req.cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
-        if !self.is_allowed(req.executable) {
-            return Err(HostError::Policy);
-        }
+        let executable = self
+            .allowed_executable(req.executable)
+            .ok_or(HostError::Policy)?;
         self.spawn_pty_inner(
-            req.executable,
+            &executable,
             req.args,
             &req.env,
             &req.env_remove,

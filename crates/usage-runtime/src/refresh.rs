@@ -537,9 +537,51 @@ impl Coordinator {
         if let Some(observed) = payload.observed_identity.as_deref() {
             self.verify_observed_identity(scope, observed)?;
         }
+        if request.account.id != scope.account_id
+            || request.account.provider_id != scope.provider_id
+        {
+            return Err(SourceError::IdentityMismatch);
+        }
         let snapshot = payload
             .snapshot
             .ok_or(SourceError::Parse { schema: "snapshot" })?;
+        if snapshot.account_id != scope.account_id {
+            return Err(SourceError::IdentityMismatch);
+        }
+        if snapshot.provider_id != scope.provider_id || snapshot.product_id != scope.product_id {
+            return Err(SourceError::Parse {
+                schema: "payload_scope",
+            });
+        }
+        if payload.coverage != snapshot.coverage {
+            return Err(SourceError::Parse {
+                schema: "payload_coverage",
+            });
+        }
+        if payload
+            .usage
+            .iter()
+            .any(|record| record.account_id != scope.account_id)
+            || payload
+                .costs
+                .iter()
+                .any(|record| record.account_id != scope.account_id)
+        {
+            return Err(SourceError::IdentityMismatch);
+        }
+        if payload
+            .usage
+            .iter()
+            .any(|record| record.product_id != scope.product_id)
+            || payload
+                .costs
+                .iter()
+                .any(|record| record.product_id != scope.product_id)
+        {
+            return Err(SourceError::Parse {
+                schema: "payload_scope",
+            });
+        }
         for quota in &snapshot.quotas {
             quota
                 .validate()
@@ -560,7 +602,7 @@ impl Coordinator {
             .lock()
             .map_err(|_| SourceError::Unavailable)?
             .commit_refresh_bundle_if_active(&usage_storage::RefreshBundle {
-                account_id: request.account.id,
+                account_id: scope.account_id,
                 product_id: &scope.product_id,
                 snapshot_payload_json: &payload_json,
                 observed_at,
@@ -603,7 +645,7 @@ impl Coordinator {
     /// idle scope never shows a failure it never had. Cooling scopes
     /// keep their persisted error state untouched elsewhere.
     pub fn lkg_outcome(&self, scope: &ScopeKey) -> RefreshOutcome {
-        self.stale_outcome(scope, None, vec![])
+        self.stale_outcome_inner(scope, None, vec![], false)
     }
 
     fn stale_outcome(
@@ -611,6 +653,16 @@ impl Coordinator {
         scope: &ScopeKey,
         error: Option<SourceError>,
         attempts: Vec<AttemptRecord>,
+    ) -> RefreshOutcome {
+        self.stale_outcome_inner(scope, error, attempts, true)
+    }
+
+    fn stale_outcome_inner(
+        &self,
+        scope: &ScopeKey,
+        error: Option<SourceError>,
+        attempts: Vec<AttemptRecord>,
+        update_state: bool,
     ) -> RefreshOutcome {
         let snapshot = self.storage.lock().ok().and_then(|storage| {
             storage
@@ -621,10 +673,12 @@ impl Coordinator {
                 .map(|view| view.snapshot)
         });
         let error_code = error.as_ref().map(|e| e.safe_code().to_string());
-        if let Ok(mut states) = self.states.lock() {
-            let state = states.entry(scope.clone()).or_default();
-            state.last_attempt = Some(self.hosts.clock.now());
-            state.error_code = error_code;
+        if update_state {
+            if let Ok(mut states) = self.states.lock() {
+                let state = states.entry(scope.clone()).or_default();
+                state.last_attempt = Some(self.hosts.clock.now());
+                state.error_code = error_code;
+            }
         }
         RefreshOutcome {
             scope: scope.clone(),
@@ -709,11 +763,19 @@ impl Coordinator {
             .flatten()
             .map(|m| (m.external_identity, m.identity_confidence))
             .unwrap_or((None, IdentityConfidence::Unknown));
-        match route(stored.as_deref(), confidence, Some(observed)) {
+        // RC3 stored the descriptive type+plan fingerprint for Codex App
+        // Server. It was never unique, so a new account-id observation is
+        // allowed to replace that weak legacy marker instead of making an
+        // existing profile fail forever after upgrade.
+        let legacy_codex_identity = Self::is_legacy_codex_identity(scope, stored.as_deref());
+        let stored_for_routing = (!legacy_codex_identity)
+            .then_some(stored.as_deref())
+            .flatten();
+        match route(stored_for_routing, confidence, Some(observed)) {
             Routing::Mismatch { .. } => Err(SourceError::IdentityMismatch),
             Routing::Attributed {
                 confidence: IdentityConfidence::Weak,
-            } if stored.is_none() => {
+            } if stored.is_none() || legacy_codex_identity => {
                 if let Ok(mut storage) = self.storage.lock() {
                     let _ = storage.set_account_identity(
                         scope.account_id,
@@ -725,6 +787,12 @@ impl Coordinator {
             }
             _ => Ok(()),
         }
+    }
+
+    fn is_legacy_codex_identity(scope: &ScopeKey, stored: Option<&str>) -> bool {
+        scope.provider_id == "openai"
+            && scope.product_id == "codex"
+            && stored.is_some_and(|value| value.starts_with("codex-app-server:"))
     }
 
     /// Lazy per-scope cooldown restoration (P0-09). Memory is
@@ -740,6 +808,7 @@ impl Coordinator {
         if live.is_some_and(|until| until > self.hosts.clock.now()) {
             return;
         }
+        let source_ids = scope_source_ids(scope);
         let persisted = self
             .storage
             .lock()
@@ -751,7 +820,7 @@ impl Coordinator {
                 let account = account_id.parse::<Uuid>().ok()?;
                 let until = until_at.parse::<DateTime<Utc>>().ok()?;
                 (account == scope.account_id
-                    && scope_source_id(scope) == source
+                    && source_ids.iter().any(|source_id| source_id == &source)
                     && until > self.hosts.clock.now())
                 .then_some(until)
             })
@@ -894,13 +963,13 @@ fn trigger_label(trigger: Trigger) -> &'static str {
     }
 }
 
-fn scope_source_id(scope: &ScopeKey) -> String {
-    // Persistent cooldowns are keyed per account+source. The scope's
-    // product maps to its primary strategy source id.
+fn scope_source_ids(scope: &ScopeKey) -> Vec<String> {
+    // A scope can have several fallback sources. Cooldowns are persisted per
+    // account+source, so restore every source that can actually serve it.
     crate::registry::strategies_for(&scope.provider_id, &scope.product_id)
-        .first()
+        .iter()
         .map(strategy_source_name)
-        .unwrap_or_default()
+        .collect()
 }
 
 fn strategy_source_name(kind: &StrategyKind) -> String {
@@ -1284,6 +1353,7 @@ mod tests {
         assert!(empty.error.is_none());
         assert!(empty.snapshot.is_none());
         assert!(empty.attempts.is_empty());
+        assert!(!coordinator.states_snapshot().contains_key(&scope));
         // After a successful refresh the stored snapshot is served.
         let first = coordinator
             .refresh_many(vec![RefreshRequest {
@@ -1306,6 +1376,19 @@ mod tests {
             snapshot.freshness,
             usage_core::Freshness::Stale(_)
         ));
+        let state_before = coordinator
+            .states_snapshot()
+            .get(&scope)
+            .cloned()
+            .expect("refresh state");
+        let _ = coordinator.lkg_outcome(&scope);
+        let state_after = coordinator
+            .states_snapshot()
+            .get(&scope)
+            .cloned()
+            .expect("refresh state after LKG");
+        assert_eq!(state_after.last_attempt, state_before.last_attempt);
+        assert_eq!(state_after.error_code, state_before.error_code);
     }
 
     #[tokio::test]

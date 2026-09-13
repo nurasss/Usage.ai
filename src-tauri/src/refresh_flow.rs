@@ -970,7 +970,8 @@ mod tests {
         assert_eq!(dto.quotas.len(), 1);
     }
 
-    fn claude_outcome(selected_source: Option<&str>, with_quotas: bool) -> RefreshOutcome {        let scope = ScopeKey {
+    fn claude_outcome(selected_source: Option<&str>, with_quotas: bool) -> RefreshOutcome {
+        let scope = ScopeKey {
             account_id: Uuid::new_v4(),
             provider_id: "anthropic".into(),
             product_id: "claude-code".into(),

@@ -51,12 +51,25 @@ pub async fn configure_openai_admin_connection(
         identity_confidence: usage_core::IdentityConfidence::Weak,
         notifications_muted: false,
     };
-    state
+    let create_result = state
         .storage
         .lock()
-        .map_err(|_| "storage_lock".to_string())?
-        .create_managed_account(&managed)
-        .map_err(|_| "account_create_failed".to_string())?;
+        .map_err(|_| "storage_lock".to_string())
+        .and_then(|mut storage| {
+            storage
+                .create_managed_account(&managed)
+                .map_err(|_| "account_create_failed".to_string())
+        });
+    if let Err(error) = create_result {
+        // Do not leave an orphaned secret behind when the account row cannot
+        // be committed.
+        let _ = state
+            .hosts
+            .keychain
+            .delete(KEYCHAIN_SERVICE, &id.to_string())
+            .await;
+        return Err(error);
+    }
     Ok(managed_account_to_dto(&managed))
 }
 
@@ -70,19 +83,46 @@ pub async fn remove_connection_secret(
     let id: Uuid = account_id
         .parse()
         .map_err(|_| "invalid_account_id".to_string())?;
-    let _ = state
+    {
+        let storage = state
+            .storage
+            .lock()
+            .map_err(|_| "storage_lock".to_string())?;
+        let account = storage
+            .get_account(id)
+            .map_err(|_| "accounts_unavailable".to_string())?
+            .ok_or_else(|| "account_not_found".to_string())?;
+        let is_api_key = account
+            .product_id
+            .as_deref()
+            .and_then(|product| find_descriptor(&account.provider_id, product))
+            .is_some_and(|descriptor| descriptor.account_model == AccountModel::ApiKey);
+        if !is_api_key {
+            return Err("account_has_no_secret".into());
+        }
+    }
+    let keychain_account_id = id.to_string();
+    match state
         .hosts
         .keychain
-        .delete(KEYCHAIN_SERVICE, &account_id)
-        .await;
-    state.coordinator.cancel_account(id);
+        .delete(KEYCHAIN_SERVICE, &keychain_account_id)
+        .await
+    {
+        Ok(()) | Err(usage_host::HostError::NotFound) => {}
+        Err(_) => return Err("keychain_delete_failed".into()),
+    }
     let mut storage = state
         .storage
         .lock()
         .map_err(|_| "storage_lock".to_string())?;
-    storage
+    let updated = storage
         .update_managed_account(id, None, Some(false), None)
         .map_err(|_| "account_update_failed".to_string())?;
+    if !updated {
+        return Err("account_not_found".into());
+    }
+    drop(storage);
+    state.coordinator.cancel_account(id);
     Ok("Секрет удалён, подключение отключено".into())
 }
 
@@ -110,6 +150,12 @@ pub fn add_account(
     };
     if descriptor.account_model == AccountModel::DiscoveryOnly {
         return Err("unsupported_source".into());
+    }
+    if descriptor.account_model == AccountModel::LocalClient {
+        // Local profiles need a canonical root binding. The dedicated
+        // discovery/connect command is the only safe way to create one;
+        // a generic row without `custom_path` would never be refreshed.
+        return Err("use_profile_discovery".into());
     }
     let alias = alias.trim();
     if alias.is_empty() || alias.len() > 64 {
@@ -196,7 +242,10 @@ pub fn update_account(
         }
         // Custom paths must resolve inside the product scope at use
         // time; obviously hostile values are rejected early.
-        if path.contains("..") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty()
+            && (!std::path::Path::new(trimmed).is_absolute() || trimmed.contains(".."))
+        {
             return Err("invalid_custom_path".into());
         }
     }
@@ -295,23 +344,39 @@ pub fn set_account_muted_inner(
 }
 
 #[tauri::command]
-pub fn remove_account(
+pub async fn remove_account(
     account_id: String,
     delete_history: bool,
     state: tauri::State<'_, AppState>,
 ) -> Result<String, String> {
     let id: Uuid = account_id.parse().map_err(|_| "invalid_account_id")?;
-    state.coordinator.cancel_account(id);
-    // Own Keychain secret is removed in both cases; the provider-side
-    // account and foreign client credentials are never touched.
-    let hosts = state.hosts.clone();
-    let account_id_owned = account_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = hosts
+    let needs_secret = {
+        let storage = state.storage.lock().map_err(|_| "storage_lock")?;
+        let account = storage
+            .get_account(id)
+            .map_err(|_| "accounts_unavailable")?
+            .ok_or("account_not_found")?;
+        account
+            .product_id
+            .as_deref()
+            .and_then(|product| find_descriptor(&account.provider_id, product))
+            .is_some_and(|descriptor| descriptor.account_model == AccountModel::ApiKey)
+    };
+    // Own Keychain secret is removed before the account row disappears; the
+    // provider-side account and foreign client credentials are untouched.
+    if needs_secret {
+        let keychain_account_id = id.to_string();
+        match state
+            .hosts
             .keychain
-            .delete(KEYCHAIN_SERVICE, &account_id_owned)
-            .await;
-    });
+            .delete(KEYCHAIN_SERVICE, &keychain_account_id)
+            .await
+        {
+            Ok(()) | Err(usage_host::HostError::NotFound) => {}
+            Err(_) => return Err("keychain_delete_failed".into()),
+        }
+    }
+    state.coordinator.cancel_account(id);
     let mut storage = state.storage.lock().map_err(|_| "storage_lock")?;
     if delete_history {
         storage
@@ -488,6 +553,13 @@ pub fn connect_candidate(
     };
     {
         let mut storage = state.storage.lock().map_err(|_| "storage_lock")?;
+        if storage
+            .connection_for_root(&provider_id, &product_id, &root_hash)
+            .map_err(|_| "candidate_store_failed")?
+            .is_some()
+        {
+            return Err("root_already_bound".into());
+        }
         storage
             .create_managed_account(&managed_account)
             .map_err(|_| "account_create_failed")?;
@@ -501,7 +573,7 @@ pub fn connect_candidate(
             .next()
             .unwrap_or("custom")
             .to_string();
-        storage
+        if storage
             .ensure_connection(
                 id,
                 &provider_id,
@@ -510,10 +582,21 @@ pub fn connect_candidate(
                 &root_hint,
                 "custom-local",
             )
-            .map_err(|_| "root_already_bound")?;
-        storage
-            .set_candidate_status(&root_hash, "connected")
-            .map_err(|_| "candidate_store_failed")?;
+            .is_err()
+        {
+            let _ = storage.delete_account_and_history(id);
+            return Err("root_already_bound".into());
+        }
+        match storage.set_candidate_status(&root_hash, "connected") {
+            Ok(true) => {}
+            Ok(false) | Err(_) => {
+                // The account and its connection were created above; clean
+                // both up if the discovery row disappeared or the status
+                // update failed, so a retry cannot leave an orphan account.
+                let _ = storage.delete_account_and_history(id);
+                return Err("candidate_store_failed".into());
+            }
+        }
     }
     Ok(managed_account_to_dto(&managed_account))
 }

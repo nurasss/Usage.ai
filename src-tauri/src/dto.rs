@@ -393,7 +393,8 @@ pub fn reclassify_legacy_claude_dto(provider: &mut ProviderDto) {
     }
 }
 
-pub fn capability_name(value: Capability) -> String {    match value {
+pub fn capability_name(value: Capability) -> String {
+    match value {
         Capability::SubscriptionQuota => "subscriptionQuota",
         Capability::QuotaResetTime => "quotaResetTime",
         Capability::ApiTokens => "apiTokens",

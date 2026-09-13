@@ -129,21 +129,21 @@ pub fn parse_chunk_bytes(
 ) -> crate::strategy::ParsedChunk {
     use crate::strategy::ParsedChunk;
     let mut chunk = ParsedChunk::default();
-    let text = String::from_utf8_lossy(bytes);
     let mut cursor = base_offset;
     let mut line_no = 0u64;
     // `split_inclusive` keeps terminators so offsets stay exact even
     // for weird line endings inside the window.
-    for piece in text.split_inclusive('\n') {
+    for piece in bytes.split_inclusive(|byte| *byte == b'\n') {
         let piece_bytes = piece.len() as u64;
-        if !piece.ends_with('\n') {
+        if !piece.ends_with(b"\n") {
             chunk.partial = true;
             break;
         }
         line_no += 1;
         let record_offset = cursor;
         cursor += piece_bytes;
-        let trimmed = piece.trim();
+        let text = String::from_utf8_lossy(piece);
+        let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -505,6 +505,21 @@ mod tests {
         assert!(!rest.partial);
         assert_eq!(rest.records.len(), 1);
     }
+
+    #[test]
+    fn invalid_utf8_does_not_shift_resume_offsets() {
+        let valid = br#"{"timestamp":"2026-09-08T12:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}}"#;
+        let mut bytes = vec![b'{', 0xff, b'}', b'\n'];
+        bytes.extend_from_slice(valid);
+        bytes.push(b'\n');
+
+        let chunk = parse_chunk_bytes(&account(), "h", 100, &bytes, Utc::now());
+        assert_eq!(chunk.consumed, 100 + bytes.len() as u64);
+        assert_eq!(chunk.malformed, 1);
+        assert_eq!(chunk.records.len(), 1);
+        assert_eq!(chunk.records[0].source_record_id, "h:104");
+    }
+
     #[test]
     fn repeated_bytes_reimport_yields_stable_identities() {
         let bytes = fixture("duplicates.jsonl");

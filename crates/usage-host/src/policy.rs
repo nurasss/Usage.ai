@@ -8,4 +8,4 @@ pub const QUOTA_TAIL_BYTES: usize = 256 * 1024;
 pub const MAX_API_PAGES: usize = 8;
 pub const REFRESH_PARALLELISM: usize = 4;
 pub const FALLBACK_COOLDOWN: Duration = Duration::from_secs(300);
-pub const USER_AGENT: &str = "Usage.ai/1.1 (local-first usage monitor)";
+pub const USER_AGENT: &str = "Usage.ai/1.3.0 (local-first usage monitor)";

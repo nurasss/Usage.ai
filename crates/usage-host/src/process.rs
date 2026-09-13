@@ -70,7 +70,11 @@ pub const SCOPED_ENV_VARS: &[&str] = &["CODEX_HOME", "CLAUDE_CONFIG_DIR"];
 /// shell token is not a scoped credential source — honoring it makes
 /// identical hosts behave differently by launcher and can promote an
 /// invalid token into a fake "logged in" state.
-pub const SCRUBBED_ENV_VARS: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+pub const SCRUBBED_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "OPENAI_API_KEY",
+];
 
 /// Validate scoped env pairs before any spawn.
 pub(crate) fn check_scoped_env(env: &[(String, String)]) -> Result<(), HostError> {
@@ -93,6 +97,35 @@ pub(crate) fn check_scrubbed_env(env_remove: &[String]) -> Result<(), HostError>
         }
     }
     Ok(())
+}
+
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Drain a child pipe concurrently with `wait`, retaining only the bounded
+/// prefix. Draining past the cap is important: otherwise a noisy child can
+/// fill the OS pipe and deadlock before its timeout is observed.
+async fn read_capped<R>(mut reader: R, cap: usize) -> Result<Vec<u8>, HostError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let cap = cap.min(MAX_CAPTURE_BYTES);
+    let mut output = Vec::with_capacity(cap.min(8192));
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|_| HostError::Unavailable)?;
+        if read == 0 {
+            break;
+        }
+        if output.len() < cap {
+            let keep = (cap - output.len()).min(read);
+            output.extend_from_slice(&buffer[..keep]);
+        }
+    }
+    Ok(output)
 }
 
 /// Owned interactive child. Only this handle can signal its process;
@@ -118,9 +151,10 @@ impl Drop for InteractiveChild {
 impl InteractiveChild {
     pub async fn write_line(&mut self, line: &str) -> Result<(), HostError> {
         use tokio::io::AsyncWriteExt;
-        let mut framed = format!("{line}\n");
-        // Bound a single write; oversized payloads are a caller bug.
-        framed.truncate(256 * 1024);
+        if line.len() >= 256 * 1024 {
+            return Err(HostError::Policy);
+        }
+        let framed = format!("{line}\n");
         self.stdin
             .write_all(framed.as_bytes())
             .await
@@ -180,14 +214,15 @@ impl AllowlistedProcess {
         }
     }
 
-    fn is_allowed(&self, executable: &Path) -> bool {
+    fn allowed_executable(&self, executable: &Path) -> Option<PathBuf> {
         let Ok(canonical) = executable.canonicalize() else {
-            return false;
+            return None;
         };
         self.allowed
             .lock()
-            .map(|allowed| allowed.contains(&canonical))
-            .unwrap_or(false)
+            .ok()
+            .filter(|allowed| allowed.contains(&canonical))
+            .map(|_| canonical)
     }
 
     fn track(&self, pid: u32) {
@@ -209,12 +244,12 @@ impl ProcessHost for AllowlistedProcess {
         if req.cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
-        if !self.is_allowed(req.executable) {
-            return Err(HostError::Policy);
-        }
+        let executable = self
+            .allowed_executable(req.executable)
+            .ok_or(HostError::Policy)?;
         check_scoped_env(&req.env)?;
         check_scrubbed_env(&req.env_remove)?;
-        let mut command = tokio::process::Command::new(req.executable);
+        let mut command = tokio::process::Command::new(&executable);
         command.args(req.args);
         command.envs(req.env.iter().map(|(k, v)| (k, v)));
         for name in &req.env_remove {
@@ -227,14 +262,16 @@ impl ProcessHost for AllowlistedProcess {
             .kill_on_drop(true)
             .spawn()
             .map_err(|_| HostError::Unavailable)?;
-        if let Some(pid) = child.id() {
+        let pid = child.id();
+        let stdout_pipe = child.stdout.take().ok_or(HostError::Unavailable)?;
+        let stderr_pipe = child.stderr.take().ok_or(HostError::Unavailable)?;
+        if let Some(pid) = pid {
             self.track(pid);
         }
-        let pid = child.id();
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
         let stdout_cap = req.stdout_cap.max(1);
         let stderr_cap = req.stderr_cap.max(1);
+        let stdout_task = tokio::spawn(read_capped(stdout_pipe, stdout_cap));
+        let stderr_task = tokio::spawn(read_capped(stderr_pipe, stderr_cap));
         // `wait` borrows the child, so timeout/cancel paths below can
         // still terminate the owned process. There is no kill(pid) API:
         // only this owned handle is ever signalled.
@@ -249,26 +286,35 @@ impl ProcessHost for AllowlistedProcess {
                     let _ = child.kill().await;
                     Ok(None)
                 }
-                Ok(Err(_)) => Err(HostError::Unavailable),
+                Ok(Err(_)) => {
+                    let _ = child.kill().await;
+                    Err(HostError::Unavailable)
+                }
                 Ok(Ok(status)) => Ok(Some(status.code())),
             },
         };
+        if wait_result.is_err() || wait_result.as_ref().is_ok_and(|status| status.is_none()) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        let status_code = match wait_result {
+            Ok(status) => status,
+            Err(error) => {
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                if let Some(pid) = pid {
+                    self.untrack(pid);
+                }
+                return Err(error);
+            }
+        };
+        let stdout_result = stdout_task.await.map_err(|_| HostError::Unavailable);
+        let stderr_result = stderr_task.await.map_err(|_| HostError::Unavailable);
         if let Some(pid) = pid {
             self.untrack(pid);
         }
-        let status_code = wait_result?;
-        let mut stdout = vec![];
-        if let Some(pipe) = stdout_pipe.as_mut() {
-            use tokio::io::AsyncReadExt;
-            let _ = pipe.read_to_end(&mut stdout).await;
-        }
-        let mut stderr = vec![];
-        if let Some(pipe) = stderr_pipe.as_mut() {
-            use tokio::io::AsyncReadExt;
-            let _ = pipe.read_to_end(&mut stderr).await;
-        }
-        stdout.truncate(stdout_cap);
-        stderr.truncate(stderr_cap);
+        let stdout = stdout_result??;
+        let stderr = stderr_result??;
         let timed_out = status_code.is_none();
         Ok(SpawnOutput {
             status_code: status_code.flatten(),
@@ -285,12 +331,12 @@ impl ProcessHost for AllowlistedProcess {
         if req.cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
-        if !self.is_allowed(req.executable) {
-            return Err(HostError::Policy);
-        }
+        let executable = self
+            .allowed_executable(req.executable)
+            .ok_or(HostError::Policy)?;
         check_scoped_env(&req.env)?;
         check_scrubbed_env(&req.env_remove)?;
-        let mut command = tokio::process::Command::new(req.executable);
+        let mut command = tokio::process::Command::new(&executable);
         command.args(req.args);
         command.envs(req.env.iter().map(|(k, v)| (k, v)));
         for name in &req.env_remove {
@@ -304,11 +350,11 @@ impl ProcessHost for AllowlistedProcess {
             .spawn()
             .map_err(|_| HostError::Unavailable)?;
         let pid = child.id();
+        let stdin = child.stdin.take().ok_or(HostError::Unavailable)?;
+        let stdout = child.stdout.take().ok_or(HostError::Unavailable)?;
         if let Some(pid) = pid {
             self.track(pid);
         }
-        let stdin = child.stdin.take().ok_or(HostError::Unavailable)?;
-        let stdout = child.stdout.take().ok_or(HostError::Unavailable)?;
         Ok(InteractiveChild {
             stdin,
             stdout: tokio::io::BufReader::new(stdout),
@@ -432,7 +478,9 @@ mod tests {
                 .expect("env dump spawn");
             let text = String::from_utf8_lossy(&scrubbed.stdout);
             assert!(
-                !text.lines().any(|line| line.starts_with("ANTHROPIC_API_KEY=")),
+                !text
+                    .lines()
+                    .any(|line| line.starts_with("ANTHROPIC_API_KEY=")),
                 "scrubbed variable leaked into child env"
             );
         }
@@ -518,6 +566,31 @@ mod tests {
         assert!(out.timed_out);
         assert_eq!(host.owned_count(), 0);
     }
+    #[tokio::test]
+    async fn noisy_child_is_drained_without_pipe_deadlock() {
+        let executable = Path::new("/usr/bin/yes");
+        if !executable.is_file() {
+            return;
+        }
+        let host = AllowlistedProcess::with_allowed([executable.to_path_buf()]);
+        let output = host
+            .spawn(SpawnRequest {
+                executable,
+                args: &[],
+                timeout: Duration::from_millis(100),
+                stdout_cap: 1024,
+                stderr_cap: 1024,
+                cancel: CancellationToken::new(),
+                env: vec![],
+                env_remove: vec![],
+            })
+            .await
+            .expect("noisy child should be terminated by timeout");
+        assert!(output.timed_out);
+        assert!(output.stdout.len() <= 1024);
+        assert_eq!(host.owned_count(), 0);
+    }
+
     #[tokio::test]
     async fn pre_cancelled_token_spawns_nothing() {
         let host = echo_host();

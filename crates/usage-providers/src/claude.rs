@@ -173,20 +173,20 @@ pub fn parse_chunk_bytes(
 ) -> crate::strategy::ParsedChunk {
     use crate::strategy::ParsedChunk;
     let mut chunk = ParsedChunk::default();
-    let text = String::from_utf8_lossy(bytes);
     let mut cursor = base_offset;
     let mut line_no = 0u64;
     let mut reduced = BTreeMap::<String, UsageRecord>::new();
-    for piece in text.split_inclusive('\n') {
+    for piece in bytes.split_inclusive(|byte| *byte == b'\n') {
         let piece_bytes = piece.len() as u64;
-        if !piece.ends_with('\n') {
+        if !piece.ends_with(b"\n") {
             chunk.partial = true;
             break;
         }
         line_no += 1;
         let record_offset = cursor;
         cursor += piece_bytes;
-        let trimmed = piece.trim();
+        let text = String::from_utf8_lossy(piece);
+        let trimmed = text.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -578,7 +578,9 @@ impl ClaudeUsageDriver for HostClaudeDriver<'_> {
         let painted = strip_ansi(&raw);
         if has_trust_markers(&painted) {
             let _ = child.kill().await;
-            return Err(ProviderError::Unavailable("claude_pty_untrusted_prompt".into()));
+            return Err(ProviderError::Unavailable(
+                "claude_pty_untrusted_prompt".into(),
+            ));
         }
         if painted.trim().is_empty() {
             let _ = child.kill().await;
@@ -1570,6 +1572,20 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_does_not_shift_resume_offsets() {
+        let valid = br#"{"timestamp":"2026-09-08T12:00:00Z","message":{"model":"claude-test","usage":{"input_tokens":1,"output_tokens":2}}}"#;
+        let mut bytes = vec![b'{', 0xff, b'}', b'\n'];
+        bytes.extend_from_slice(valid);
+        bytes.push(b'\n');
+
+        let chunk = parse_chunk_bytes(&account(), "h", 100, &bytes, Utc::now());
+        assert_eq!(chunk.consumed, 100 + bytes.len() as u64);
+        assert_eq!(chunk.malformed, 1);
+        assert_eq!(chunk.records.len(), 1);
+        assert_eq!(chunk.records[0].source_record_id, "h:104");
+    }
+
+    #[test]
     fn redacted_claude_line_roundtrips_through_production_parser() {
         let redacted_line = concat!(
             "{\"timestamp\":\"2026-09-08T12:00:00.000Z\",",
@@ -2273,9 +2289,8 @@ mod quota_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn silent_binary_is_unavailable_not_parse() {
-        let process = usage_host::AllowlistedProcess::with_allowed([PathBuf::from(
-            "/usr/bin/false",
-        )]);
+        let process =
+            usage_host::AllowlistedProcess::with_allowed([PathBuf::from("/usr/bin/false")]);
         let pty = usage_host::AllowlistedPty::with_allowed([PathBuf::from("/usr/bin/false")]);
         let driver = HostClaudeDriver {
             process: &process,
@@ -2329,7 +2344,10 @@ mod quota_tests {
                 &self,
                 req: usage_host::SpawnRequest<'_>,
             ) -> Result<usage_host::SpawnOutput, usage_host::HostError> {
-                self.seen_remove.lock().unwrap().push(req.env_remove.to_vec());
+                self.seen_remove
+                    .lock()
+                    .unwrap()
+                    .push(req.env_remove.to_vec());
                 Ok(usage_host::SpawnOutput {
                     status_code: Some(0),
                     stdout: br#"{"loggedIn":true,"authMethod":"oauth"}"#.to_vec(),
@@ -2367,7 +2385,11 @@ mod quota_tests {
         assert_eq!(seen.len(), 1);
         assert_eq!(
             seen[0],
-            vec!["ANTHROPIC_API_KEY".to_string(), "ANTHROPIC_AUTH_TOKEN".to_string()]
+            vec![
+                "ANTHROPIC_API_KEY".to_string(),
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "OPENAI_API_KEY".to_string()
+            ]
         );
     }
 

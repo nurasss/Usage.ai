@@ -2,7 +2,8 @@
   "account": {
     "type": "chatgpt",
     "email": "redacted@example.invalid",
-    "planType": "plus"
+    "planType": "plus",
+    "id": "acct_plus_001"
   },
   "requiresOpenaiAuth": true
 }

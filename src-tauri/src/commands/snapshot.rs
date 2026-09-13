@@ -23,7 +23,11 @@ pub async fn get_snapshot(
     // Served errors are explicit: a packaged backend failure never
     // falls back to synthetic demo data (P0-3).
     if let Some(value) = state.cached.lock().map_err(|_| "state_lock")?.clone() {
-        return Ok(guard_legacy_trust(value));
+        let value = guard_legacy_trust(value);
+        // Normalize the in-memory copy too: diagnostics and other native
+        // readers may inspect `cached` without going through this command.
+        *state.cached.lock().map_err(|_| "state_lock")? = Some(value.clone());
+        return Ok(value);
     }
     if let Ok(storage) = state.storage.lock() {
         if let Ok(Some(json)) = storage.cache("app_snapshot") {

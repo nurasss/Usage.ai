@@ -2,7 +2,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::appstate::AppState;
-use crate::dto::{status_class, AttemptDto, DiagnosticsDto};
+use crate::dto::{reclassify_legacy_claude_dto, status_class, AttemptDto, DiagnosticsDto};
 use usage_host::{NetworkHost, OnlineState};
 
 /// Attempt latency from persisted RFC3339 timestamps. None when the
@@ -262,9 +262,14 @@ fn get_diagnostics_inner(state: &AppState) -> Vec<DiagnosticsDto> {
     let cached = state.cached.lock().ok().and_then(|c| c.clone());
     let states = state.coordinator.states_snapshot();
     let mut out = vec![];
-    let Some(snapshot) = cached else {
+    let Some(mut snapshot) = cached else {
         return out;
     };
+    // Diagnostics can be requested before/without the snapshot IPC command;
+    // apply the same legacy trust guard to the direct cache read.
+    for provider in &mut snapshot.providers {
+        reclassify_legacy_claude_dto(provider);
+    }
     for provider in &snapshot.providers {
         let scope_key = usage_runtime::ScopeKey {
             account_id: provider.account_id.parse::<Uuid>().unwrap_or(Uuid::nil()),
@@ -342,8 +347,7 @@ mod tests {
     /// required injection strings plus extras, loaded from the
     /// allowlisted fixture file (never inlined, so repo hygiene and
     /// production proof stay separate concerns).
-    const INJECTION_FIXTURE: &str =
-        include_str!("../../fixtures/diagnostics-pii-injection.json");
+    const INJECTION_FIXTURE: &str = include_str!("../../fixtures/diagnostics-pii-injection.json");
 
     fn injection_values() -> Vec<String> {
         let fixture: serde_json::Value = serde_json::from_str(INJECTION_FIXTURE).unwrap();
@@ -384,7 +388,13 @@ mod tests {
 
     fn hostile_diag() -> (DiagnosticsDto, ImportStatsDto) {
         let fixture: serde_json::Value = serde_json::from_str(INJECTION_FIXTURE).unwrap();
-        let get = |key: &str| fixture.get(key).and_then(|v| v.as_str()).unwrap().to_string();
+        let get = |key: &str| {
+            fixture
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
         let mut diag = sample_diag(&get("alias"), "acc-9");
         // Identity notes travel inside warnings in the DTO (mismatch
         // notes); both must vanish from export surfaces.
@@ -423,7 +433,8 @@ mod tests {
     #[test]
     fn pii_tripwire_production_export_bytes_are_clean() {
         let (diag, imports) = hostile_diag();
-        let bundle = sanitize_diagnostics(std::slice::from_ref(&diag), std::slice::from_ref(&imports));
+        let bundle =
+            sanitize_diagnostics(std::slice::from_ref(&diag), std::slice::from_ref(&imports));
         let exported = serde_json::to_string(&serde_json::json!({
             "schemaVersion": 3,
             "accounts": bundle.accounts,
@@ -471,10 +482,7 @@ mod tests {
         });
         let serialized = serde_json::to_string(&unsafe_payload).unwrap();
         let verdict = tripwire_check(&serialized, &forbidden, &["\"schemaVersion\":3"]);
-        assert!(
-            verdict.is_err(),
-            "tripwire must reject the unsafe payload"
-        );
+        assert!(verdict.is_err(), "tripwire must reject the unsafe payload");
         let violations = verdict.expect_err("must fail");
         assert!(
             violations.iter().any(|v| v.contains(&forbidden[0])),
@@ -504,7 +512,10 @@ mod tests {
         assert_eq!(account.connector_version, "codex-app-server");
         assert_eq!(account.parser_version, "v1");
         assert_eq!(account.schema_fingerprint.as_deref(), Some("fp"));
-        assert_eq!(account.capabilities_detected, vec!["subscriptionQuota".to_string()]);
+        assert_eq!(
+            account.capabilities_detected,
+            vec!["subscriptionQuota".to_string()]
+        );
         assert_eq!(account.last_safe_error_code, None);
         assert_eq!(account.recent_attempts[0].latency_ms, Some(250));
         assert_eq!(
@@ -579,10 +590,7 @@ mod tests {
 
     #[test]
     fn copy_text_is_allowlisted_no_free_text() {
-        let diags = vec![
-            sample_diag("Main", "acc-1"),
-            sample_diag("Other", "acc-2"),
-        ];
+        let diags = vec![sample_diag("Main", "acc-1"), sample_diag("Other", "acc-2")];
         let imports = vec![ImportStatsDto {
             product_id: "codex".into(),
             files_discovered: 3,

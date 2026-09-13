@@ -168,7 +168,9 @@ pub fn account_usage_and_cost_today(
 
     let mut result = AccountUsageAndCost::default();
 
-    if let Ok(tokens) = storage.tokens_for_account_between(account_id, product_id, start, end) {
+    if let Ok(tokens) =
+        storage.authoritative_tokens_for_account_between(account_id, product_id, start, end)
+    {
         if tokens > 0 {
             result.tokens_today = Some(tokens);
         }
@@ -177,10 +179,11 @@ pub fn account_usage_and_cost_today(
     if let Ok(costs) = storage.cost_records_between(start, end) {
         let mut reported: HashMap<String, Decimal> = HashMap::new();
         let mut estimated: HashMap<String, Decimal> = HashMap::new();
-        for record in costs
-            .iter()
-            .filter(|r| r.account_id == account_id && r.product_id == product_id)
-        {
+        for record in costs.iter().filter(|r| {
+            r.coverage.is_authoritative()
+                && r.account_id == account_id
+                && r.product_id == product_id
+        }) {
             let target = if record.kind == usage_core::CostKind::Reported {
                 &mut reported
             } else {
@@ -224,7 +227,9 @@ fn build_costs_for_range(
         let mut reported: HashMap<String, Decimal> = HashMap::new();
         let mut estimated: HashMap<String, Decimal> = HashMap::new();
         for record in costs.iter().filter(|record| {
-            record.account_id == provider.account_id && record.product_id == provider.product_id
+            record.coverage.is_authoritative()
+                && record.account_id == provider.account_id
+                && record.product_id == provider.product_id
         }) {
             let target = if record.kind == usage_core::CostKind::Reported {
                 &mut reported
@@ -379,31 +384,37 @@ mod tests {
             })
             .unwrap();
 
-        // Insert unverified record
-        storage
-            .upsert_usage(&usage_core::UsageRecord {
-                account_id: acc_id,
-                product_id: "codex".into(),
-                billing_scope_id: Some("scope-unverified".into()),
-                source_record_id: "rec-unverified".into(),
-                period_start: now,
-                period_end: now,
-                model: Some("gpt-codex".into()),
-                input_tokens: Some(200),
-                output_tokens: Some(100),
-                cached_tokens: None,
-                cache_creation_tokens: None,
-                cache_read_tokens: None,
-                reasoning_tokens: None,
-                total_tokens: Some(300),
-                requests: Some(1),
-                source: "local".into(),
-                coverage: usage_core::Coverage::UnverifiedSemantics,
-                connection_id: None,
-                file_id: None,
-                file_generation: None,
-            })
-            .unwrap();
+        // Insert unverified records. The second one uses a different
+        // non-authoritative coverage value to ensure SQL follows the domain
+        // predicate instead of checking one enum variant by name.
+        let unverified = usage_core::UsageRecord {
+            account_id: acc_id,
+            product_id: "codex".into(),
+            billing_scope_id: Some("scope-unverified".into()),
+            source_record_id: "rec-unverified".into(),
+            period_start: now,
+            period_end: now,
+            model: Some("gpt-codex".into()),
+            input_tokens: Some(200),
+            output_tokens: Some(100),
+            cached_tokens: None,
+            cache_creation_tokens: None,
+            cache_read_tokens: None,
+            reasoning_tokens: None,
+            total_tokens: Some(300),
+            requests: Some(1),
+            source: "local".into(),
+            coverage: usage_core::Coverage::UnverifiedSemantics,
+            connection_id: None,
+            file_id: None,
+            file_generation: None,
+        };
+        storage.upsert_usage(&unverified).unwrap();
+        let mut unknown = unverified.clone();
+        unknown.source_record_id = "rec-unknown".into();
+        unknown.total_tokens = Some(400);
+        unknown.coverage = usage_core::Coverage::Unknown;
+        storage.upsert_usage(&unknown).unwrap();
 
         let aggregates = build_aggregates(&storage, &[]);
 
@@ -416,10 +427,112 @@ mod tests {
         // Unverified overview MUST contain unverified product (300)
         let today_unverified = aggregates.unverified_overview.get("today").unwrap();
         assert_eq!(today_unverified.len(), 1);
-        assert_eq!(today_unverified[0].value, 300);
+        assert_eq!(today_unverified[0].value, 700);
 
         // Excluded unverified count MUST reflect excluded source
         let excluded_count = aggregates.excluded_unverified_count.get("today").unwrap();
         assert_eq!(*excluded_count, 1);
+    }
+
+    #[test]
+    fn provider_facing_totals_exclude_non_authoritative_usage_and_costs() {
+        let mut storage = Storage::in_memory().unwrap();
+        let account_id = Uuid::new_v4();
+        let today = Local::now().date_naive();
+        let start = local_midnight(today).with_timezone(&Utc);
+        let observed_at = start + Duration::hours(1);
+
+        let make_usage = |source_record_id: &str,
+                          total_tokens: u64,
+                          coverage: usage_core::Coverage|
+         -> usage_core::UsageRecord {
+            usage_core::UsageRecord {
+                account_id,
+                product_id: "codex".into(),
+                billing_scope_id: None,
+                source_record_id: source_record_id.into(),
+                period_start: observed_at,
+                period_end: observed_at,
+                model: Some("gpt-codex".into()),
+                input_tokens: Some(total_tokens),
+                output_tokens: None,
+                cached_tokens: None,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+                reasoning_tokens: None,
+                total_tokens: Some(total_tokens),
+                requests: Some(1),
+                source: "test".into(),
+                coverage,
+                connection_id: None,
+                file_id: None,
+                file_generation: None,
+            }
+        };
+        storage
+            .upsert_usage(&make_usage("verified", 100, usage_core::Coverage::Complete))
+            .unwrap();
+        storage
+            .upsert_usage(&make_usage(
+                "unverified",
+                900,
+                usage_core::Coverage::Unknown,
+            ))
+            .unwrap();
+
+        let make_cost = |source_record_id: &str,
+                         amount_decimal: Decimal,
+                         coverage: usage_core::Coverage|
+         -> usage_core::CostRecord {
+            usage_core::CostRecord {
+                account_id,
+                product_id: "codex".into(),
+                billing_scope_id: None,
+                source_record_id: source_record_id.into(),
+                period_start: observed_at,
+                period_end: observed_at,
+                amount_decimal,
+                currency: "USD".into(),
+                kind: usage_core::CostKind::Reported,
+                source: "test".into(),
+                coverage,
+            }
+        };
+        storage
+            .upsert_cost(&make_cost(
+                "cost-verified",
+                Decimal::new(150, 2),
+                usage_core::Coverage::Partial,
+            ))
+            .unwrap();
+        storage
+            .upsert_cost(&make_cost(
+                "cost-unverified",
+                Decimal::new(9000, 2),
+                usage_core::Coverage::LocalClientOnly,
+            ))
+            .unwrap();
+
+        let today_totals = account_usage_and_cost_today(&storage, account_id, "codex");
+        assert_eq!(today_totals.tokens_today, Some(100));
+        assert_eq!(
+            today_totals.reported_cost_today.unwrap().amount,
+            Decimal::new(150, 2).to_string()
+        );
+
+        let providers = [ProviderCostInput {
+            account_id,
+            product_id: "codex".into(),
+            provider_name: "OpenAI".into(),
+            alias: "Test".into(),
+        }];
+        let aggregates = build_aggregates(&storage, &providers);
+        let today_costs = aggregates.costs_by_period.get("today").unwrap();
+        assert_eq!(today_costs.len(), 1);
+        assert_eq!(today_costs[0].reported.len(), 1);
+        assert_eq!(
+            today_costs[0].reported[0].amount,
+            Decimal::new(150, 2).to_string()
+        );
     }
 }

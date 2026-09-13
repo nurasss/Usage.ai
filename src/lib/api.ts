@@ -114,9 +114,9 @@ export async function loadStorageStatus(): Promise<StorageStatus | null> {
 }
 
 export async function loadAppInfo(): Promise<AppInfo> {
-  if (!inTauri()) return { version: '1.0.0', updatesEnabled: false };
+  if (!inTauri()) return { version: '1.3.0', updatesEnabled: false };
   try { return await invoke<AppInfo>('get_app_info'); }
-  catch { return { version: '1.0.0', updatesEnabled: false }; }
+  catch { return { version: '1.3.0', updatesEnabled: false }; }
 }
 
 export async function loadDescriptors(): Promise<ProductDescriptor[]> {

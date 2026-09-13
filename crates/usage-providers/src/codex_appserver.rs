@@ -16,11 +16,19 @@ pub const KILL_SWITCH: &str = "codex-app-server";
 pub const SOURCE_ID: &str = "codex-app-server";
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_RPC_BYTES: usize = 512 * 1024;
+const MAX_RPC_SESSION_BYTES: usize = 2 * 1024 * 1024;
 /// Health-handshake budget per candidate executable. A cold node
 /// wrapper can take seconds on first launch; a dead install EOFs
 /// fast. Hangs must never stall availability: the probe is bounded
 /// and a negative result is never cached (see HEALTHY_EXECUTABLES).
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn credential_scrub_list() -> Vec<String> {
+    usage_host::process::SCRUBBED_ENV_VARS
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
+}
 
 /// Process-global POSITIVE health cache: executables that answered an
 /// `initialize` handshake are trusted without re-probing for the rest
@@ -70,7 +78,7 @@ pub fn parse_auth_metadata(bytes: &[u8]) -> Result<AuthMetadata, ProviderError> 
     struct Wire {
         auth_mode: Option<String>,
         #[serde(rename = "OPENAI_API_KEY")]
-        openai_api_key: Option<String>,
+        openai_api_key: Option<serde::de::IgnoredAny>,
         tokens: Option<WireTokens>,
     }
     #[derive(serde::Deserialize)]
@@ -81,11 +89,12 @@ pub fn parse_auth_metadata(bytes: &[u8]) -> Result<AuthMetadata, ProviderError> 
         .map_err(|_| ProviderError::Parse("codex_auth_schema".into()))?;
     // Only presence bits and non-secret identifiers survive: token
     // values are dropped here and never leave this function.
-    let has_api_key = wire.openai_api_key.is_some_and(|k| !k.is_empty());
+    let has_api_key = wire.openai_api_key.is_some();
     let account_id_fingerprint = wire
         .tokens
         .as_ref()
-        .and_then(|t| t.account_id.clone())
+        .and_then(|t| t.account_id.as_deref())
+        .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(|id| usage_host::fingerprint("codex-account", id.as_bytes()));
     Ok(AuthMetadata {
@@ -96,9 +105,9 @@ pub fn parse_auth_metadata(bytes: &[u8]) -> Result<AuthMetadata, ProviderError> 
     })
 }
 
-/// Observed login identity for routing: account type + plan only.
-/// Email is present in the RPC response but is NEVER used as identity
-/// (B-02 ban) and never stored.
+/// Legacy descriptive fingerprint for telemetry/tests. Account type + plan
+/// are not unique across users and MUST NOT be used for account routing.
+/// Production routing uses the provider account id fingerprint instead.
 pub fn identity_fingerprint(account_type: &str, plan_type: Option<&str>) -> String {
     usage_host::fingerprint(
         "codex-app-server",
@@ -237,6 +246,7 @@ pub struct AccountEvidence {
     pub account_type: String,
     pub plan_type: Option<String>,
     pub requires_auth: bool,
+    pub account_id_fingerprint: Option<String>,
 }
 
 /// Pure parser for `account/read` results. `refreshToken` must always
@@ -269,6 +279,12 @@ pub fn parse_account_response(value: &serde_json::Value) -> Result<AccountEviden
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
                 requires_auth,
+                account_id_fingerprint: ["id", "accountId"]
+                    .into_iter()
+                    .filter_map(|key| account.get(key).and_then(|value| value.as_str()))
+                    .map(str::trim)
+                    .find(|value| !value.is_empty())
+                    .map(|value| usage_host::fingerprint("codex-account", value.as_bytes())),
             })
         }
     }
@@ -408,7 +424,10 @@ pub async fn run_quota_session<T: AppServerTransport + ?Sized>(
     if cancel.is_cancelled() {
         return Err(ProviderError::Network("codex_appserver_cancelled".into()));
     }
-    let account = parse_account_response(&results[1])?;
+    let account_response = results
+        .get(1)
+        .ok_or_else(|| ProviderError::Parse("codex_appserver_rpc".into()))?;
+    let account = parse_account_response(account_response)?;
     // An account object without identity (proven live: a login-less
     // CODEX_HOME reports `{}` with requiresOpenaiAuth=true) is not
     // an empty success — it is a missing login. Surfacing auth state
@@ -417,7 +436,10 @@ pub async fn run_quota_session<T: AppServerTransport + ?Sized>(
     if account.account_type == "unknown" {
         return Err(ProviderError::AuthenticationRequired);
     }
-    let limits = parse_ratelimits_response(&results[2])?;
+    let limits_response = results
+        .get(2)
+        .ok_or_else(|| ProviderError::Parse("codex_appserver_rpc".into()))?;
+    let limits = parse_ratelimits_response(limits_response)?;
     Ok((account, limits))
 }
 
@@ -542,7 +564,7 @@ impl CodexAppServerStrategy {
             executable: executable.to_path_buf(),
             timeout: PROBE_TIMEOUT,
             env: env.to_vec(),
-            env_remove: vec![],
+            env_remove: credential_scrub_list(),
         };
         let init = rpc_request(
             1,
@@ -671,8 +693,9 @@ impl crate::strategy::FetchStrategy for CodexAppServerStrategy {
                 executable,
                 timeout: RPC_TIMEOUT,
                 env: self.profile_env(),
-                env_remove: vec![],
-            };            run_quota_session(&transport, &ctx.cancel).await
+                env_remove: credential_scrub_list(),
+            };
+            run_quota_session(&transport, &ctx.cancel).await
         };
         let (evidence, limits) = outcome.map_err(|e| match e {
             ProviderError::AuthenticationRequired => SourceError::AuthenticationRequired,
@@ -689,6 +712,22 @@ impl crate::strategy::FetchStrategy for CodexAppServerStrategy {
         if ctx.cancel.is_cancelled() {
             return Err(SourceError::Cancelled);
         }
+        let observed_identity = evidence.account_id_fingerprint.clone().or_else(|| {
+            let root = ctx.local_root.as_ref()?;
+            let files = ctx.facade.files?;
+            let bytes = files
+                .read_scoped_file(root, "auth.json", 64 * 1024, &ctx.cancel)
+                .ok()?;
+            parse_auth_metadata(&bytes).ok()?.account_id_fingerprint
+        });
+        let Some(observed_identity) = observed_identity else {
+            // A quota response without a stable provider account id cannot
+            // be safely attributed to a managed account. Let the coordinator
+            // try the non-authoritative local history fallback instead.
+            return Err(SourceError::Parse {
+                schema: "codex-account-identity",
+            });
+        };
         let observed_at = ctx.facade.clock.now();
         let snapshot = quotas_from_buckets(
             ctx.account,
@@ -711,10 +750,7 @@ impl crate::strategy::FetchStrategy for CodexAppServerStrategy {
             coverage: Coverage::Complete,
             observed_at: Some(observed_at),
             source_error: None,
-            observed_identity: Some(identity_fingerprint(
-                &evidence.account_type,
-                evidence.plan_type.as_deref(),
-            )),
+            observed_identity: Some(observed_identity),
         })
     }
 }
@@ -727,7 +763,7 @@ pub struct HostProcessTransport<'a> {
     pub timeout: Duration,
     pub env: Vec<(String, String)>,
     /// Codex auth resolves from CODEX_HOME files, never ambient
-    /// secrets: no scrub list needed (empty).
+    /// secrets; credential-shaped inherited variables are scrubbed.
     pub env_remove: Vec<String>,
 }
 
@@ -784,6 +820,7 @@ async fn transact_session(
         .collect();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut lines = vec![];
+    let mut total_bytes = 0usize;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if cancel.is_cancelled() {
@@ -813,6 +850,10 @@ async fn transact_session(
                     }
                 }
             }
+        }
+        total_bytes = total_bytes.saturating_add(line.len());
+        if total_bytes > MAX_RPC_SESSION_BYTES {
+            return Err(ProviderError::Parse("codex_appserver_rpc_cap".into()));
         }
         lines.push(line);
         if wanted.iter().all(|id| seen.contains(id)) {
@@ -933,6 +974,7 @@ mod tests {
         assert_eq!(*server.calls.lock().unwrap(), 1);
         assert_eq!(evidence.account_type, "chatgpt");
         assert_eq!(evidence.plan_type.as_deref(), Some("plus"));
+        assert!(evidence.account_id_fingerprint.is_some());
         // Primary bucket + codex bucket + extra bucket.
         assert_eq!(limits.buckets.len(), 3);
         let primary = limits.buckets[0].primary.as_ref().unwrap();
@@ -1056,6 +1098,22 @@ mod tests {
         assert_ne!(a, identity_fingerprint("chatgpt", Some("pro")));
         assert_ne!(a, identity_fingerprint("apiKey", Some("plus")));
         assert!(parse_auth_metadata(br#"{"auth_mode":"oauth","OPENAI_API_KEY":null,"tokens":{"id_token":"x","access_token":"y","refresh_token":"z","account_id":"acc-1"}}"#).unwrap().account_id_fingerprint.is_some());
+    }
+
+    #[test]
+    fn account_ids_produce_distinct_routing_fingerprints() {
+        let first = parse_account_response(&serde_json::json!({
+            "account": {"type": "chatgpt", "planType": "plus", "id": "acct-a"}
+        }))
+        .unwrap();
+        let second = parse_account_response(&serde_json::json!({
+            "account": {"type": "chatgpt", "planType": "plus", "id": "acct-b"}
+        }))
+        .unwrap();
+        assert_ne!(
+            first.account_id_fingerprint, second.account_id_fingerprint,
+            "same plan must not collapse distinct provider accounts"
+        );
     }
 
     #[test]
@@ -1295,6 +1353,16 @@ mod credit_and_order_tests {
         let limits_line = serde_json::to_string(&limits).unwrap();
         std::fs::write(root_a.join("limits.json"), &limits_line).unwrap();
         std::fs::write(root_b.join("limits.json"), &limits_line).unwrap();
+        std::fs::write(
+            root_a.join("auth.json"),
+            r#"{"tokens":{"account_id":"acct-plus"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root_b.join("auth.json"),
+            r#"{"tokens":{"account_id":"acct-team"}}"#,
+        )
+        .unwrap();
         let script = base.path().join("fake-codex.sh");
         std::fs::write(
             &script,
@@ -1333,6 +1401,10 @@ mod credit_and_order_tests {
                 stub: None,
                 custom_root: Some(root.clone()),
             };
+            let local_root = hosts
+                .file_scope
+                .scope_root(root, &usage_host::CancellationToken::new())
+                .unwrap();
             let ctx = FetchContext {
                 account: &account,
                 facade: hosts.facade(&usage_host::facade::FacadePolicy {
@@ -1345,7 +1417,7 @@ mod credit_and_order_tests {
                 }),
                 descriptor,
                 timeout: std::time::Duration::from_secs(10),
-                local_root: None,
+                local_root: Some(local_root),
                 secret: None,
                 cancel: usage_host::CancellationToken::new(),
             };
@@ -1371,11 +1443,11 @@ mod credit_and_order_tests {
         );
         assert_eq!(
             identities["a"],
-            identity_fingerprint("chatgpt", Some("plus"))
+            usage_host::fingerprint("codex-account", b"acct-plus")
         );
         assert_eq!(
             identities["b"],
-            identity_fingerprint("chatgpt", Some("team"))
+            usage_host::fingerprint("codex-account", b"acct-team")
         );
     }
 

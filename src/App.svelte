@@ -20,10 +20,10 @@
   let budgets: Budget[] = [];
   let descriptors: ProductDescriptor[] = [];
   let candidates: ProfileCandidate[] = [];
-  let candidateAlias = '';
+  let candidateAliases: Record<string, string> = {};
   let importStats: ImportStats[] = [];
   let storageStatus: StorageStatus | null = null;
-  let appInfo: AppInfo = { version: '1.0.0', updatesEnabled: false };
+  let appInfo: AppInfo = { version: '1.3.0', updatesEnabled: false };
   let online = typeof navigator === 'undefined' ? true : navigator.onLine;
   let providerFilter = '';
   let newAlias = '';
@@ -52,18 +52,18 @@
 
   onMount(() => {
     loadSnapshot().then((value) => { snapshot = value; loadError = ''; }).catch(() => { loadError = 'Не удалось загрузить данные. Проверьте подключение и нажмите «Повторить».'; });
-    loadSettings().then((value) => { settings = value; applyTheme(settings.theme); });
+    loadSettings().then((value) => { settings = value; applyTheme(settings.theme); }).catch(() => { applyTheme(settings.theme); });
     loadDescriptors().then((value) => descriptors = value).catch(() => {});
-    loadDiagnostics().then((value) => diagnostics = value);
-    loadAccounts().then((value) => accounts = value);
+    loadDiagnostics().then((value) => diagnostics = value).catch(() => {});
+    loadAccounts().then((value) => accounts = value).catch(() => {});
     scanCandidates().then((value) => candidates = value.filter((c) => c.status === 'pending')).catch(() => {});
-    loadBudgets().then((value) => budgets = value);
-    loadImportStats().then((value) => importStats = value);
-    loadStorageStatus().then((value) => storageStatus = value);
-    loadAppInfo().then((value) => appInfo = value);
+    loadBudgets().then((value) => budgets = value).catch(() => {});
+    loadImportStats().then((value) => importStats = value).catch(() => {});
+    loadStorageStatus().then((value) => storageStatus = value).catch(() => {});
+    loadAppInfo().then((value) => appInfo = value).catch(() => {});
     void reportOnlineState(online);
     let unlisten: (() => void) | undefined;
-    if ('__TAURI_INTERNALS__' in window) import('@tauri-apps/api/event').then(({ listen }) => listen('open-settings', () => selected = 'settings')).then((stop) => unlisten = stop);
+    if ('__TAURI_INTERNALS__' in window) import('@tauri-apps/api/event').then(({ listen }) => listen('open-settings', () => selected = 'settings')).then((stop) => unlisten = stop).catch(() => {});
     const timer = window.setInterval(() => now = Date.now(), 1_000);
     const onOnline = () => { online = true; void reportOnlineState(true); };
     const onOffline = () => { online = false; void reportOnlineState(false); };
@@ -90,7 +90,7 @@
       loadError = '';
       diagnostics = await loadDiagnostics();
       accounts = await loadAccounts();
-      candidates = await scanCandidates().catch(() => candidates);
+      candidates = (await scanCandidates()).filter((c) => c.status === 'pending');
       budgets = await loadBudgets();
       importStats = await loadImportStats();
       storageStatus = await loadStorageStatus();
@@ -123,11 +123,15 @@
   }
 
   async function dropAccount(id: string, history: boolean) {
-    notice = await removeAccount(id, history);
-    accounts = await loadAccounts();
-    budgets = await loadBudgets();
-    candidates = await scanCandidates().catch(() => candidates);
-    try { snapshot = await loadSnapshot(); } catch { /* keep last good view */ }
+    try {
+      notice = await removeAccount(id, history);
+      accounts = await loadAccounts();
+      budgets = await loadBudgets();
+      candidates = (await scanCandidates()).filter((c) => c.status === 'pending');
+      try { snapshot = await loadSnapshot(); } catch { /* keep last good view */ }
+    } catch {
+      notice = history ? 'Не удалось удалить аккаунт' : 'Не удалось архивировать аккаунт';
+    }
     window.setTimeout(() => notice = '', 3000);
   }
 
@@ -141,10 +145,12 @@
 
   async function connectProfile(candidate: ProfileCandidate) {
     try {
-      await connectCandidate(candidate.rootHash, candidateAlias.trim() || candidate.rootHint);
-      candidateAlias = '';
+      const alias = candidateAliases[candidate.rootHash]?.trim() || candidate.rootHint;
+      await connectCandidate(candidate.rootHash, alias);
+      const { [candidate.rootHash]: _removed, ...remainingAliases } = candidateAliases;
+      candidateAliases = remainingAliases;
       accounts = await loadAccounts();
-      candidates = await scanCandidates().catch(() => candidates);
+      candidates = (await scanCandidates()).filter((c) => c.status === 'pending');
       snapshot = await refreshAll();
       notice = 'Профиль подключён';
     } catch { notice = 'Не удалось подключить: корень уже привязан или недоступен'; }
@@ -205,8 +211,13 @@
   }
 
   async function removeBudget(budget: Budget) {
-    await deleteBudget(budget.accountId, budget.productId, budget.currency);
-    budgets = await loadBudgets();
+    try {
+      const removed = await deleteBudget(budget.accountId, budget.productId, budget.currency);
+      if (!removed) throw new Error('budget_not_found');
+      budgets = await loadBudgets();
+      notice = 'Бюджет удалён';
+    } catch { notice = 'Не удалось удалить бюджет'; }
+    window.setTimeout(() => notice = '', 3000);
   }
 
   async function persistSettings() {
@@ -242,7 +253,10 @@
   $: breakdownSegments = snapshot ? (breakdown === 'product' ? (snapshot.overview[period] ?? []) : breakdown === 'model' ? (snapshot.modelBreakdown?.[period] ?? []) : breakdown === 'account' ? (snapshot.accountBreakdown?.[period] ?? []) : (snapshot.projectBreakdown?.[period] ?? [])) : [];
   $: breakdownTotal = breakdownSegments.reduce((sum, item) => sum + item.value, 0);
   $: visibleProviders = snapshot ? snapshot.providers.filter((p) => !providerFilter.trim() || `${p.providerName} ${p.productName} ${p.alias}`.toLowerCase().includes(providerFilter.trim().toLowerCase())) : [];
-  $: connectableDescriptors = descriptors.filter((d) => d.accountModel !== 'discoveryOnly');
+  // Local products are connected through the discovered-profile flow (or
+  // the built-in default root), so the generic account form must not create
+  // a managed local row with no root that can never be refreshed.
+  $: connectableDescriptors = descriptors.filter((d) => d.accountModel === 'apiKey');
   $: blockedDescriptors = descriptors.filter((d) => d.accountModel === 'discoveryOnly');
   $: selectedDescriptor = descriptors.find((d) => d.productId === newProduct);
 </script>
@@ -324,8 +338,8 @@
             <p class="muted">Новых профилей нет. Сканируются только известные места: стандартный корень, `~/.codex-*` / `~/.claude-*`, добавленные вручную пути.</p>
           {:else}
             {#each candidates.filter((c) => c.status === 'pending') as candidate}
-              <label><span>{candidate.rootHint} · {candidate.kind}{candidate.boundAccountId ? ' · уже привязан' : ''}</span></label>
-              <div class="button-row"><input class="shortcut-input" aria-label="Название профиля" bind:value={candidateAlias} placeholder={candidate.rootHint} /><button class="secondary" on:click={() => connectProfile(candidate)} disabled={!!candidate.boundAccountId}>Подключить</button><button class="secondary" on:click={() => ignoreProfile(candidate)}>Игнорировать</button></div>
+              <div class="account-line"><span>{candidate.rootHint} · {candidate.kind}{candidate.boundAccountId ? ' · уже привязан' : ''}</span></div>
+              <div class="button-row"><input class="shortcut-input" aria-label="Название профиля" value={candidateAliases[candidate.rootHash] ?? ''} on:input={(event) => candidateAliases = { ...candidateAliases, [candidate.rootHash]: (event.currentTarget as HTMLInputElement).value }} placeholder={candidate.rootHint} /><button class="secondary" on:click={() => connectProfile(candidate)} disabled={!!candidate.boundAccountId}>Подключить</button><button class="secondary" on:click={() => ignoreProfile(candidate)}>Игнорировать</button></div>
             {/each}
           {/if}
         </div>

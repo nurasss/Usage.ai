@@ -47,6 +47,7 @@ pub struct ScopedRoot {
 #[derive(Debug, Clone)]
 pub struct ScopedFile {
     path: PathBuf,
+    root: PathBuf,
     identity: FileIdentity,
 }
 
@@ -108,6 +109,7 @@ pub trait FilesHost: Send + Sync {
                 if !out.iter().any(|f: &ScopedFile| f.path == canonical) {
                     out.push(ScopedFile {
                         path: canonical,
+                        root: root.root.clone(),
                         identity,
                     });
                 }
@@ -132,9 +134,21 @@ pub trait FilesHost: Send + Sync {
             return Err(HostError::Cancelled);
         }
         use std::io::{Read, Seek, SeekFrom};
-        let size = file.identity.size;
+        let canonical = file.path.canonicalize().map_err(|_| HostError::NotFound)?;
+        if canonical != file.path || !canonical.starts_with(&file.root) || !canonical.is_file() {
+            return Err(HostError::Policy);
+        }
+        let mut handle = std::fs::File::open(&canonical).map_err(|_| HostError::NotFound)?;
+        let metadata = handle.metadata().map_err(|_| HostError::Unavailable)?;
+        let opened_identity = file_identity_from_metadata(&canonical, &metadata);
+        if (file.identity.device != 0 || file.identity.inode != 0)
+            && (file.identity.device, file.identity.inode)
+                != (opened_identity.device, opened_identity.inode)
+        {
+            return Err(HostError::Policy);
+        }
+        let size = opened_identity.size;
         let start = offset.min(size);
-        let mut handle = std::fs::File::open(&file.path).map_err(|_| HostError::NotFound)?;
         handle
             .seek(SeekFrom::Start(start))
             .map_err(|_| HostError::Unavailable)?;
@@ -195,6 +209,7 @@ pub trait FilesHost: Send + Sync {
         self.read_scoped_range(
             &ScopedFile {
                 path: canonical,
+                root: root.root.clone(),
                 identity,
             },
             0,
@@ -209,11 +224,10 @@ pub trait FilesHost: Send + Sync {
 /// provider strategies through `HostFacade`.
 pub trait FileScopeHost: Send + Sync {
     /// Validate one product root: absolute, canonicalizable, directory.
-    fn scope_root(
-        &self,
-        root: &Path,
-        _cancel: &CancellationToken,
-    ) -> Result<ScopedRoot, HostError> {
+    fn scope_root(&self, root: &Path, cancel: &CancellationToken) -> Result<ScopedRoot, HostError> {
+        if cancel.is_cancelled() {
+            return Err(HostError::Cancelled);
+        }
         if !root.is_absolute() {
             return Err(HostError::Policy);
         }
@@ -377,6 +391,10 @@ fn path_contains_symlink(root: &Path, path: &Path) -> bool {
 
 pub fn file_identity(path: &Path) -> Result<FileIdentity, HostError> {
     let meta = std::fs::metadata(path).map_err(|_| HostError::NotFound)?;
+    Ok(file_identity_from_metadata(path, &meta))
+}
+
+fn file_identity_from_metadata(path: &Path, meta: &std::fs::Metadata) -> FileIdentity {
     let mtime_ms = meta
         .modified()
         .ok()
@@ -390,13 +408,13 @@ pub fn file_identity(path: &Path) -> Result<FileIdentity, HostError> {
     };
     #[cfg(not(unix))]
     let (device, inode) = (0u64, 0u64);
-    Ok(FileIdentity {
+    FileIdentity {
         device,
         inode,
         size: meta.len(),
         mtime_ms,
         path_hash: path_hash(path),
-    })
+    }
 }
 
 pub fn path_hash(path: &Path) -> String {
@@ -560,5 +578,30 @@ mod scoped_file_tests {
             .read_scoped_file(&root, "auth.json", 64, &CancellationToken::new())
             .unwrap();
         assert_eq!(bytes, b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_file_rejects_replacement_with_outside_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(root.join("auth.json"), "inside").unwrap();
+        std::fs::write(&outside, "secret").unwrap();
+        let host = ScopedFiles;
+        let scoped_root = host.scope_root(&root, &CancellationToken::new()).unwrap();
+        let file = host
+            .list_files(&scoped_root, "auth.json", &CancellationToken::new())
+            .unwrap()
+            .pop()
+            .unwrap();
+        std::fs::remove_file(root.join("auth.json")).unwrap();
+        symlink(&outside, root.join("auth.json")).unwrap();
+        assert!(matches!(
+            host.read_scoped_range(&file, 0, 64, &CancellationToken::new()),
+            Err(HostError::Policy)
+        ));
     }
 }
