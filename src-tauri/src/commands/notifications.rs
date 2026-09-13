@@ -1,8 +1,10 @@
 use chrono::{Local, NaiveTime, Utc};
+use rust_decimal::Decimal;
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt;
 use usage_core::CostKind;
 use usage_runtime::{PlannedNotice, ProviderNoticeView, QuotaNoticeView};
+use usage_storage::{Budget, Storage};
 
 use crate::appstate::AppState;
 use crate::commands::settings::read_settings;
@@ -121,22 +123,8 @@ fn deliver_budget_notices(app: &AppHandle, state: &AppState) {
         .and_then(|s| s.list_budgets().ok())
         .unwrap_or_default();
     for budget in budgets {
-        let spent: Option<rust_decimal::Decimal> = state.storage.lock().ok().and_then(|s| {
-            s.cost_records_between(month_start.with_timezone(&Utc), Utc::now())
-                .ok()
-                .map(|records| {
-                    records
-                        .iter()
-                        .filter(|r| {
-                            r.account_id == budget.account_id
-                                && r.product_id == budget.product_id
-                                && r.currency == budget.currency
-                                && r.kind == CostKind::Reported
-                                && r.coverage.is_authoritative()
-                        })
-                        .map(|r| r.amount_decimal)
-                        .sum()
-                })
+        let spent = state.storage.lock().ok().and_then(|s| {
+            reported_spend_for_budget(&s, &budget, month_start.with_timezone(&Utc), Utc::now())
         });
         let Some(spent) = spent else { continue };
         let Some(notice) = usage_runtime::Planner::plan_budget(
@@ -175,6 +163,34 @@ fn deliver_budget_notices(app: &AppHandle, state: &AppState) {
     }
 }
 
+/// Read the reported, authoritative spend used by the real budget delivery
+/// path. Persisted coverage has already crossed the storage parser boundary;
+/// this predicate remains explicit so non-authoritative rows cannot influence
+/// notices or remaining-budget calculations.
+fn reported_spend_for_budget(
+    storage: &Storage,
+    budget: &Budget,
+    start: chrono::DateTime<Utc>,
+    end: chrono::DateTime<Utc>,
+) -> Option<Decimal> {
+    storage
+        .cost_records_between(start, end)
+        .ok()
+        .map(|records| {
+            records
+                .iter()
+                .filter(|record| {
+                    record.account_id == budget.account_id
+                        && record.product_id == budget.product_id
+                        && record.currency == budget.currency
+                        && record.kind == CostKind::Reported
+                        && record.coverage.is_authoritative()
+                })
+                .map(|record| record.amount_decimal)
+                .sum()
+        })
+}
+
 pub fn quiet_now(settings: &crate::dto::AppSettings) -> bool {
     let (Some(start), Some(end)) = (
         settings.quiet_hours_start.as_deref(),
@@ -193,5 +209,85 @@ pub fn quiet_now(settings: &crate::dto::AppSettings) -> bool {
         now >= start && now < end
     } else {
         now >= start || now < end
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use usage_core::{CostKind, CostRecord, Coverage};
+    use usage_runtime::Planner;
+    use uuid::Uuid;
+
+    #[test]
+    fn budget_spend_path_excludes_non_authoritative_rows() {
+        let mut storage = Storage::in_memory().unwrap();
+        let account_id = Uuid::new_v4();
+        let start = Utc::now();
+        let observed_at = start + Duration::hours(1);
+        let budget = Budget {
+            account_id,
+            product_id: "codex".into(),
+            currency: "USD".into(),
+            amount_decimal: Decimal::new(200, 2),
+            period: "monthly".into(),
+        };
+        let make_cost =
+            |source_record_id: &str, amount_decimal: Decimal, coverage: Coverage| -> CostRecord {
+                CostRecord {
+                    account_id,
+                    product_id: "codex".into(),
+                    billing_scope_id: None,
+                    source_record_id: source_record_id.into(),
+                    period_start: observed_at,
+                    period_end: observed_at,
+                    amount_decimal,
+                    currency: "USD".into(),
+                    kind: CostKind::Reported,
+                    source: "budget-test".into(),
+                    coverage,
+                }
+            };
+        for (id, amount, coverage) in [
+            ("complete", Decimal::new(100, 2), Coverage::Complete),
+            ("partial", Decimal::new(50, 2), Coverage::Partial),
+            ("unknown", Decimal::new(1000, 2), Coverage::Unknown),
+            (
+                "unverified",
+                Decimal::new(2000, 2),
+                Coverage::UnverifiedSemantics,
+            ),
+        ] {
+            storage
+                .upsert_cost(&make_cost(id, amount, coverage))
+                .unwrap();
+        }
+
+        let spent =
+            reported_spend_for_budget(&storage, &budget, start, start + Duration::days(1)).unwrap();
+        assert_eq!(spent, Decimal::new(150, 2));
+        assert_eq!(budget.amount_decimal - spent, Decimal::new(50, 2));
+        assert!(Planner::plan_budget(
+            &account_id.to_string(),
+            &budget.product_id,
+            &budget.currency,
+            budget.amount_decimal,
+            spent,
+            "2026-09",
+        )
+        .is_none());
+
+        // The same production path still alerts when canonical authoritative
+        // rows genuinely exceed the configured budget.
+        assert!(Planner::plan_budget(
+            &account_id.to_string(),
+            &budget.product_id,
+            &budget.currency,
+            Decimal::new(100, 2),
+            spent,
+            "2026-09",
+        )
+        .is_some());
     }
 }

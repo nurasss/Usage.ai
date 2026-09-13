@@ -5,11 +5,28 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use usage_core::{Account, CostRecord, Snapshot, UsageRecord};
+use usage_core::{Account, CostRecord, Coverage, Snapshot, UsageRecord};
 
 const SCHEMA_VERSION: u32 = 10;
 
 const USAGE_UPSERT_SQL: &str = "INSERT INTO usage_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,model,input_tokens,output_tokens,cached_tokens,cache_creation_tokens,cache_read_tokens,reasoning_tokens,total_tokens,requests,source,coverage,connection_id,file_id,file_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(account_id,product_id,source,source_record_id) DO UPDATE SET billing_scope_id=excluded.billing_scope_id,period_start=MAX(usage_records.period_start,excluded.period_start),period_end=MAX(usage_records.period_end,excluded.period_end),model=COALESCE(usage_records.model,excluded.model),input_tokens=CASE WHEN excluded.input_tokens IS NULL THEN usage_records.input_tokens WHEN usage_records.input_tokens IS NULL THEN excluded.input_tokens ELSE MAX(usage_records.input_tokens,excluded.input_tokens) END,output_tokens=CASE WHEN excluded.output_tokens IS NULL THEN usage_records.output_tokens WHEN usage_records.output_tokens IS NULL THEN excluded.output_tokens ELSE MAX(usage_records.output_tokens,excluded.output_tokens) END,cached_tokens=CASE WHEN excluded.cached_tokens IS NULL THEN usage_records.cached_tokens WHEN usage_records.cached_tokens IS NULL THEN excluded.cached_tokens ELSE MAX(usage_records.cached_tokens,excluded.cached_tokens) END,cache_creation_tokens=CASE WHEN excluded.cache_creation_tokens IS NULL THEN usage_records.cache_creation_tokens WHEN usage_records.cache_creation_tokens IS NULL THEN excluded.cache_creation_tokens ELSE MAX(usage_records.cache_creation_tokens,excluded.cache_creation_tokens) END,cache_read_tokens=CASE WHEN excluded.cache_read_tokens IS NULL THEN usage_records.cache_read_tokens WHEN usage_records.cache_read_tokens IS NULL THEN excluded.cache_read_tokens ELSE MAX(usage_records.cache_read_tokens,excluded.cache_read_tokens) END,reasoning_tokens=CASE WHEN excluded.reasoning_tokens IS NULL THEN usage_records.reasoning_tokens WHEN usage_records.reasoning_tokens IS NULL THEN excluded.reasoning_tokens ELSE MAX(usage_records.reasoning_tokens,excluded.reasoning_tokens) END,total_tokens=CASE WHEN excluded.total_tokens IS NULL THEN usage_records.total_tokens WHEN usage_records.total_tokens IS NULL THEN excluded.total_tokens ELSE MAX(usage_records.total_tokens,excluded.total_tokens) END,requests=CASE WHEN excluded.requests IS NULL THEN usage_records.requests WHEN usage_records.requests IS NULL THEN excluded.requests ELSE MAX(usage_records.requests,excluded.requests) END,coverage=excluded.coverage,connection_id=COALESCE(excluded.connection_id,usage_records.connection_id),file_id=COALESCE(excluded.file_id,usage_records.file_id),file_generation=MAX(usage_records.file_generation,excluded.file_generation)";
+
+/// Decode the persisted coverage representation without granting trust to
+/// unknown or future strings. Only the current enum spellings are accepted;
+/// in particular, authoritative values are never recognized by substring,
+/// prefix, suffix, case folding, or whitespace normalization.
+fn parse_persisted_coverage_exact(raw: &str) -> Coverage {
+    match raw {
+        "Complete" => Coverage::Complete,
+        "Partial" => Coverage::Partial,
+        "LocalClientOnly" => Coverage::LocalClientOnly,
+        "UnverifiedSemantics" => Coverage::UnverifiedSemantics,
+        "FromConnectionTime" => Coverage::FromConnectionTime,
+        "ProviderDelayed" => Coverage::ProviderDelayed,
+        "Unknown" => Coverage::Unknown,
+        _ => Coverage::Unknown,
+    }
+}
 
 pub struct Storage {
     conn: Connection,
@@ -1338,14 +1355,7 @@ impl Storage {
                         _ => usage_core::CostKind::Reported,
                     },
                     source: r.get(9)?,
-                    coverage: match coverage_raw.as_str() {
-                        "Partial" => usage_core::Coverage::Partial,
-                        "LocalClientOnly" => usage_core::Coverage::LocalClientOnly,
-                        "FromConnectionTime" => usage_core::Coverage::FromConnectionTime,
-                        "ProviderDelayed" => usage_core::Coverage::ProviderDelayed,
-                        _ if coverage_raw.contains("Complete") => usage_core::Coverage::Complete,
-                        _ => usage_core::Coverage::Unknown,
-                    },
+                    coverage: parse_persisted_coverage_exact(&coverage_raw),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3089,6 +3099,101 @@ mod tests {
         assert!(s.cost_records_between(start, end).unwrap().is_empty());
         assert_eq!(s.list_accounts().unwrap().len(), 0);
     }
+
+    #[test]
+    fn persisted_coverage_parser_is_exact_and_fail_closed() {
+        use chrono::TimeZone;
+        let storage = Storage::in_memory().unwrap();
+        let start = Utc.with_ymd_and_hms(2026, 9, 8, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 9, 9, 0, 0, 0).unwrap();
+        let cases = [
+            ("Complete", Coverage::Complete, true, Decimal::new(100, 2)),
+            ("Partial", Coverage::Partial, true, Decimal::new(50, 2)),
+            (
+                "UnverifiedSemantics",
+                Coverage::UnverifiedSemantics,
+                false,
+                Decimal::new(1000, 2),
+            ),
+            ("Unknown", Coverage::Unknown, false, Decimal::new(2000, 2)),
+            (
+                "legacy-invalid-Complete",
+                Coverage::Unknown,
+                false,
+                Decimal::new(700, 2),
+            ),
+            (
+                "legacy-invalid-Partial",
+                Coverage::Unknown,
+                false,
+                Decimal::new(800, 2),
+            ),
+            ("fooComplete", Coverage::Unknown, false, Decimal::ZERO),
+            ("fooPartial", Coverage::Unknown, false, Decimal::ZERO),
+            ("Complete-old", Coverage::Unknown, false, Decimal::ZERO),
+            ("Partial-old", Coverage::Unknown, false, Decimal::ZERO),
+            ("COMPLETE", Coverage::Unknown, false, Decimal::ZERO),
+            ("PARTIAL", Coverage::Unknown, false, Decimal::ZERO),
+            ("unknown", Coverage::Unknown, false, Decimal::ZERO),
+            ("", Coverage::Unknown, false, Decimal::ZERO),
+            (
+                "VerifiedByVendorV2",
+                Coverage::Unknown,
+                false,
+                Decimal::ZERO,
+            ),
+            (" Complete ", Coverage::Unknown, false, Decimal::ZERO),
+        ];
+
+        for (index, (raw, expected, authoritative, amount)) in cases.iter().enumerate() {
+            storage
+                .conn
+                .execute(
+                    "INSERT INTO cost_records(account_id,product_id,billing_scope_id,source_record_id,period_start,period_end,amount_decimal,currency,kind,source,coverage) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    params![
+                        Uuid::nil().to_string(),
+                        "codex",
+                        Option::<String>::None,
+                        format!("coverage-case-{index}"),
+                        start.to_rfc3339(),
+                        start.to_rfc3339(),
+                        amount.to_string(),
+                        "USD",
+                        "Reported",
+                        "audit",
+                        raw,
+                    ],
+                )
+                .unwrap();
+            assert_eq!(parse_persisted_coverage_exact(raw), *expected);
+            assert_eq!(expected.is_authoritative(), *authoritative);
+        }
+
+        let rows = storage.cost_records_between(start, end).unwrap();
+        assert_eq!(rows.len(), cases.len());
+        for (index, (_, expected, authoritative, amount)) in cases.iter().enumerate() {
+            let row = rows
+                .iter()
+                .find(|row| row.source_record_id == format!("coverage-case-{index}"))
+                .unwrap();
+            assert_eq!(row.amount_decimal, *amount);
+            assert_eq!(row.coverage, *expected);
+            assert_eq!(row.coverage.is_authoritative(), *authoritative);
+        }
+        let authoritative_total: Decimal = rows
+            .iter()
+            .filter(|row| row.coverage.is_authoritative())
+            .map(|row| row.amount_decimal)
+            .sum();
+        assert_eq!(authoritative_total, Decimal::new(150, 2));
+        let raw_total: Decimal = rows.iter().map(|row| row.amount_decimal).sum();
+        assert_eq!(raw_total, Decimal::new(4650, 2));
+        assert!(storage
+            .export_csv()
+            .unwrap()
+            .contains("legacy-invalid-Complete"));
+    }
+
     fn provenanced(
         id: &str,
         total: u64,
