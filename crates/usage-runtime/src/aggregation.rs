@@ -438,17 +438,20 @@ mod tests {
     fn provider_facing_totals_exclude_non_authoritative_usage_and_costs() {
         let mut storage = Storage::in_memory().unwrap();
         let account_id = Uuid::new_v4();
+        let other_account_id = Uuid::new_v4();
         let today = Local::now().date_naive();
         let start = local_midnight(today).with_timezone(&Utc);
         let observed_at = start + Duration::hours(1);
 
-        let make_usage = |source_record_id: &str,
+        let make_usage = |account_id: Uuid,
+                          product_id: &str,
+                          source_record_id: &str,
                           total_tokens: u64,
                           coverage: usage_core::Coverage|
          -> usage_core::UsageRecord {
             usage_core::UsageRecord {
                 account_id,
-                product_id: "codex".into(),
+                product_id: product_id.into(),
                 billing_scope_id: None,
                 source_record_id: source_record_id.into(),
                 period_start: observed_at,
@@ -469,24 +472,78 @@ mod tests {
                 file_generation: None,
             }
         };
+        for (source_record_id, total_tokens, coverage) in [
+            ("complete", 100, usage_core::Coverage::Complete),
+            ("partial", 50, usage_core::Coverage::Partial),
+            ("unknown", 1000, usage_core::Coverage::Unknown),
+            ("local-only", 2000, usage_core::Coverage::LocalClientOnly),
+            (
+                "unverified-semantics",
+                4000,
+                usage_core::Coverage::UnverifiedSemantics,
+            ),
+        ] {
+            storage
+                .upsert_usage(&make_usage(
+                    account_id,
+                    "codex",
+                    source_record_id,
+                    total_tokens,
+                    coverage,
+                ))
+                .unwrap();
+        }
+        // A different account and product must never bleed into the target
+        // provider-facing DTO totals, while remaining visible to global
+        // authoritative analytics.
         storage
-            .upsert_usage(&make_usage("verified", 100, usage_core::Coverage::Complete))
+            .upsert_usage(&make_usage(
+                other_account_id,
+                "codex",
+                "other-account",
+                700,
+                usage_core::Coverage::Complete,
+            ))
             .unwrap();
         storage
             .upsert_usage(&make_usage(
-                "unverified",
-                900,
-                usage_core::Coverage::Unknown,
+                account_id,
+                "claude-code",
+                "other-product",
+                800,
+                usage_core::Coverage::Complete,
             ))
             .unwrap();
 
-        let make_cost = |source_record_id: &str,
+        assert_eq!(
+            storage
+                .tokens_for_account_between(account_id, "codex", start, start + Duration::days(1))
+                .unwrap(),
+            7150,
+            "raw/local history keeps every coverage class"
+        );
+        assert_eq!(
+            storage
+                .authoritative_tokens_for_account_between(
+                    account_id,
+                    "codex",
+                    start,
+                    start + Duration::days(1),
+                )
+                .unwrap(),
+            150,
+            "provider-facing usage accepts only Complete + Partial"
+        );
+
+        let make_cost = |account_id: Uuid,
+                         product_id: &str,
+                         source_record_id: &str,
                          amount_decimal: Decimal,
                          coverage: usage_core::Coverage|
          -> usage_core::CostRecord {
             usage_core::CostRecord {
                 account_id,
-                product_id: "codex".into(),
+                product_id: product_id.into(),
                 billing_scope_id: None,
                 source_record_id: source_record_id.into(),
                 period_start: observed_at,
@@ -498,41 +555,122 @@ mod tests {
                 coverage,
             }
         };
-        storage
-            .upsert_cost(&make_cost(
-                "cost-verified",
-                Decimal::new(150, 2),
+        for (source_record_id, amount_decimal, coverage) in [
+            (
+                "cost-complete",
+                Decimal::new(100, 2),
+                usage_core::Coverage::Complete,
+            ),
+            (
+                "cost-partial",
+                Decimal::new(50, 2),
                 usage_core::Coverage::Partial,
+            ),
+            (
+                "cost-unknown",
+                Decimal::new(1000, 2),
+                usage_core::Coverage::Unknown,
+            ),
+            (
+                "cost-local-only",
+                Decimal::new(2000, 2),
+                usage_core::Coverage::LocalClientOnly,
+            ),
+            (
+                "cost-unverified-semantics",
+                Decimal::new(4000, 2),
+                usage_core::Coverage::UnverifiedSemantics,
+            ),
+        ] {
+            storage
+                .upsert_cost(&make_cost(
+                    account_id,
+                    "codex",
+                    source_record_id,
+                    amount_decimal,
+                    coverage,
+                ))
+                .unwrap();
+        }
+        storage
+            .upsert_cost(&make_cost(
+                other_account_id,
+                "codex",
+                "cost-other-account",
+                Decimal::new(9999, 2),
+                usage_core::Coverage::Complete,
             ))
             .unwrap();
         storage
             .upsert_cost(&make_cost(
-                "cost-unverified",
-                Decimal::new(9000, 2),
-                usage_core::Coverage::LocalClientOnly,
+                account_id,
+                "claude-code",
+                "cost-other-product",
+                Decimal::new(7777, 2),
+                usage_core::Coverage::Complete,
             ))
             .unwrap();
+
+        let raw_target_cost: Decimal = storage
+            .cost_records_between(start, start + Duration::days(1))
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.account_id == account_id && record.product_id == "codex")
+            .map(|record| record.amount_decimal)
+            .sum();
+        assert_eq!(
+            raw_target_cost,
+            Decimal::new(7150, 2),
+            "raw/local cost history keeps non-authoritative amounts exactly"
+        );
 
         let today_totals = account_usage_and_cost_today(&storage, account_id, "codex");
-        assert_eq!(today_totals.tokens_today, Some(100));
+        assert_eq!(today_totals.tokens_today, Some(150));
         assert_eq!(
             today_totals.reported_cost_today.unwrap().amount,
-            Decimal::new(150, 2).to_string()
+            Decimal::new(150, 2).to_string(),
+            "provider-facing cost uses exact Decimal arithmetic"
         );
 
-        let providers = [ProviderCostInput {
-            account_id,
-            product_id: "codex".into(),
-            provider_name: "OpenAI".into(),
-            alias: "Test".into(),
-        }];
+        let providers = [
+            ProviderCostInput {
+                account_id,
+                product_id: "codex".into(),
+                provider_name: "OpenAI".into(),
+                alias: "Test".into(),
+            },
+            ProviderCostInput {
+                account_id: other_account_id,
+                product_id: "codex".into(),
+                provider_name: "OpenAI".into(),
+                alias: "Other account".into(),
+            },
+            ProviderCostInput {
+                account_id,
+                product_id: "claude-code".into(),
+                provider_name: "Anthropic".into(),
+                alias: "Other product".into(),
+            },
+        ];
         let aggregates = build_aggregates(&storage, &providers);
         let today_costs = aggregates.costs_by_period.get("today").unwrap();
-        assert_eq!(today_costs.len(), 1);
-        assert_eq!(today_costs[0].reported.len(), 1);
+        let target_costs = today_costs
+            .iter()
+            .find(|row| row.account_id == account_id.to_string() && row.product_id == "codex")
+            .unwrap();
         assert_eq!(
-            today_costs[0].reported[0].amount,
+            target_costs.reported[0].amount,
             Decimal::new(150, 2).to_string()
         );
+        assert_eq!(
+            today_costs.len(),
+            3,
+            "each account/product remains isolated"
+        );
+
+        let unverified = aggregates.unverified_overview.get("today").unwrap();
+        assert!(unverified.iter().any(|segment| {
+            segment.label == "Codex (неподтверждённые)" && segment.value == 7000
+        }));
     }
 }
