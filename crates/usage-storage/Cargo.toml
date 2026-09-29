@@ -8,7 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 csv = "1"
-rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "uuid"] }
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
