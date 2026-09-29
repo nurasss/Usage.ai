@@ -16,7 +16,7 @@ rand = "0.9"
 rust_decimal = { version = "1", features = ["serde-with-str", "serde-with-arbitrary-precision"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "net", "io-util"] }
 tracing = "0.1"
