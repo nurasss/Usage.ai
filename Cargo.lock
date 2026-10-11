@@ -4916,7 +4916,7 @@ version = "1.3.0"
 dependencies = [
  "async-trait",
  "chrono",
- "rand 0.9.5",
+ "rand 0.10.2",
  "rust_decimal",
  "serde",
  "serde_json",

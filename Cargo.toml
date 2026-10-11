@@ -12,7 +12,7 @@ authors = ["Usage.ai"]
 anyhow = "1"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
-rand = "0.9"
+rand = "0.10"
 rust_decimal = { version = "1", features = ["serde-with-str", "serde-with-arbitrary-precision"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
